@@ -1,0 +1,1 @@
+"""Polymarket BTC trading bot."""
