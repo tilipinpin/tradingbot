@@ -38,6 +38,9 @@ POLYMARKET_EVENT_SLUG=
 POLYMARKET_MARKET_SLUG=
 TRADE_OUTCOME=AUTO
 SPOT_PRICE_SOURCE=COINGECKO
+CHAINLINK_DATA_STREAMS_API_KEY=
+CHAINLINK_DATA_STREAMS_API_SECRET=
+CHAINLINK_BTC_USD_FEED_ID=
 MANUAL_BTC_PRICE=
 THRESHOLD_BUFFER_BPS=25
 MAX_PRICE=0.55
@@ -93,6 +96,17 @@ python -m src.simulate_updown --duration 300 --interval 15 --up-ask 0.52 --down-
 python -m src.watch_updown --slug https://polymarket.com/zh/event/btc-updown-5m-1783685100 --duration 900 --interval 10
 ```
 
+BTC 5m Up/Down 的正式结算源是 Chainlink BTC/USD Data Stream。`watch_updown` 默认使用
+免费的 `AUTO` 模式，优先订阅 Polymarket 公开的 Chainlink 实时流，失败时再依次尝试
+Binance、Coinbase、Kraken 和 CoinGecko。需要代理时传入
+`--ws-proxy socks5h://127.0.0.1:7898`。为了禁止交易所回退并严格使用结算源，可传入
+`--price-source POLYMARKET_CHAINLINK`。
+
+使用付费 Chainlink Data Streams API 时传入 `--price-source CHAINLINK`，并配置
+`CHAINLINK_DATA_STREAMS_API_KEY`、`CHAINLINK_DATA_STREAMS_API_SECRET` 和
+`CHAINLINK_BTC_USD_FEED_ID`。不要将 Key 或 Secret 提交到 Git。Chainlink 网页展示价格
+可能延迟，只适合人工校验，不用于自动入场。
+
 这个命令只 dry-run 打印盘口、fair probability 和理论动作，不会真实下单。
 
 启用自动交易检测，但仍然 dry-run 不下单：
@@ -103,9 +117,12 @@ python -m src.watch_updown \
   --duration 3600 \
   --interval 10 \
   --auto-trade \
-  --decision-seconds-before-end 120 \
-  --min-entry 0.40 \
-  --max-entry 0.50 \
+  --decision-seconds-before-end 90 \
+  --min-seconds-before-end 25 \
+  --signal-confirmations 2 \
+  --market-data-timeout 3 \
+  --min-entry 0.50 \
+  --max-entry 0.78 \
   --order-size 5
 ```
 
@@ -119,15 +136,30 @@ python -m src.watch_updown \
   --duration 21600 \
   --interval 10 \
   --auto-trade \
+  --strategy fair_value_edge \
+  --price-source POLYMARKET_CHAINLINK \
+  --ws-proxy socks5h://127.0.0.1:7898 \
   --paper-trading \
   --paper-bankroll 20 \
   --paper-stake 1 \
   --stop-when-bust \
-  --decision-seconds-before-end 120 \
-  --min-entry 0.40 \
-  --max-entry 0.50 \
-  --max-trades 1
+  --decision-seconds-before-end 90 \
+  --min-seconds-before-end 25 \
+  --signal-confirmations 2 \
+  --market-data-timeout 3 \
+  --min-win-probability 0.62 \
+  --edge 0.06 \
+  --min-entry 0.50 \
+  --max-entry 0.78 \
+  --max-spread 0.04 \
+  --min-ask-sum 0.90 \
+  --max-ask-sum 1.10 \
+  --max-trades 1 \
+  --max-consecutive-losses 2 \
+  --pause-windows-after-losses 2
 ```
+
+`fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在理论概率相对盘口 ask 有足够 edge 时入场。默认要求同方向连续出现两次信号、理论胜率至少 62%，并避开最后 25 秒、过期现货价格、宽 spread、交叉报价和异常 ask 总价。高价或临近结算的入场还需要额外 edge；纸面模拟连续亏损达到阈值后会暂停若干窗口。
 
 回测 BTC 5m Up/Down 历史盘口策略：
 

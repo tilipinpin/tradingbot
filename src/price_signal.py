@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 import re
+import json
+import threading
+import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from decimal import Decimal
 
 import requests
+import websocket
+import certifi
+from requests import RequestException
 
 
 PRICE_PATTERN = re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)(\s*[kKmM])?")
@@ -15,6 +25,7 @@ class SpotPrice:
     symbol: str
     price: Decimal
     source: str
+    observed_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -24,18 +35,80 @@ class DirectionSignal:
 
 
 class SpotPriceClient:
-    def __init__(self, source: str, timeout: int = 20) -> None:
+    EXCHANGE_SOURCES = ("BINANCE", "COINBASE", "KRAKEN", "COINGECKO")
+    SOURCES = ("POLYMARKET_CHAINLINK", *EXCHANGE_SOURCES)
+    CHAINLINK_API_URL = "https://api.dataengine.chain.link"
+
+    def __init__(self, source: str, timeout: int = 20, ws_proxy: str | None = None) -> None:
         self.source = source.upper()
         self.timeout = timeout
+        self.ws_proxy = ws_proxy
+        self._polymarket_stream: PolymarketChainlinkStream | None = None
 
     def btc_usd(self) -> SpotPrice:
-        if self.source == "BINANCE":
+        if self.source == "CHAINLINK":
+            return self._chainlink_btc_usd()
+        if self.source == "AUTO":
+            sources = self.SOURCES
+        elif self.source == "POLYMARKET_CHAINLINK":
+            sources = (self.source,)
+        else:
+            sources = (self.source, *[source for source in self.EXCHANGE_SOURCES if source != self.source])
+        errors: list[str] = []
+        for source in sources:
+            try:
+                return self._btc_usd_from_source(source)
+            except (KeyError, RequestException, RuntimeError, ValueError) as exc:
+                errors.append(f"{source}: {exc}")
+        raise RuntimeError(f"All BTC/USD price sources failed: {'; '.join(errors)}")
+
+    def _btc_usd_from_source(self, source: str) -> SpotPrice:
+        if source == "POLYMARKET_CHAINLINK":
+            if self._polymarket_stream is None:
+                self._polymarket_stream = PolymarketChainlinkStream(timeout=self.timeout, proxy_url=self.ws_proxy)
+            return self._polymarket_stream.btc_usd()
+        if source == "BINANCE":
             return self._binance_btc_usdt()
-        if self.source == "COINBASE":
+        if source == "COINBASE":
             return self._coinbase_btc_usd()
-        if self.source == "COINGECKO":
+        if source == "COINGECKO":
             return self._coingecko_btc_usd()
-        raise ValueError("SPOT_PRICE_SOURCE must be BINANCE, COINBASE, or COINGECKO")
+        if source == "KRAKEN":
+            return self._kraken_btc_usd()
+        raise ValueError(
+            "SPOT_PRICE_SOURCE must be AUTO, POLYMARKET_CHAINLINK, CHAINLINK, "
+            "BINANCE, COINBASE, KRAKEN, or COINGECKO"
+        )
+
+    def _chainlink_btc_usd(self) -> SpotPrice:
+        api_key = os.getenv("CHAINLINK_DATA_STREAMS_API_KEY")
+        api_secret = os.getenv("CHAINLINK_DATA_STREAMS_API_SECRET")
+        feed_id = os.getenv("CHAINLINK_BTC_USD_FEED_ID")
+        if not api_key or not api_secret or not feed_id:
+            raise RuntimeError(
+                "CHAINLINK price source requires CHAINLINK_DATA_STREAMS_API_KEY, "
+                "CHAINLINK_DATA_STREAMS_API_SECRET, and CHAINLINK_BTC_USD_FEED_ID"
+            )
+
+        path = f"/api/v1/reports/latest?feedID={feed_id}"
+        timestamp_ms = str(int(time.time() * 1000))
+        body_hash = hashlib.sha256(b"").hexdigest()
+        string_to_sign = f"GET {path} {body_hash} {api_key} {timestamp_ms}"
+        signature = hmac.new(api_secret.encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
+        response = requests.get(
+            f"{os.getenv('CHAINLINK_DATA_STREAMS_API_URL', self.CHAINLINK_API_URL)}{path}",
+            headers={
+                "Authorization": api_key,
+                "X-Authorization-Timestamp": timestamp_ms,
+                "X-Authorization-Signature-SHA256": signature,
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        report = response.json()["report"]
+        price = decode_chainlink_v3_price(report["fullReport"], feed_id)
+        observed_at = int(report["observationsTimestamp"])
+        return SpotPrice(symbol="BTC/USD", price=price, source="CHAINLINK", observed_at=observed_at)
 
     def _binance_btc_usdt(self) -> SpotPrice:
         response = requests.get(
@@ -52,6 +125,20 @@ class SpotPriceClient:
         amount = response.json()["data"]["amount"]
         return SpotPrice(symbol="BTC/USD", price=Decimal(str(amount)), source="COINBASE")
 
+    def _kraken_btc_usd(self) -> SpotPrice:
+        response = requests.get(
+            "https://api.kraken.com/0/public/Ticker",
+            params={"pair": "XBTUSD"},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("error"):
+            raise RuntimeError(f"Kraken ticker error: {payload['error']}")
+        result = payload["result"]
+        ticker = next(iter(result.values()))
+        return SpotPrice(symbol="BTC/USD", price=Decimal(str(ticker["c"][0])), source="KRAKEN")
+
     def _coingecko_btc_usd(self) -> SpotPrice:
         response = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
@@ -61,6 +148,117 @@ class SpotPriceClient:
         response.raise_for_status()
         price = response.json()["bitcoin"]["usd"]
         return SpotPrice(symbol="BTC/USD", price=Decimal(str(price)), source="COINGECKO")
+
+
+def decode_chainlink_v3_price(full_report: str, expected_feed_id: str) -> Decimal:
+    raw = bytes.fromhex(full_report.removeprefix("0x"))
+    if len(raw) < 7 * 32:
+        raise ValueError("Chainlink fullReport is too short")
+
+    report_offset = int.from_bytes(raw[3 * 32 : 4 * 32], "big")
+    if report_offset + 32 > len(raw):
+        raise ValueError("Chainlink fullReport contains an invalid report offset")
+    report_length = int.from_bytes(raw[report_offset : report_offset + 32], "big")
+    payload_start = report_offset + 32
+    payload_end = payload_start + report_length
+    if report_length < 9 * 32 or payload_end > len(raw):
+        raise ValueError("Chainlink v3 report payload is incomplete")
+
+    payload = raw[payload_start:payload_end]
+    actual_feed_id = "0x" + payload[:32].hex()
+    if actual_feed_id.lower() != expected_feed_id.lower():
+        raise ValueError("Chainlink report feed ID does not match configured BTC/USD feed")
+
+    price_word = payload[6 * 32 : 7 * 32]
+    price_raw = int.from_bytes(price_word, "big", signed=True)
+    if price_raw <= 0:
+        raise ValueError("Chainlink BTC/USD report contains a non-positive price")
+    return Decimal(price_raw) / Decimal(10**18)
+
+
+class PolymarketChainlinkStream:
+    URL = "wss://ws-live-data.polymarket.com"
+    SUBSCRIPTION = {
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": '{"symbol":"btc/usd"}',
+            }
+        ],
+    }
+
+    def __init__(self, timeout: int = 5, proxy_url: str | None = None) -> None:
+        self.timeout = timeout
+        self.proxy_url = proxy_url
+        self._latest: SpotPrice | None = None
+        self._ready = threading.Event()
+        self._started = False
+        self._lock = threading.Lock()
+        self._last_error: str | None = None
+
+    @staticmethod
+    def parse_message(message: str) -> SpotPrice | None:
+        payload = json.loads(message)
+        if payload.get("topic") != "crypto_prices_chainlink" or payload.get("type") != "update":
+            return None
+        price = payload.get("payload") or {}
+        if str(price.get("symbol", "")).lower() != "btc/usd":
+            return None
+        timestamp_ms = int(price["timestamp"])
+        return SpotPrice(
+            symbol="BTC/USD",
+            price=Decimal(str(price["value"])),
+            source="POLYMARKET_CHAINLINK",
+            observed_at=timestamp_ms // 1000,
+        )
+
+    def btc_usd(self) -> SpotPrice:
+        with self._lock:
+            if not self._started:
+                self._started = True
+                threading.Thread(target=self._run, name="polymarket-chainlink", daemon=True).start()
+        if not self._ready.wait(self.timeout):
+            detail = f": {self._last_error}" if self._last_error else ""
+            raise RuntimeError(f"Timed out waiting for Polymarket Chainlink BTC/USD stream{detail}")
+        assert self._latest is not None
+        return self._latest
+
+    def _run(self) -> None:
+        while True:
+            connection = None
+            try:
+                options: dict[str, object] = {"timeout": self.timeout, "sslopt": {"ca_certs": certifi.where()}}
+                if self.proxy_url:
+                    proxy = urlparse(self.proxy_url)
+                    if not proxy.hostname or not proxy.port:
+                        raise ValueError("WebSocket proxy must include scheme, host, and port")
+                    options.update(
+                        http_proxy_host=proxy.hostname,
+                        http_proxy_port=proxy.port,
+                        proxy_type=proxy.scheme,
+                    )
+                connection = websocket.create_connection(self.URL, **options)
+                connection.send(json.dumps(self.SUBSCRIPTION))
+                while True:
+                    try:
+                        message = connection.recv()
+                    except websocket.WebSocketTimeoutException:
+                        connection.send("PING")
+                        continue
+                    if not isinstance(message, str) or not message.strip():
+                        continue
+                    price = self.parse_message(message)
+                    if price is not None:
+                        self._latest = price
+                        self._ready.set()
+            except Exception as exc:
+                self._last_error = str(exc)
+                time.sleep(1)
+            finally:
+                if connection is not None:
+                    connection.close()
 
 
 def extract_price_threshold(text: str) -> Decimal | None:

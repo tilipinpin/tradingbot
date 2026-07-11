@@ -176,8 +176,8 @@ class ClobDataClient:
         self.timeout = timeout
 
     def quote(self, token_id: str) -> OrderBookQuote:
-        bid = self._price(token_id, "SELL")
-        ask = self._price(token_id, "BUY")
+        bid = self._price(token_id, "BUY")
+        ask = self._price(token_id, "SELL")
         return OrderBookQuote(bid=bid, ask=ask)
 
     def _price(self, token_id: str, side: str) -> Decimal | None:

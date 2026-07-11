@@ -42,6 +42,8 @@ class PaperPosition:
     stake: Decimal
     shares: Decimal
     settled: bool = False
+    profit: Decimal | None = None
+    accounted: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,18 +51,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slug", required=True, help="Current BTC 5m event slug or Polymarket event URL.")
     parser.add_argument("--duration", type=int, default=900, help="Total watch duration in seconds.")
     parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds.")
-    parser.add_argument("--price-source", default="COINGECKO", help="BINANCE, COINBASE, or COINGECKO.")
+    parser.add_argument("--price-source", default="AUTO", help="AUTO (Polymarket Chainlink + free exchanges), POLYMARKET_CHAINLINK, CHAINLINK, BINANCE, COINBASE, KRAKEN, or COINGECKO.")
     parser.add_argument("--edge", default="0.06", help="Minimum theoretical edge for BUY_UP/BUY_DOWN.")
     parser.add_argument("--fallback-sigma", default="0.00005", help="Fallback volatility per sqrt(second).")
     parser.add_argument("--clob-host", default="https://clob.polymarket.com")
+    parser.add_argument("--market-data-timeout", type=int, default=3, help="Per-request timeout for CLOB and spot data.")
+    parser.add_argument("--ws-proxy", help="Optional WebSocket proxy, e.g. socks5h://127.0.0.1:7898.")
     parser.add_argument("--auto-trade", action="store_true", help="Enable automatic signal detection.")
     parser.add_argument("--live-trading", action="store_true", help="Actually submit orders. Requires wallet env vars.")
-    parser.add_argument("--strategy", default="near_even_momentum", choices=["near_even_momentum"])
-    parser.add_argument("--decision-seconds-before-end", type=int, default=120)
-    parser.add_argument("--min-entry", default="0.40")
-    parser.add_argument("--max-entry", default="0.50")
+    parser.add_argument("--strategy", default="fair_value_edge", choices=["near_even_momentum", "fair_value_edge"])
+    parser.add_argument("--decision-seconds-before-end", type=int, default=90)
+    parser.add_argument("--min-seconds-before-end", type=int, default=25)
+    parser.add_argument("--signal-confirmations", type=int, default=2)
+    parser.add_argument("--max-spot-age", type=int, default=20, help="Maximum cached spot-price age allowed for entries.")
+    parser.add_argument("--max-start-capture-delay", type=int, default=15, help="Skip a window if its start price is captured later than this many seconds.")
+    parser.add_argument("--min-win-probability", default="0.62")
+    parser.add_argument("--min-entry", default="0.50")
+    parser.add_argument("--max-entry", default="0.78")
+    parser.add_argument("--max-spread", default="0.04", help="Max bid/ask spread allowed for the selected side.")
+    parser.add_argument("--min-ask-sum", default="0.90", help="Skip markets where Up ask + Down ask is below this.")
+    parser.add_argument("--max-ask-sum", default="1.10", help="Skip markets where Up ask + Down ask is above this.")
     parser.add_argument("--order-size", default="5")
     parser.add_argument("--max-trades", type=int, default=1, help="Max live/dry-run trade signals per window.")
+    parser.add_argument("--max-consecutive-losses", type=int, default=2)
+    parser.add_argument("--pause-windows-after-losses", type=int, default=2)
     parser.add_argument("--paper-trading", action="store_true", help="Track a simulated bankroll and settle windows.")
     parser.add_argument("--paper-bankroll", default="20", help="Starting simulated bankroll in USDC.")
     parser.add_argument("--paper-stake", default="1", help="Simulated USDC stake per signal.")
@@ -174,6 +188,103 @@ def choose_near_even_momentum_signal(
     )
 
 
+def quote_spread(quote: OrderBookQuote | None) -> Decimal | None:
+    if quote is None or quote.bid is None or quote.ask is None:
+        return None
+    return quote.ask - quote.bid
+
+
+def quotes_pass_sanity_checks(
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    max_spread: Decimal,
+    min_ask_sum: Decimal,
+    max_ask_sum: Decimal,
+) -> tuple[bool, str]:
+    if up_quote is None or down_quote is None:
+        return False, "missing quote"
+    if up_quote.bid is None or up_quote.ask is None or down_quote.bid is None or down_quote.ask is None:
+        return False, "missing bid/ask"
+    quotes = (("UP", up_quote), ("DOWN", down_quote))
+    for side, quote in quotes:
+        if quote.bid < 0 or quote.ask <= 0 or quote.bid > 1 or quote.ask > 1:
+            return False, f"{side} quote outside 0-1"
+        if quote.bid > quote.ask:
+            return False, f"{side} bid {quote.bid} > ask {quote.ask}"
+        if quote.ask - quote.bid > max_spread:
+            return False, f"{side} spread {quote.ask - quote.bid} > {max_spread}"
+    ask_sum = up_quote.ask + down_quote.ask
+    if ask_sum < min_ask_sum or ask_sum > max_ask_sum:
+        return False, f"ask_sum {ask_sum} outside {min_ask_sum}-{max_ask_sum}"
+    return True, "ok"
+
+
+def choose_fair_value_edge_signal(
+    market: Market,
+    probability_up: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    decision_seconds_before_end: Decimal,
+    min_entry: Decimal,
+    max_entry: Decimal,
+    edge_threshold: Decimal,
+    max_spread: Decimal,
+    min_ask_sum: Decimal,
+    max_ask_sum: Decimal,
+    min_seconds_before_end: Decimal = Decimal("0"),
+    min_win_probability: Decimal = Decimal("0"),
+) -> AutoTradeSignal | None:
+    if seconds_to_end > decision_seconds_before_end or seconds_to_end < min_seconds_before_end:
+        return None
+    ok, reason = quotes_pass_sanity_checks(up_quote, down_quote, max_spread, min_ask_sum, max_ask_sum)
+    if not ok:
+        return None
+    assert up_quote is not None and up_quote.ask is not None
+    assert down_quote is not None and down_quote.ask is not None
+
+    down_probability = Decimal("1") - probability_up
+    up_edge = probability_up - up_quote.ask
+    down_edge = down_probability - down_quote.ask
+    if up_edge >= down_edge:
+        side = "UP"
+        token_id = market.token_ids[0]
+        entry = up_quote.ask
+        edge = up_edge
+    else:
+        side = "DOWN"
+        token_id = market.token_ids[1]
+        entry = down_quote.ask
+        edge = down_edge
+
+    if entry < min_entry or entry > max_entry:
+        return None
+    selected_probability = probability_up if side == "UP" else down_probability
+    if selected_probability < min_win_probability:
+        return None
+
+    # Late and expensive entries need extra model margin because small price errors
+    # have an outsized effect close to settlement.
+    required_edge = edge_threshold
+    if seconds_to_end < Decimal("45"):
+        required_edge += Decimal("0.02")
+    if entry > Decimal("0.65"):
+        required_edge += (entry - Decimal("0.65")) * Decimal("0.25")
+    if edge < required_edge:
+        return None
+
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=entry,
+        reason=(
+            f"fair_value_edge entry={entry} edge={edge.quantize(Decimal('0.0001'))} "
+            f"required_edge={required_edge.quantize(Decimal('0.0001'))} "
+            f"p_up={probability_up.quantize(Decimal('0.0001'))} seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
 def build_live_trader(args: argparse.Namespace) -> ClobTradingClient | None:
     if not args.live_trading:
         return None
@@ -249,6 +360,7 @@ def settle_paper_positions(positions: list[PaperPosition], slug: str, bankroll: 
         payout = position.shares if position.side == winner else Decimal("0")
         bankroll += payout
         profit = payout - position.stake
+        position.profit = profit
         logger.info(
             "PAPER_SETTLE slug=%s side=%s winner=%s payout=%s profit=%s bankroll=%s",
             slug,
@@ -259,6 +371,32 @@ def settle_paper_positions(positions: list[PaperPosition], slug: str, bankroll: 
             bankroll.quantize(Decimal("0.0001")),
         )
     return bankroll
+
+
+def account_new_paper_settlements(
+    positions: list[PaperPosition],
+    consecutive_losses: int,
+    max_consecutive_losses: int,
+    pause_windows_after_losses: int,
+) -> tuple[int, int]:
+    pause_windows = 0
+    for position in positions:
+        if not position.settled or position.accounted or position.profit is None:
+            continue
+        position.accounted = True
+        if position.profit < 0:
+            consecutive_losses += 1
+        else:
+            consecutive_losses = 0
+        if max_consecutive_losses > 0 and consecutive_losses >= max_consecutive_losses:
+            pause_windows = max(pause_windows, pause_windows_after_losses)
+            logger.info(
+                "RISK_PAUSE_TRIGGER consecutive_losses=%s pause_windows=%s",
+                consecutive_losses,
+                pause_windows,
+            )
+            consecutive_losses = 0
+    return consecutive_losses, pause_windows
 
 
 def settle_all_paper_positions(positions: list[PaperPosition], bankroll: Decimal) -> Decimal:
@@ -283,25 +421,36 @@ def _seconds_to_end(market: Market, now: datetime) -> Decimal:
 def watch() -> None:
     args = parse_args()
     gamma = GammaClient()
-    clob = ClobDataClient(args.clob_host)
+    clob = ClobDataClient(args.clob_host, timeout=args.market_data_timeout)
     trader = build_live_trader(args)
-    price_client = SpotPriceClient(args.price_source)
+    price_client = SpotPriceClient(args.price_source, timeout=args.market_data_timeout, ws_proxy=args.ws_proxy)
     slug = slug_from_value(args.slug)
     stop_at = time.monotonic() + args.duration
     current_market: Market | None = None
     start_price: Decimal | None = None
     initial_up_ask: Decimal | None = None
+    last_spot_price: Decimal | None = None
+    last_spot_fetched_at: float | None = None
     prices: list[Decimal] = []
     signals_this_window = 0
+    candidate_side: str | None = None
+    candidate_confirmations = 0
     edge_threshold = Decimal(args.edge)
     fallback_sigma = Decimal(args.fallback_sigma)
     min_entry = Decimal(args.min_entry)
     max_entry = Decimal(args.max_entry)
+    max_spread = Decimal(args.max_spread)
+    min_ask_sum = Decimal(args.min_ask_sum)
+    max_ask_sum = Decimal(args.max_ask_sum)
+    min_win_probability = Decimal(args.min_win_probability)
     order_size = Decimal(args.order_size)
     decision_seconds_before_end = Decimal(str(args.decision_seconds_before_end))
+    min_seconds_before_end = Decimal(str(args.min_seconds_before_end))
     paper_bankroll = Decimal(args.paper_bankroll)
     paper_stake = Decimal(args.paper_stake)
     paper_positions: list[PaperPosition] = []
+    consecutive_losses = 0
+    pause_windows_remaining = 0
 
     if args.live_trading and not args.auto_trade:
         raise ValueError("--live-trading requires --auto-trade")
@@ -320,6 +469,13 @@ def watch() -> None:
         now = datetime.now(timezone.utc)
         if args.paper_trading:
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
+            consecutive_losses, new_pause_windows = account_new_paper_settlements(
+                paper_positions,
+                consecutive_losses,
+                args.max_consecutive_losses,
+                args.pause_windows_after_losses,
+            )
+            pause_windows_remaining = max(pause_windows_remaining, new_pause_windows)
             if args.stop_when_bust and paper_bankroll <= 0 and all(position.settled for position in paper_positions):
                 logger.info("PAPER_BUST bankroll=%s. Exiting.", paper_bankroll)
                 return
@@ -333,11 +489,26 @@ def watch() -> None:
             initial_up_ask = None
             prices = []
             signals_this_window = 0
+            candidate_side = None
+            candidate_confirmations = 0
+            if pause_windows_remaining > 0:
+                pause_windows_remaining -= 1
+                logger.info("RISK_PAUSE_ACTIVE remaining_windows=%s", pause_windows_remaining)
             if current_market is None:
                 time.sleep(args.interval)
                 continue
             if _seconds_to_end(current_market, datetime.now(timezone.utc)) <= 0:
                 logger.info("Skipping expired window: %s", current_market.slug)
+                slug = next_5m_slug(current_market.slug)
+                current_market = None
+                continue
+            elapsed_since_start = -_seconds_to_start(current_market, datetime.now(timezone.utc))
+            if elapsed_since_start > Decimal(str(args.max_start_capture_delay)):
+                logger.info(
+                    "Skipping partial window %s: already started %ss ago",
+                    current_market.slug,
+                    int(elapsed_since_start),
+                )
                 slug = next_5m_slug(current_market.slug)
                 current_market = None
                 continue
@@ -352,7 +523,23 @@ def watch() -> None:
 
         seconds_to_start = _seconds_to_start(current_market, now)
         seconds_to_end = _seconds_to_end(current_market, now)
-        spot = price_client.btc_usd()
+        try:
+            spot = price_client.btc_usd()
+            if spot.observed_at is not None:
+                report_age = abs(int(time.time()) - spot.observed_at)
+                if report_age > args.max_spot_age:
+                    raise RuntimeError(f"Chainlink report is stale by {report_age}s")
+            last_spot_price = spot.price
+            last_spot_fetched_at = time.monotonic()
+        except Exception as exc:
+            if last_spot_price is None:
+                logger.warning("Spot price unavailable and no cached price exists: %s", exc)
+                time.sleep(args.interval)
+                continue
+            logger.warning("Spot price unavailable; reusing cached BTC/USD=%s: %s", last_spot_price, exc)
+            spot = type("CachedSpotPrice", (), {"price": last_spot_price, "source": "CACHE"})()
+
+        spot_age = Decimal(str(time.monotonic() - last_spot_fetched_at)) if last_spot_fetched_at is not None else Decimal("Infinity")
 
         if seconds_to_start > 0:
             logger.info(
@@ -365,6 +552,20 @@ def watch() -> None:
             continue
 
         if start_price is None:
+            elapsed_since_start = -seconds_to_start
+            if spot.source == "CACHE":
+                if elapsed_since_start > Decimal(str(args.max_start_capture_delay)):
+                    logger.info(
+                        "Skipping %s: no fresh start price within %ss",
+                        current_market.slug,
+                        args.max_start_capture_delay,
+                    )
+                    slug = next_5m_slug(current_market.slug)
+                    current_market = None
+                else:
+                    logger.info("Waiting for fresh start price for %s", current_market.slug)
+                time.sleep(args.interval)
+                continue
             start_price = spot.price
             prices = [spot.price]
             logger.info("Captured start_price=%s for %s", start_price, current_market.slug)
@@ -393,19 +594,59 @@ def watch() -> None:
             action,
         )
 
-        if args.auto_trade and signals_this_window < args.max_trades:
-            signal = choose_near_even_momentum_signal(
-                current_market,
-                initial_up_ask,
-                up_quote,
-                down_quote,
-                seconds_to_end,
-                decision_seconds_before_end,
-                min_entry,
-                max_entry,
-            )
+        if args.auto_trade and signals_this_window < args.max_trades and pause_windows_remaining <= 0:
+            if args.strategy == "near_even_momentum":
+                signal = choose_near_even_momentum_signal(
+                    current_market,
+                    initial_up_ask,
+                    up_quote,
+                    down_quote,
+                    seconds_to_end,
+                    decision_seconds_before_end,
+                    min_entry,
+                    max_entry,
+                )
+            else:
+                signal = choose_fair_value_edge_signal(
+                    current_market,
+                    fair.probability_up,
+                    up_quote,
+                    down_quote,
+                    seconds_to_end,
+                    decision_seconds_before_end,
+                    min_entry,
+                    max_entry,
+                    edge_threshold,
+                    max_spread,
+                    min_ask_sum,
+                    max_ask_sum,
+                    min_seconds_before_end,
+                    min_win_probability,
+                )
             if signal is not None:
+                if spot_age > Decimal(str(args.max_spot_age)):
+                    logger.info("SIGNAL_REJECTED stale_spot_age=%.1fs", float(spot_age))
+                    candidate_side = None
+                    candidate_confirmations = 0
+                    time.sleep(args.interval)
+                    continue
+                if signal.side == candidate_side:
+                    candidate_confirmations += 1
+                else:
+                    candidate_side = signal.side
+                    candidate_confirmations = 1
+                if candidate_confirmations < max(1, args.signal_confirmations):
+                    logger.info(
+                        "SIGNAL_PENDING side=%s confirmations=%s/%s",
+                        signal.side,
+                        candidate_confirmations,
+                        max(1, args.signal_confirmations),
+                    )
+                    time.sleep(args.interval)
+                    continue
                 signals_this_window += 1
+                candidate_side = None
+                candidate_confirmations = 0
                 logger.info(
                     "AUTO_SIGNAL %s side=%s price=%s size=%s reason=%s",
                     current_market.slug,
@@ -437,6 +678,9 @@ def watch() -> None:
                         neg_risk=current_market.neg_risk,
                     )
                     logger.info("LIVE ORDER response=%s", response)
+            else:
+                candidate_side = None
+                candidate_confirmations = 0
 
         time.sleep(args.interval)
 
