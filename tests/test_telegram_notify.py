@@ -156,6 +156,26 @@ def test_settlement_service_persists_and_deduplicates_notifications(tmp_path) ->
     assert settlement_key(order) in saved["settlements"]
 
 
+def test_record_fill_is_silent_until_settlement_by_default(tmp_path) -> None:
+    session = FakeSession()
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=tmp_path / "trades.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+
+    service.record_fill(matched_order())
+
+    assert session.calls == []
+    assert service.ledger_path.read_text().strip()
+
+
 def test_daily_stats_count_only_resolved_orders_in_win_rate() -> None:
     orders = [
         matched_order("one", "UP", "3", "5"),

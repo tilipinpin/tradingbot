@@ -315,6 +315,7 @@ class TradingNotificationService:
         state_path: Path = Path("data/telegram_daily_state.json"),
         timezone_name: str = "Asia/Shanghai",
         settlement_interval: float = 30,
+        notify_on_matched: bool = False,
     ) -> None:
         self.notifier = notifier
         self.trader = trader
@@ -331,6 +332,7 @@ class TradingNotificationService:
         self._next_daily_attempt = 0.0
         self._next_settlement_attempt = 0.0
         self.settlement_interval = max(5, settlement_interval)
+        self.notify_on_matched = notify_on_matched
         try:
             self.local_timezone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
@@ -360,6 +362,8 @@ class TradingNotificationService:
             state_path=Path(os.getenv("TELEGRAM_DAILY_STATE", "data/telegram_daily_state.json")),
             timezone_name=os.getenv("TELEGRAM_TIMEZONE", "Asia/Shanghai"),
             settlement_interval=float(os.getenv("TELEGRAM_SETTLEMENT_INTERVAL", "30")),
+            notify_on_matched=os.getenv("TELEGRAM_NOTIFY_ON_MATCHED", "false").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -414,7 +418,8 @@ class TradingNotificationService:
                     handle.write(json.dumps(order, ensure_ascii=False, default=str) + "\n")
             except OSError as exc:
                 self.notify_exception("写入成交账本", exc, key="trade-ledger")
-        self.notifier.send(format_fill_message(order))
+        if self.notify_on_matched:
+            self.notifier.send(format_fill_message(order))
 
     def notify_exception(
         self,
