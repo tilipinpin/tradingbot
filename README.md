@@ -149,6 +149,7 @@ TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=<bot-token>
 TELEGRAM_CHAT_ID=<chat-id>
 TELEGRAM_TIMEZONE=Asia/Shanghai
+TELEGRAM_COMMANDS_ENABLED=true
 ```
 
 先在 Telegram 中主动给机器人发送一条消息，确保 bot 可以向该 chat ID 回复。未配置 token
@@ -160,6 +161,19 @@ TELEGRAM_TIMEZONE=Asia/Shanghai
 - 异常：签名、余额/授权、RPC/API 超时、网络/代理和订单未成交；持续同类行情异常默认冷却 5 分钟。
 - 日报：上海时区午夜后的第一个轮询，统计实际成交、已结算胜率、策略毛盈亏、余额变化和手续费/余额差额估算。
 - 停止：正常结束、`Ctrl+C` 或未捕获异常，包含运行时长、累计尝试、累计成交、最终余额和最后错误。
+
+同一个已授权 chat ID 可以直接控制和查询机器人，其他 chat 的消息会被忽略：
+
+- `/balance`：读取交易钱包的可用抵押余额。
+- `/pnl`：读取本地成交账本和逐单结算记录，汇总今日胜率与毛盈亏。
+- `/positions`：用 `DEPOSIT_WALLET`/`FUNDER_ADDRESS` 查询 Polymarket Data API 当前持仓。
+- `/status`：查看进程心跳、运行时间、策略、窗口和累计尝试/成交。
+- `/stop`：立即阻止提交新订单并持久化暂停状态；不会撤销已经提交或成交的订单。
+- `/start`：清除暂停状态，从下一次有效信号开始恢复下单。
+- `/restart`：保存 Telegram offset 和实盘摘要，使用原命令行参数替换并重启当前进程。
+
+首次启用命令轮询时会丢弃启动前积压的旧消息，避免历史 `/stop` 或 `/restart` 被误执行。
+控制状态和 Telegram offset 也保存在 `data/telegram_daily_state.json`，所以进程重启后不会重复执行指令。
 
 日报成交账本保存在 `data/live_trade_events.jsonl`，每日余额快照保存在
 `data/telegram_daily_state.json`；二者均位于 Git 忽略的 `data/` 目录。断电或 `SIGKILL`

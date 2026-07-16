@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -15,6 +16,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
+from src.telegram_commands import TelegramCommandPoller
+
 
 logger = logging.getLogger("telegram-notify")
 
@@ -22,6 +25,7 @@ BOT_TOKEN_PATTERN = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
 PRIVATE_KEY_PATTERN = re.compile(r"\b(?:0x)?[0-9a-fA-F]{64}\b")
 PROBABILITY_PATTERN = re.compile(r"\b(?:probability|p_up)=([01](?:\.\d+)?)")
 MICRO_UNITS = Decimal("1000000")
+POSITIONS_API = "https://data-api.polymarket.com/positions"
 
 
 def _as_decimal(value: Any, default: str = "0") -> Decimal:
@@ -271,26 +275,37 @@ class TelegramNotifier:
         return bool(self.token and self.chat_id)
 
     def send(self, message: str) -> bool:
+        return self.api_request(
+            "sendMessage",
+            {
+                "chat_id": self.chat_id,
+                "text": sanitize_sensitive_text(message),
+                "disable_web_page_preview": True,
+            },
+        ) is not None
+
+    def api_request(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
         if not self.enabled:
-            return False
+            return None
         try:
             response = self.session.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={
-                    "chat_id": self.chat_id,
-                    "text": sanitize_sensitive_text(message),
-                    "disable_web_page_preview": True,
-                },
-                timeout=self.timeout,
+                f"https://api.telegram.org/bot{self.token}/{method}",
+                json=payload,
+                timeout=timeout if timeout is not None else self.timeout,
             )
             response.raise_for_status()
-            payload = response.json()
-            if payload.get("ok") is not True:
+            response_payload = response.json()
+            if response_payload.get("ok") is not True:
                 raise RuntimeError("Telegram API returned ok=false")
-            return True
+            return response_payload
         except Exception as exc:
-            logger.warning("Telegram notification failed: %s", sanitize_sensitive_text(exc))
-            return False
+            logger.warning("Telegram API %s failed: %s", method, sanitize_sensitive_text(exc))
+            return None
 
     def alert(self, key: str, message: str, cooldown: float = 300) -> bool:
         now = time.monotonic()
@@ -316,6 +331,9 @@ class TradingNotificationService:
         timezone_name: str = "Asia/Shanghai",
         settlement_interval: float = 30,
         notify_on_matched: bool = False,
+        commands_enabled: bool = False,
+        wallet_address: str | None = None,
+        positions_api: str = POSITIONS_API,
     ) -> None:
         self.notifier = notifier
         self.trader = trader
@@ -333,12 +351,27 @@ class TradingNotificationService:
         self._next_settlement_attempt = 0.0
         self.settlement_interval = max(5, settlement_interval)
         self.notify_on_matched = notify_on_matched
+        self.commands_enabled = commands_enabled
+        self.wallet_address = (wallet_address or "").strip()
+        self.positions_api = positions_api
         try:
             self.local_timezone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
             logger.warning("Unknown Telegram timezone %s; using Asia/Shanghai", timezone_name)
             self.local_timezone = ZoneInfo("Asia/Shanghai")
         self.state = self._load_state()
+        self._pause_event = threading.Event()
+        if bool(self.state.get("control", {}).get("paused")):
+            self._pause_event.set()
+        self._command_poller: TelegramCommandPoller | None = None
+        self._saved_command_offset = int(self.state.get("telegram", {}).get("offset") or 0)
+        self._runtime: dict[str, Any] = {
+            "heartbeat": time.monotonic(),
+            "slug": None,
+            "seconds_left": None,
+            "spot": None,
+            "spot_source": None,
+        }
 
     @classmethod
     def from_env(
@@ -349,6 +382,7 @@ class TradingNotificationService:
         mode: str,
         version: str,
         summary: dict[str, Any],
+        wallet_address: str | None = None,
     ) -> "TradingNotificationService":
         return cls(
             notifier=TelegramNotifier.from_env(),
@@ -364,11 +398,36 @@ class TradingNotificationService:
             settlement_interval=float(os.getenv("TELEGRAM_SETTLEMENT_INTERVAL", "30")),
             notify_on_matched=os.getenv("TELEGRAM_NOTIFY_ON_MATCHED", "false").strip().lower()
             in {"1", "true", "yes", "on"},
+            commands_enabled=os.getenv("TELEGRAM_COMMANDS_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            wallet_address=wallet_address,
+            positions_api=os.getenv("POLYMARKET_POSITIONS_API", POSITIONS_API),
         )
 
     @property
     def enabled(self) -> bool:
         return self.notifier.enabled
+
+    @property
+    def trading_paused(self) -> bool:
+        return self._pause_event.is_set()
+
+    def update_runtime(
+        self,
+        slug: str | None = None,
+        seconds_left: Decimal | None = None,
+        spot: Decimal | None = None,
+        spot_source: str | None = None,
+    ) -> None:
+        self._runtime["heartbeat"] = time.monotonic()
+        if slug is not None:
+            self._runtime["slug"] = slug
+        if seconds_left is not None:
+            self._runtime["seconds_left"] = seconds_left
+        if spot is not None:
+            self._runtime["spot"] = spot
+        if spot_source is not None:
+            self._runtime["spot_source"] = spot_source
 
     def current_balance(self) -> Decimal | None:
         if self.trader is None:
@@ -408,6 +467,45 @@ class TradingNotificationService:
                 ]
             )
         )
+        self._start_command_polling()
+
+    def process_commands(self) -> bool:
+        if self._command_poller is None:
+            return False
+        commands = self._command_poller.drain()
+        drained_offset = self._command_poller.drained_offset
+
+        restart_requested = False
+        for item in commands:
+            if item.command == "/balance":
+                self._send_balance()
+            elif item.command == "/pnl":
+                self._send_today_pnl()
+            elif item.command == "/positions":
+                self._send_positions()
+            elif item.command == "/status":
+                self._send_status()
+            elif item.command == "/stop":
+                self._set_trading_paused(True)
+                self.notifier.send(
+                    "⛔ 已暂停自动交易\n不会再提交新订单；已提交或已成交的订单不会被撤销。"
+                )
+            elif item.command == "/start":
+                self._set_trading_paused(False)
+                self.notifier.send("▶️ 已恢复自动交易\n机器人将从下一次有效信号开始允许下单。")
+            elif item.command == "/restart":
+                self.notifier.send("🔄 已收到重启指令\n正在保存状态并重启机器人。")
+                restart_requested = True
+        if drained_offset != self._saved_command_offset:
+            self.state.setdefault("telegram", {})["offset"] = drained_offset
+            self._saved_command_offset = drained_offset
+            self._save_state()
+        return restart_requested
+
+    def prepare_restart(self) -> None:
+        if self._command_poller is not None:
+            self._command_poller.stop()
+            self._command_poller = None
 
     def record_fill(self, order: dict[str, Any]) -> None:
         order["matched_at"] = order.get("matched_at") or datetime.now(timezone.utc).isoformat()
@@ -537,6 +635,9 @@ class TradingNotificationService:
         if self._stopped:
             return
         self._stopped = True
+        if self._command_poller is not None:
+            self._command_poller.stop()
+            self._command_poller = None
         if not self.enabled:
             return
         balance = self.current_balance()
@@ -555,15 +656,198 @@ class TradingNotificationService:
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
-            return {"days": {}, "settlements": {}}
+            return {"days": {}, "settlements": {}, "control": {}, "telegram": {}}
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             if isinstance(payload, dict) and isinstance(payload.get("days"), dict):
                 payload.setdefault("settlements", {})
+                payload.setdefault("control", {})
+                payload.setdefault("telegram", {})
                 return payload
-            return {"days": {}, "settlements": {}}
+            return {"days": {}, "settlements": {}, "control": {}, "telegram": {}}
         except (OSError, json.JSONDecodeError):
-            return {"days": {}, "settlements": {}}
+            return {"days": {}, "settlements": {}, "control": {}, "telegram": {}}
+
+    def _start_command_polling(self) -> None:
+        if not self.commands_enabled or not self.enabled:
+            return
+        offset = self._saved_command_offset
+        discard_pending = False
+        if offset <= 0:
+            payload = self.notifier.api_request(
+                "getUpdates",
+                {"offset": 0, "timeout": 0, "allowed_updates": ["message"]},
+                timeout=self.notifier.timeout,
+            )
+            discard_pending = payload is None
+            updates = payload.get("result") if payload is not None else []
+            update_ids = [
+                int(update.get("update_id") or 0)
+                for update in (updates or [])
+                if isinstance(update, dict)
+            ]
+            if update_ids:
+                offset = max(update_ids) + 1
+                self.state.setdefault("telegram", {})["offset"] = offset
+                self._saved_command_offset = offset
+                self._save_state()
+        self.notifier.api_request(
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": "balance", "description": "查看钱包余额"},
+                    {"command": "pnl", "description": "查看今日盈亏"},
+                    {"command": "positions", "description": "查看当前持仓"},
+                    {"command": "status", "description": "查看机器人状态"},
+                    {"command": "stop", "description": "紧急暂停新交易"},
+                    {"command": "start", "description": "恢复自动交易"},
+                    {"command": "restart", "description": "重启机器人"},
+                ]
+            },
+        )
+        self._command_poller = TelegramCommandPoller(
+            notifier=self.notifier,
+            allowed_chat_id=self.notifier.chat_id,
+            offset=offset,
+            pause_event=self._pause_event,
+            discard_pending=discard_pending,
+        )
+        self._command_poller.start()
+
+    def _set_trading_paused(self, paused: bool) -> None:
+        if paused:
+            self._pause_event.set()
+        else:
+            self._pause_event.clear()
+        self.state.setdefault("control", {})["paused"] = paused
+        self.state["control"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_state()
+
+    def _send_balance(self) -> None:
+        balance = self.current_balance()
+        self.notifier.send(
+            "\n".join(
+                [
+                    "📈 Polymarket 钱包余额",
+                    f"可用抵押余额: {_money(balance)}",
+                    f"查询时间: {datetime.now(self.local_timezone).isoformat(timespec='seconds')}",
+                ]
+            )
+        )
+
+    def _send_today_pnl(self) -> None:
+        today = datetime.now(self.local_timezone).date()
+        orders = self._orders_for_date(today)
+        settlements = self.state.get("settlements", {})
+        resolved = [
+            settlements[settlement_key(order)]
+            for order in orders
+            if settlement_key(order) in settlements
+        ]
+        wins = sum(1 for item in resolved if item.get("won") is True)
+        gross_pnl = sum(
+            (_as_decimal(item.get("gross_pnl")) for item in resolved),
+            Decimal("0"),
+        )
+        settled = len(resolved)
+        win_rate = "N/A" if settled == 0 else f"{Decimal(wins) / Decimal(settled):.2%}"
+        self.notifier.send(
+            "\n".join(
+                [
+                    f"📊 今日盈亏 {today.isoformat()}",
+                    f"实际成交: {len(orders)} 单",
+                    f"已结算: {settled} 单，待结算: {len(orders) - settled} 单",
+                    f"胜负: {wins} 胜 / {settled - wins} 负",
+                    f"胜率: {win_rate}",
+                    f"已结算毛盈亏: {gross_pnl:+.4f} pUSD",
+                    f"当前钱包余额: {_money(self.current_balance())}",
+                ]
+            )
+        )
+
+    def _send_positions(self) -> None:
+        if not self.wallet_address:
+            self.notifier.send("📋 无法查询持仓\n未配置 DEPOSIT_WALLET/FUNDER_ADDRESS。")
+            return
+        try:
+            response = requests.get(
+                self.positions_api,
+                params={
+                    "user": self.wallet_address,
+                    "sizeThreshold": "0.01",
+                    "limit": "100",
+                },
+                timeout=self.notifier.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            positions = payload if isinstance(payload, list) else []
+        except Exception as exc:
+            self.notify_exception("查询持仓", exc, key="positions-read", cooldown=60)
+            self.notifier.send("📋 持仓查询失败\n请检查 Data API、代理和网络连接。")
+            return
+        if not positions:
+            self.notifier.send("📋 当前持仓\n暂无大于 0.01 份的持仓。")
+            return
+
+        total_value = sum(
+            (_as_decimal(item.get("currentValue")) for item in positions),
+            Decimal("0"),
+        )
+        total_pnl = sum(
+            (_as_decimal(item.get("cashPnl")) for item in positions),
+            Decimal("0"),
+        )
+        lines = [
+            f"📋 当前持仓（{len(positions)} 项）",
+            f"当前总价值: {_money(total_value)}",
+            f"持仓现金盈亏: {total_pnl:+.4f} pUSD",
+        ]
+        for index, item in enumerate(positions[:10], start=1):
+            title = str(item.get("title") or item.get("slug") or "N/A")
+            if len(title) > 45:
+                title = title[:42] + "..."
+            lines.extend(
+                [
+                    "",
+                    f"{index}. {title}",
+                    f"{str(item.get('outcome') or 'N/A').upper()} | "
+                    f"{_as_decimal(item.get('size')):.4f} 份 | "
+                    f"均价 {_as_decimal(item.get('avgPrice')):.4f} | "
+                    f"现价 {_as_decimal(item.get('curPrice')):.4f}",
+                    f"价值 {_as_decimal(item.get('currentValue')):.4f} pUSD | "
+                    f"盈亏 {_as_decimal(item.get('cashPnl')):+.4f} pUSD"
+                    f"{' | 可赎回' if item.get('redeemable') else ''}",
+                ]
+            )
+        if len(positions) > 10:
+            lines.append(f"\n另有 {len(positions) - 10} 项未展开。")
+        self.notifier.send("\n".join(lines))
+
+    def _send_status(self) -> None:
+        heartbeat_age = max(0, int(time.monotonic() - self._runtime["heartbeat"]))
+        seconds_left = self._runtime.get("seconds_left")
+        spot = self._runtime.get("spot")
+        lines = [
+            "❤️ Polymarket 机器人状态",
+            "进程: 正常运行",
+            f"交易: {'已暂停' if self.trading_paused else '运行中'}",
+            f"版本: {self.version}",
+            f"模式: {self.mode}",
+            f"策略: {self.strategy}",
+            f"运行时长: {_duration(time.monotonic() - self.started_monotonic)}",
+            f"心跳: {heartbeat_age} 秒前",
+            f"累计尝试/成交: {self.summary.get('order_attempts', 0)}/{self.summary.get('matched_orders', 0)}",
+        ]
+        if self._runtime.get("slug"):
+            lines.append(f"当前市场: {self._runtime['slug']}")
+        if seconds_left is not None:
+            lines.append(f"窗口剩余: {max(0, int(_as_decimal(seconds_left)))} 秒")
+        if spot is not None:
+            lines.append(
+                f"BTC/USD: {_as_decimal(spot):.2f}（{self._runtime.get('spot_source') or 'N/A'}）"
+            )
+        self.notifier.send("\n".join(lines))
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

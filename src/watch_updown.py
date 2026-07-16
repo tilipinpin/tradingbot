@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -699,6 +700,7 @@ def watch() -> None:
         mode=str(live_summary["mode"]),
         version=__version__,
         summary=live_summary,
+        wallet_address=os.getenv(args.funder_address_env) or os.getenv("DEPOSIT_WALLET"),
     )
     _ACTIVE_NOTIFICATIONS = notifications
     atexit.register(notifications.stop, "进程退出")
@@ -743,6 +745,15 @@ def watch() -> None:
 
     while time.time() < stop_at:
         now = datetime.now(timezone.utc)
+        notifications.update_runtime()
+        if notifications.process_commands():
+            live_summary["status"] = "restarting"
+            write_live_summary()
+            notifications.prepare_restart()
+            os.execv(
+                sys.executable,
+                [sys.executable, "-m", "src.watch_updown", *sys.argv[1:]],
+            )
         notifications.maybe_send_settlements(fetch_winner)
         notifications.maybe_send_daily(fetch_winner)
         if args.paper_trading:
@@ -826,6 +837,12 @@ def watch() -> None:
             spot = type("CachedSpotPrice", (), {"price": last_spot_price, "source": "CACHE"})()
 
         spot_age = Decimal(str(time.monotonic() - last_spot_fetched_at)) if last_spot_fetched_at is not None else Decimal("Infinity")
+        notifications.update_runtime(
+            slug=current_market.slug,
+            seconds_left=seconds_to_end,
+            spot=spot.price,
+            spot_source=spot.source,
+        )
 
         if seconds_to_start > 0:
             logger.info(
@@ -903,7 +920,12 @@ def watch() -> None:
             action,
         )
 
-        if args.auto_trade and args.strategy == "paired_lock" and pause_windows_remaining <= 0:
+        if (
+            args.auto_trade
+            and args.strategy == "paired_lock"
+            and pause_windows_remaining <= 0
+            and not notifications.trading_paused
+        ):
             elapsed_seconds = Decimal("300") - seconds_to_end
             quotes = {"UP": up_quote, "DOWN": down_quote}
             if paired_state is None and elapsed_seconds >= Decimal(str(args.paired_entry_delay)):
@@ -1007,6 +1029,7 @@ def watch() -> None:
             and args.strategy != "paired_lock"
             and signals_this_window < args.max_trades
             and pause_windows_remaining <= 0
+            and not notifications.trading_paused
         ):
             if args.strategy == "near_even_momentum":
                 signal = choose_near_even_momentum_signal(
@@ -1061,6 +1084,12 @@ def watch() -> None:
                     min_win_probability,
                 )
             if signal is not None:
+                if notifications.trading_paused:
+                    logger.warning("AUTO_SIGNAL blocked because Telegram trading pause is active.")
+                    candidate_side = None
+                    candidate_confirmations = 0
+                    time.sleep(args.interval)
+                    continue
                 if spot_age > Decimal(str(args.max_spot_age)):
                     logger.info("SIGNAL_REJECTED stale_spot_age=%.1fs", float(spot_age))
                     candidate_side = None
@@ -1122,6 +1151,11 @@ def watch() -> None:
                             notional,
                             max_live_notional,
                         )
+                        time.sleep(args.interval)
+                        continue
+                    if notifications.trading_paused:
+                        logger.warning("LIVE ORDER blocked by Telegram trading pause before submission.")
+                        signals_this_window = max(0, signals_this_window - 1)
                         time.sleep(args.interval)
                         continue
                     order_record = {

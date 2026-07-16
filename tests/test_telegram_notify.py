@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
+from src.telegram_commands import TelegramCommand
 from src.telegram_notify import (
     TelegramNotifier,
     TradingNotificationService,
@@ -34,6 +36,21 @@ class FakeSession:
     def post(self, url: str, json: dict, timeout: float) -> FakeResponse:
         self.calls.append((url, json, timeout))
         return FakeResponse()
+
+
+class StubCommandPoller:
+    def __init__(self, commands: list[TelegramCommand], offset: int = 1) -> None:
+        self.commands = commands
+        self.offset = offset
+        self.drained_offset = offset
+
+    def drain(self) -> list[TelegramCommand]:
+        commands = self.commands
+        self.commands = []
+        return commands
+
+    def stop(self, wait: bool = True) -> None:
+        return None
 
 
 def matched_order(
@@ -201,3 +218,173 @@ def test_daily_stats_count_only_resolved_orders_in_win_rate() -> None:
 def test_sensitive_text_redacts_telegram_tokens() -> None:
     token = "123456789:abcdefghijklmnopqrstuvwxyz_ABCD"
     assert token not in sanitize_sensitive_text(f"request {token} failed")
+
+
+def test_command_stop_and_start_persist_trading_gate(tmp_path) -> None:
+    session = FakeSession()
+    state = tmp_path / "state.json"
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+    service._command_poller = StubCommandPoller(
+        [TelegramCommand(1, "/stop"), TelegramCommand(2, "/start")],
+        offset=3,
+    )
+
+    assert service.process_commands() is False
+
+    assert service.trading_paused is False
+    saved = json.loads(state.read_text())
+    assert saved["control"]["paused"] is False
+    assert saved["telegram"]["offset"] == 3
+    assert "已暂停自动交易" in session.calls[0][1]["text"]
+    assert "已恢复自动交易" in session.calls[1][1]["text"]
+
+
+def test_restart_command_requests_process_replacement_without_persisting_pause(tmp_path) -> None:
+    session = FakeSession()
+    state = tmp_path / "state.json"
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+    service._command_poller = StubCommandPoller([TelegramCommand(4, "/restart")], offset=5)
+
+    assert service.process_commands() is True
+
+    saved = json.loads(state.read_text())
+    assert saved["telegram"]["offset"] == 5
+    assert saved.get("control", {}).get("paused") is not True
+    assert "正在保存状态并重启" in session.calls[0][1]["text"]
+
+
+def test_today_pnl_uses_persisted_per_order_settlements(tmp_path) -> None:
+    session = FakeSession()
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    order = matched_order(cost="3", shares="5")
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    order["matched_at"] = now.isoformat()
+    ledger.write_text(json.dumps(order) + "\n")
+    state.write_text(
+        json.dumps(
+            {
+                "days": {},
+                "settlements": {settlement_key(order): settlement_values(order, "UP")},
+            }
+        )
+    )
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+    )
+    service.current_balance = lambda: Decimal("22")
+    service._command_poller = StubCommandPoller([TelegramCommand(1, "/pnl")], offset=2)
+
+    service.process_commands()
+
+    message = session.calls[0][1]["text"]
+    assert "实际成交: 1 单" in message
+    assert "胜率: 100.00%" in message
+    assert "已结算毛盈亏: +2.0000 pUSD" in message
+    assert "当前钱包余额: 22.0000 pUSD" in message
+
+
+def test_positions_command_uses_deposit_wallet_data_api(monkeypatch, tmp_path) -> None:
+    class PositionResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> list[dict]:
+            return [
+                {
+                    "title": "Bitcoin Up or Down - test",
+                    "outcome": "Up",
+                    "size": 5,
+                    "avgPrice": 0.6,
+                    "curPrice": 1,
+                    "currentValue": 5,
+                    "cashPnl": 2,
+                    "redeemable": True,
+                }
+            ]
+
+    captured: dict = {}
+
+    def fake_get(url: str, params: dict, timeout: float) -> PositionResponse:
+        captured.update({"url": url, "params": params, "timeout": timeout})
+        return PositionResponse()
+
+    monkeypatch.setattr("src.telegram_notify.requests.get", fake_get)
+    session = FakeSession()
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=tmp_path / "state.json",
+        wallet_address="0xdeposit",
+    )
+    service._command_poller = StubCommandPoller([TelegramCommand(1, "/positions")], offset=2)
+
+    service.process_commands()
+
+    assert captured["params"]["user"] == "0xdeposit"
+    message = session.calls[0][1]["text"]
+    assert "当前持仓（1 项）" in message
+    assert "UP | 5.0000 份" in message
+    assert "盈亏 +2.0000 pUSD | 可赎回" in message
+
+
+def test_status_command_reports_health_and_trading_pause(tmp_path) -> None:
+    session = FakeSession()
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="0.7.0",
+        summary={"order_attempts": 3, "matched_orders": 1},
+        state_path=tmp_path / "state.json",
+    )
+    service._set_trading_paused(True)
+    service.update_runtime(
+        slug="btc-updown-5m-1",
+        seconds_left=Decimal("42"),
+        spot=Decimal("118000.50"),
+        spot_source="CHAINLINK",
+    )
+    service._command_poller = StubCommandPoller([TelegramCommand(1, "/status")], offset=2)
+
+    service.process_commands()
+
+    message = session.calls[0][1]["text"]
+    assert "进程: 正常运行" in message
+    assert "交易: 已暂停" in message
+    assert "累计尝试/成交: 3/1" in message
+    assert "窗口剩余: 42 秒" in message
+    assert "BTC/USD: 118000.50（CHAINLINK）" in message
