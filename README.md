@@ -126,8 +126,8 @@ python -m src.watch_updown \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
   --market-data-timeout 3 \
-  --min-entry 0.50 \
-  --max-entry 0.78 \
+  --min-entry 0.45 \
+  --max-entry 0.70 \
   --order-size 5
 ```
 
@@ -186,8 +186,8 @@ python -m src.watch_updown \
   --market-data-timeout 3 \
   --min-win-probability 0.62 \
   --edge 0.06 \
-  --min-entry 0.50 \
-  --max-entry 0.78 \
+  --min-entry 0.45 \
+  --max-entry 0.70 \
   --max-spread 0.04 \
   --min-ask-sum 0.90 \
   --max-ask-sum 1.10 \

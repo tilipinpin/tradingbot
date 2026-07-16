@@ -560,6 +560,9 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.max_live_orders == 0
     assert args.max_trades == 2
     assert args.duration == 0
+    assert args.min_entry == "0.45"
+    assert args.max_entry == "0.70"
+    assert args.max_live_notional == "3.50"
 
 
 def test_live_response_requires_conclusive_match() -> None:
