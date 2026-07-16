@@ -189,9 +189,10 @@ class PolymarketChainlinkStream:
         ],
     }
 
-    def __init__(self, timeout: int = 5, proxy_url: str | None = None) -> None:
+    def __init__(self, timeout: int = 5, proxy_url: str | None = None, max_stale_seconds: int = 15) -> None:
         self.timeout = timeout
         self.proxy_url = proxy_url
+        self.max_stale_seconds = max_stale_seconds
         self._latest: SpotPrice | None = None
         self._ready = threading.Event()
         self._started = False
@@ -223,6 +224,8 @@ class PolymarketChainlinkStream:
             detail = f": {self._last_error}" if self._last_error else ""
             raise RuntimeError(f"Timed out waiting for Polymarket Chainlink BTC/USD stream{detail}")
         assert self._latest is not None
+        if self._latest.observed_at is None or int(time.time()) - self._latest.observed_at > self.max_stale_seconds:
+            raise RuntimeError("Polymarket Chainlink BTC/USD stream is stale")
         return self._latest
 
     def _run(self) -> None:
@@ -245,6 +248,12 @@ class PolymarketChainlinkStream:
                     try:
                         message = connection.recv()
                     except websocket.WebSocketTimeoutException:
+                        if (
+                            self._latest is not None
+                            and self._latest.observed_at is not None
+                            and int(time.time()) - self._latest.observed_at > self.max_stale_seconds
+                        ):
+                            raise RuntimeError("Polymarket Chainlink BTC/USD stream stopped updating")
                         connection.send("PING")
                         continue
                     if not isinstance(message, str) or not message.strip():

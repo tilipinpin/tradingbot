@@ -204,27 +204,37 @@ class ClobTradingClient(ClobDataClient):
         signature_type: int,
     ) -> None:
         ClobClient = _import_clob_client()
+        self._client_v2 = ClobClient.__module__.startswith("py_clob_client_v2")
 
-        temp_client = ClobClient(host, key=private_key, chain_id=chain_id)
-        creds = _create_or_derive_creds(temp_client)
-        super().__init__(host)
         self.client = ClobClient(
             host,
             key=private_key,
             chain_id=chain_id,
-            creds=creds,
             signature_type=signature_type,
             funder=funder_address,
         )
+        creds = _create_or_derive_creds(self.client)
+        super().__init__(host)
         if hasattr(self.client, "set_api_creds"):
             self.client.set_api_creds(creds)
+        else:
+            self.client = ClobClient(
+                host,
+                key=private_key,
+                chain_id=chain_id,
+                creds=creds,
+                signature_type=signature_type,
+                funder=funder_address,
+            )
 
     def quote(self, token_id: str) -> OrderBookQuote:
         book = self.client.get_order_book(token_id)
         bids = getattr(book, "bids", None) or book.get("bids", [])
         asks = getattr(book, "asks", None) or book.get("asks", [])
-        best_bid = Decimal(str(bids[0]["price"])) if bids else None
-        best_ask = Decimal(str(asks[0]["price"])) if asks else None
+        bid_prices = [_book_level_price(level) for level in bids]
+        ask_prices = [_book_level_price(level) for level in asks]
+        best_bid = max(bid_prices) if bid_prices else None
+        best_ask = min(ask_prices) if ask_prices else None
         return OrderBookQuote(bid=best_bid, ask=best_ask)
 
     def buy_limit(
@@ -234,45 +244,121 @@ class ClobTradingClient(ClobDataClient):
         size: Decimal,
         tick_size: str,
         neg_risk: bool,
+        order_type: str = "GTC",
     ) -> dict[str, Any]:
         OrderArgs, OrderType, PartialCreateOrderOptions, buy_side = _import_order_types()
+        return self._post_limit(
+            OrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+            buy_side,
+            token_id,
+            price,
+            size,
+            tick_size,
+            neg_risk,
+            order_type,
+        )
+
+    def sell_limit(
+        self,
+        token_id: str,
+        price: Decimal,
+        size: Decimal,
+        tick_size: str,
+        neg_risk: bool,
+        order_type: str = "GTC",
+    ) -> dict[str, Any]:
+        OrderArgs, OrderType, PartialCreateOrderOptions, sell_side = _import_sell_order_types()
+        return self._post_limit(
+            OrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+            sell_side,
+            token_id,
+            price,
+            size,
+            tick_size,
+            neg_risk,
+            order_type,
+        )
+
+    def _post_limit(
+        self,
+        OrderArgs: Any,
+        OrderType: Any,
+        PartialCreateOrderOptions: Any,
+        side: str,
+        token_id: str,
+        price: Decimal,
+        size: Decimal,
+        tick_size: str,
+        neg_risk: bool,
+        order_type: str,
+    ) -> dict[str, Any]:
+        selected_order_type = getattr(OrderType, order_type.upper())
         order_args = OrderArgs(
             token_id=token_id,
             price=float(price),
             size=float(size),
-            side=buy_side,
+            side=side,
         )
         options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
 
-        if hasattr(self.client, "create_and_post_order"):
-            return self.client.create_and_post_order(order_args, options=options, order_type=OrderType.GTC)
+        if getattr(self, "_client_v2", False):
+            return self.client.create_and_post_order(
+                order_args,
+                options=options,
+                order_type=selected_order_type,
+            )
+
+        if order_type.upper() == "GTC" and hasattr(self.client, "create_and_post_order"):
+            return self.client.create_and_post_order(order_args, options=options)
 
         signed_order = self.client.create_order(order_args, options=options)
-        return self.client.post_order(signed_order, OrderType.GTC)
+        return self.client.post_order(signed_order, selected_order_type)
 
 
 def _import_clob_client() -> Any:
     try:
-        from py_clob_client.client import ClobClient
-
-        return ClobClient
-    except ImportError:
         from py_clob_client_v2 import ClobClient
 
         return ClobClient
+    except ImportError:
+        from py_clob_client.client import ClobClient
+
+        return ClobClient
+
+
+def _book_level_price(level: Any) -> Decimal:
+    raw = level["price"] if isinstance(level, dict) else level.price
+    return Decimal(str(raw))
 
 
 def _import_order_types() -> tuple[Any, Any, Any, str]:
     try:
-        from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-        from py_clob_client.order_builder.constants import BUY
-
-        return OrderArgs, OrderType, PartialCreateOrderOptions, BUY
-    except ImportError:
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
         from py_clob_client_v2.order_builder.constants import BUY
 
         return OrderArgs, OrderType, PartialCreateOrderOptions, BUY
+    except ImportError:
+        from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+        from py_clob_client.order_builder.constants import BUY
+
+        return OrderArgs, OrderType, PartialCreateOrderOptions, BUY
+
+
+def _import_sell_order_types() -> tuple[Any, Any, Any, str]:
+    try:
+        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
+        from py_clob_client_v2.order_builder.constants import SELL
+
+        return OrderArgs, OrderType, PartialCreateOrderOptions, SELL
+    except ImportError:
+        from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+        from py_clob_client.order_builder.constants import SELL
+
+        return OrderArgs, OrderType, PartialCreateOrderOptions, SELL
 
 
 def _create_or_derive_creds(client: Any) -> Any:

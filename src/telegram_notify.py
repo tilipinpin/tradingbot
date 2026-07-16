@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import socket
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import requests
+
+
+logger = logging.getLogger("telegram-notify")
+
+BOT_TOKEN_PATTERN = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
+PRIVATE_KEY_PATTERN = re.compile(r"\b(?:0x)?[0-9a-fA-F]{64}\b")
+PROBABILITY_PATTERN = re.compile(r"\b(?:probability|p_up)=([01](?:\.\d+)?)")
+MICRO_UNITS = Decimal("1000000")
+
+
+def _as_decimal(value: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(default)
+
+
+def _money(value: Decimal | None) -> str:
+    return "N/A" if value is None else f"{value.quantize(Decimal('0.0001'))} pUSD"
+
+
+def _duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}h {minutes}m {secs}s"
+
+
+def sanitize_sensitive_text(value: Any) -> str:
+    text = str(value)
+    text = BOT_TOKEN_PATTERN.sub("<telegram-token-redacted>", text)
+    return PRIVATE_KEY_PATTERN.sub("<private-key-redacted>", text)
+
+
+def fill_amounts(order: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal]:
+    response = order.get("response") if isinstance(order.get("response"), dict) else {}
+    cost = _as_decimal(response.get("makingAmount"))
+    shares = _as_decimal(response.get("takingAmount"))
+    if cost <= 0:
+        cost = _as_decimal(order.get("notional"))
+    if shares <= 0:
+        shares = _as_decimal(order.get("size"))
+    price = cost / shares if shares > 0 else _as_decimal(order.get("price"))
+    return cost, shares, price
+
+
+def model_probability(order: dict[str, Any]) -> Decimal | None:
+    match = PROBABILITY_PATTERN.search(str(order.get("reason") or ""))
+    if match is None:
+        return None
+    probability = _as_decimal(match.group(1), "-1")
+    if "p_up=" in match.group(0) and str(order.get("side", "")).upper() == "DOWN":
+        probability = Decimal("1") - probability
+    return probability if Decimal("0") <= probability <= Decimal("1") else None
+
+
+def format_fill_message(order: dict[str, Any]) -> str:
+    cost, shares, price = fill_amounts(order)
+    winning_profit = shares - cost
+    probability = model_probability(order)
+    expected_profit = probability * shares - cost if probability is not None else None
+    order_id = str((order.get("response") or {}).get("orderID") or "N/A")
+    lines = [
+        "💰 Polymarket 实际成交",
+        f"市场: {order.get('slug', 'N/A')}",
+        f"方向: {str(order.get('side', 'N/A')).upper()}",
+        f"成交均价: {price.quantize(Decimal('0.0001'))}",
+        f"数量: {shares.quantize(Decimal('0.0001'))} 份",
+        f"实际投入: {_money(cost)}",
+        f"获胜时毛收益: {_money(winning_profit)}",
+    ]
+    if expected_profit is not None:
+        lines.append(f"模型期望收益: {_money(expected_profit)}（胜率 {probability:.2%}）")
+    lines.append(f"订单: {order_id[:18]}{'…' if len(order_id) > 18 else ''}")
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class DailyStats:
+    fills: int
+    settled: int
+    wins: int
+    losses: int
+    unresolved: int
+    gross_pnl: Decimal
+
+    @property
+    def win_rate(self) -> Decimal | None:
+        if self.settled == 0:
+            return None
+        return Decimal(self.wins) / Decimal(self.settled)
+
+
+def calculate_daily_stats(
+    orders: list[dict[str, Any]],
+    winners: dict[str, str | None],
+) -> DailyStats:
+    wins = 0
+    losses = 0
+    unresolved = 0
+    gross_pnl = Decimal("0")
+    for order in orders:
+        winner = winners.get(str(order.get("slug") or ""))
+        if winner not in {"UP", "DOWN"}:
+            unresolved += 1
+            continue
+        cost, shares, _ = fill_amounts(order)
+        if str(order.get("side") or "").upper() == winner:
+            wins += 1
+            gross_pnl += shares - cost
+        else:
+            losses += 1
+            gross_pnl -= cost
+    return DailyStats(
+        fills=len(orders),
+        settled=wins + losses,
+        wins=wins,
+        losses=losses,
+        unresolved=unresolved,
+        gross_pnl=gross_pnl,
+    )
+
+
+def format_daily_message(
+    report_date: date,
+    stats: DailyStats,
+    start_balance: Decimal | None,
+    end_balance: Decimal | None,
+) -> str:
+    balance_change = (
+        end_balance - start_balance
+        if start_balance is not None and end_balance is not None
+        else None
+    )
+    estimated_costs = (
+        stats.gross_pnl - balance_change
+        if balance_change is not None and stats.unresolved == 0
+        else None
+    )
+    win_rate = "N/A" if stats.win_rate is None else f"{stats.win_rate:.2%}"
+    return "\n".join(
+        [
+            f"📊 Polymarket 日报 {report_date.isoformat()}",
+            f"实际成交: {stats.fills} 单（已结算 {stats.settled}，待结算 {stats.unresolved}）",
+            f"胜负: {stats.wins} 胜 / {stats.losses} 负",
+            f"胜率: {win_rate}",
+            f"策略毛盈亏: {_money(stats.gross_pnl)}",
+            f"手续费/余额差额估算: {_money(estimated_costs)}",
+            f"期初余额: {_money(start_balance)}",
+            f"期末余额: {_money(end_balance)}",
+            f"余额变化: {_money(balance_change)}",
+            "注: 手续费为理论结算盈亏与钱包余额变化之差，充值、提现或未领取头寸会影响该估算。",
+        ]
+    )
+
+
+class TelegramNotifier:
+    def __init__(
+        self,
+        token: str | None,
+        chat_id: str | None,
+        timeout: float = 10,
+        session: Any = requests,
+    ) -> None:
+        self.token = (token or "").strip()
+        self.chat_id = (chat_id or "").strip()
+        self.timeout = timeout
+        self.session = session
+        self._last_alert_at: dict[str, float] = {}
+
+    @classmethod
+    def from_env(cls) -> "TelegramNotifier":
+        enabled = os.getenv("TELEGRAM_ENABLED", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        token = os.getenv("TELEGRAM_BOT_TOKEN") if enabled else None
+        chat_id = os.getenv("TELEGRAM_CHAT_ID") if enabled else None
+        return cls(token, chat_id, timeout=float(os.getenv("TELEGRAM_TIMEOUT", "10")))
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+    def send(self, message: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            response = self.session.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={
+                    "chat_id": self.chat_id,
+                    "text": sanitize_sensitive_text(message),
+                    "disable_web_page_preview": True,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("ok") is not True:
+                raise RuntimeError("Telegram API returned ok=false")
+            return True
+        except Exception as exc:
+            logger.warning("Telegram notification failed: %s", sanitize_sensitive_text(exc))
+            return False
+
+    def alert(self, key: str, message: str, cooldown: float = 300) -> bool:
+        now = time.monotonic()
+        previous = self._last_alert_at.get(key)
+        if previous is not None and now - previous < cooldown:
+            return False
+        self._last_alert_at[key] = now
+        return self.send(message)
+
+
+class TradingNotificationService:
+    def __init__(
+        self,
+        notifier: TelegramNotifier,
+        trader: Any,
+        signature_type: int,
+        strategy: str,
+        mode: str,
+        version: str,
+        summary: dict[str, Any],
+        ledger_path: Path = Path("data/live_trade_events.jsonl"),
+        state_path: Path = Path("data/telegram_daily_state.json"),
+        timezone_name: str = "Asia/Shanghai",
+    ) -> None:
+        self.notifier = notifier
+        self.trader = trader
+        self.signature_type = signature_type
+        self.strategy = strategy
+        self.mode = mode
+        self.version = version
+        self.summary = summary
+        self.ledger_path = ledger_path
+        self.state_path = state_path
+        self.started_monotonic = time.monotonic()
+        self.started_at = datetime.now(timezone.utc)
+        self._stopped = False
+        self._next_daily_attempt = 0.0
+        try:
+            self.local_timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            logger.warning("Unknown Telegram timezone %s; using Asia/Shanghai", timezone_name)
+            self.local_timezone = ZoneInfo("Asia/Shanghai")
+        self.state = self._load_state()
+
+    @classmethod
+    def from_env(
+        cls,
+        trader: Any,
+        signature_type: int,
+        strategy: str,
+        mode: str,
+        version: str,
+        summary: dict[str, Any],
+    ) -> "TradingNotificationService":
+        return cls(
+            notifier=TelegramNotifier.from_env(),
+            trader=trader,
+            signature_type=signature_type,
+            strategy=strategy,
+            mode=mode,
+            version=version,
+            summary=summary,
+            ledger_path=Path(os.getenv("TELEGRAM_TRADE_LEDGER", "data/live_trade_events.jsonl")),
+            state_path=Path(os.getenv("TELEGRAM_DAILY_STATE", "data/telegram_daily_state.json")),
+            timezone_name=os.getenv("TELEGRAM_TIMEZONE", "Asia/Shanghai"),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.notifier.enabled
+
+    def current_balance(self) -> Decimal | None:
+        if self.trader is None:
+            return None
+        try:
+            try:
+                from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+            except ImportError:
+                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=self.signature_type,
+            )
+            response = self.trader.client.get_balance_allowance(params)
+            return _as_decimal(response.get("balance")) / MICRO_UNITS
+        except Exception as exc:
+            self.notify_exception("读取钱包余额", exc, key="balance-read")
+            return None
+
+    def start(self) -> None:
+        if not self.enabled:
+            logger.info("Telegram notifications disabled: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured")
+            return
+        balance = self.current_balance()
+        local_now = datetime.now(self.local_timezone)
+        self._ensure_day(local_now.date(), balance)
+        self.notifier.send(
+            "\n".join(
+                [
+                    "🚀 Polymarket 机器人启动成功",
+                    f"版本: {self.version}",
+                    f"服务器: {socket.gethostname()}",
+                    f"模式: {self.mode}",
+                    f"策略: {self.strategy}",
+                    f"启动时间: {local_now.isoformat(timespec='seconds')}",
+                    f"钱包余额: {_money(balance)}",
+                ]
+            )
+        )
+
+    def record_fill(self, order: dict[str, Any]) -> None:
+        order["matched_at"] = order.get("matched_at") or datetime.now(timezone.utc).isoformat()
+        if self.enabled:
+            try:
+                self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.ledger_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(order, ensure_ascii=False, default=str) + "\n")
+            except OSError as exc:
+                self.notify_exception("写入成交账本", exc, key="trade-ledger")
+        self.notifier.send(format_fill_message(order))
+
+    def notify_exception(
+        self,
+        context: str,
+        exc: Any,
+        key: str | None = None,
+        cooldown: float = 300,
+    ) -> None:
+        error = sanitize_sensitive_text(f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else exc)
+        category = self._exception_category(error)
+        self.notifier.alert(
+            key or f"{category}:{context}",
+            "\n".join(
+                [
+                    "⚠️ Polymarket 机器人异常",
+                    f"类型: {category}",
+                    f"环节: {context}",
+                    f"详情: {error[:500]}",
+                    f"时间: {datetime.now(self.local_timezone).isoformat(timespec='seconds')}",
+                ]
+            ),
+            cooldown=cooldown,
+        )
+
+    def maybe_send_daily(self, winner_lookup: Callable[[str], str | None]) -> None:
+        if not self.enabled or time.monotonic() < self._next_daily_attempt:
+            return
+        local_today = datetime.now(self.local_timezone).date()
+        days = self.state.get("days", {})
+        needs_roll = local_today.isoformat() not in days or any(
+            day_text < local_today.isoformat() and "end_balance" not in item
+            for day_text, item in days.items()
+        )
+        has_pending = any(
+            day_text < local_today.isoformat() and not item.get("reported")
+            for day_text, item in days.items()
+        )
+        if not needs_roll and not has_pending:
+            return
+        balance = self.current_balance()
+        self._roll_days(local_today, balance)
+        pending = sorted(
+            day_text
+            for day_text, item in self.state.get("days", {}).items()
+            if day_text < local_today.isoformat() and not item.get("reported")
+        )
+        if not pending:
+            return
+        report_day = date.fromisoformat(pending[0])
+        orders = self._orders_for_date(report_day)
+        winners: dict[str, str | None] = {}
+        try:
+            for slug in sorted({str(order.get("slug") or "") for order in orders}):
+                winners[slug] = winner_lookup(slug)
+        except Exception as exc:
+            self.notify_exception("生成每日报告", exc, key="daily-report")
+            self._next_daily_attempt = time.monotonic() + 300
+            return
+        stats = calculate_daily_stats(orders, winners)
+        day_state = self.state["days"][report_day.isoformat()]
+        start_balance = self._optional_decimal(day_state.get("start_balance"))
+        end_balance = self._optional_decimal(day_state.get("end_balance"))
+        if self.notifier.send(format_daily_message(report_day, stats, start_balance, end_balance)):
+            day_state["reported"] = True
+            day_state["reported_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_state()
+
+    def stop(self, reason: str, error: Any = None) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        if not self.enabled:
+            return
+        balance = self.current_balance()
+        latest_error = error or self.summary.get("error")
+        lines = [
+            "🛑 Polymarket 机器人已停止",
+            f"原因: {reason}",
+            f"运行时长: {_duration(time.monotonic() - self.started_monotonic)}",
+            f"累计尝试: {self.summary.get('order_attempts', 0)} 单",
+            f"累计成交: {self.summary.get('matched_orders', 0)} 单",
+            f"最终余额: {_money(balance)}",
+        ]
+        if latest_error:
+            lines.append(f"最后错误: {sanitize_sensitive_text(latest_error)[:500]}")
+        self.notifier.send("\n".join(lines))
+
+    def _load_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {"days": {}}
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) and isinstance(payload.get("days"), dict) else {"days": {}}
+        except (OSError, json.JSONDecodeError):
+            return {"days": {}}
+
+    def _save_state(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(
+            json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _ensure_day(self, day: date, balance: Decimal | None) -> None:
+        days = self.state.setdefault("days", {})
+        day_state = days.setdefault(day.isoformat(), {"reported": False})
+        if "start_balance" not in day_state:
+            day_state["start_balance"] = str(balance) if balance is not None else None
+            day_state["started_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_state()
+
+    def _roll_days(self, local_today: date, balance: Decimal | None) -> None:
+        days = self.state.setdefault("days", {})
+        changed = False
+        for day_text, day_state in days.items():
+            if day_text < local_today.isoformat() and "end_balance" not in day_state:
+                day_state["end_balance"] = str(balance) if balance is not None else None
+                changed = True
+        if local_today.isoformat() not in days:
+            days[local_today.isoformat()] = {
+                "reported": False,
+                "start_balance": str(balance) if balance is not None else None,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            changed = True
+        if changed:
+            self._save_state()
+
+    def _orders_for_date(self, report_date: date) -> list[dict[str, Any]]:
+        if not self.ledger_path.exists():
+            return []
+        orders: list[dict[str, Any]] = []
+        for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
+            try:
+                order = json.loads(line)
+                matched_at = datetime.fromisoformat(str(order["matched_at"]).replace("Z", "+00:00"))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if matched_at.astimezone(self.local_timezone).date() == report_date:
+                orders.append(order)
+        return orders
+
+    @staticmethod
+    def _optional_decimal(value: Any) -> Decimal | None:
+        return None if value in (None, "") else _as_decimal(value)
+
+    @staticmethod
+    def _exception_category(error: str) -> str:
+        lowered = error.lower()
+        if any(word in lowered for word in ("sign", "signature", "签名")):
+            return "签名失败"
+        if any(word in lowered for word in ("insufficient", "balance", "allowance", "余额")):
+            return "余额或授权不足"
+        if any(word in lowered for word in ("timeout", "timed out", "超时")):
+            return "RPC/API 超时"
+        if any(word in lowered for word in ("network", "connection", "proxy", "dns", "网络")):
+            return "网络中断"
+        if "rpc" in lowered:
+            return "RPC 异常"
+        return "交易程序异常"

@@ -1,13 +1,17 @@
 from decimal import Decimal
+import json
+import time
 
 from requests import HTTPError
 
 from src.config import _slug
 from src.backtest_updown import price_at_or_before, previous_slugs, winning_side, PricePoint
 from src.fair_value import btc_up_probability, choose_theoretical_action
+from src.market_recorder import JsonlSnapshotWriter, build_snapshot
 from src.polymarket import (
     GammaClient,
     ClobDataClient,
+    ClobTradingClient,
     Market,
     OrderBookQuote,
     _parse_token_ids,
@@ -24,17 +28,27 @@ from src.price_signal import (
     extract_price_threshold,
 )
 from src.strategy import build_buy_intent
+from src.replay_recorded import Params, Snapshot, metrics, simulate_window
 from src.watch_updown import (
     account_new_paper_settlements,
+    close_paper_position,
     choose_near_even_momentum_signal,
     choose_fair_value_edge_signal,
+    choose_three_phase_signal,
+    live_order_limit_reached,
+    live_response_is_matched,
+    live_session_should_continue,
     open_paper_position,
+    paired_lock_roi,
+    phase_trend,
     quotes_pass_sanity_checks,
     settle_all_paper_positions,
     settle_paper_positions,
     AutoTradeSignal,
     next_5m_slug,
     slug_from_value,
+    start_capture_is_too_late,
+    parse_args as parse_watch_args,
 )
 
 
@@ -241,6 +255,327 @@ def test_polymarket_chainlink_stream_parser() -> None:
     assert price.observed_at == 1753314088
 
 
+def test_polymarket_chainlink_stream_rejects_stale_cached_price() -> None:
+    stream = PolymarketChainlinkStream(timeout=0, max_stale_seconds=15)
+    stream._started = True
+    stream._latest = SpotPrice(
+        symbol="BTC/USD",
+        price=Decimal("64123.45"),
+        source="POLYMARKET_CHAINLINK",
+        observed_at=int(time.time()) - 16,
+    )
+    stream._ready.set()
+
+    try:
+        stream.btc_usd()
+    except RuntimeError as exc:
+        assert "stale" in str(exc)
+    else:
+        raise AssertionError("Expected stale Chainlink data to be rejected")
+
+
+def test_paired_lock_roi_uses_equal_share_combined_cost() -> None:
+    assert paired_lock_roi(Decimal("0.50"), Decimal("0.40")) == Decimal("0.1111111111111111111111111111")
+
+
+def test_close_paper_position_returns_sale_proceeds() -> None:
+    positions = []
+    signal = AutoTradeSignal(side="UP", token_id="up", price=Decimal("0.50"), reason="test")
+    bankroll = open_paper_position(positions, Decimal("20"), "slug", signal, Decimal("0.50"))
+
+    bankroll = close_paper_position(positions[0], bankroll, Decimal("0.44"), "stop")
+
+    assert bankroll == Decimal("19.94")
+    assert positions[0].profit == Decimal("-0.06")
+    assert positions[0].settled is True
+
+
+def test_phase_trend_classifies_direction_and_noise() -> None:
+    assert phase_trend([Decimal("100"), Decimal("101"), Decimal("103")])[0] == "U"
+    assert phase_trend([Decimal("103"), Decimal("102"), Decimal("100")])[0] == "D"
+    assert phase_trend([Decimal("100"), Decimal("103"), Decimal("100.5")])[0] == "N"
+
+
+def test_three_phase_uu_selects_up_with_edge() -> None:
+    market = make_market("BTC Up or Down", "slug", "c", ("up", "down"), "0.01", False, Decimal("10"))
+    signal = choose_three_phase_signal(
+        market,
+        [
+            [Decimal("100"), Decimal("102")],
+            [Decimal("102"), Decimal("105")],
+            [],
+        ],
+        Decimal("100"),
+        Decimal("105"),
+        Decimal("0.75"),
+        OrderBookQuote(Decimal("0.59"), Decimal("0.60")),
+        OrderBookQuote(Decimal("0.39"), Decimal("0.40")),
+        Decimal("0.06"),
+        Decimal("0.04"),
+    )
+
+    assert signal is not None
+    assert signal.side == "UP"
+    assert "pattern=UU" in signal.reason
+
+
+def test_three_phase_reversal_is_disabled_unless_explicitly_enabled() -> None:
+    market = make_market("BTC Up or Down", "slug", "c", ("up", "down"), "0.01", False, Decimal("10"))
+    args = (
+        market,
+        [[Decimal("105"), Decimal("100")], [Decimal("100"), Decimal("106")], []],
+        Decimal("100"),
+        Decimal("106"),
+        Decimal("0.75"),
+        OrderBookQuote(Decimal("0.59"), Decimal("0.60")),
+        OrderBookQuote(Decimal("0.39"), Decimal("0.40")),
+        Decimal("0.06"),
+        Decimal("0.04"),
+    )
+
+    assert choose_three_phase_signal(*args) is None
+    signal = choose_three_phase_signal(
+        *args,
+        reversal_ratio=Decimal("1.0"),
+        allow_reversals=True,
+    )
+    assert signal is not None
+    assert "pattern=DU" in signal.reason
+
+
+def test_jsonl_snapshot_writer_preserves_quotes(tmp_path) -> None:
+    snapshot = build_snapshot(
+        observed_at="2026-07-14T00:00:00+00:00",
+        observed_ts=100,
+        slug="btc-updown-5m-0",
+        market_start_ts=0,
+        market_end_ts=300,
+        seconds_left=Decimal("90.9"),
+        spot=Decimal("62000.25"),
+        start_spot=Decimal("61990"),
+        spot_source="POLYMARKET_CHAINLINK",
+        probability_up=Decimal("0.65"),
+        up_quote=OrderBookQuote(Decimal("0.59"), Decimal("0.60")),
+        down_quote=OrderBookQuote(Decimal("0.39"), Decimal("0.40")),
+    )
+    path = tmp_path / "snapshots.jsonl"
+
+    JsonlSnapshotWriter(path).write(snapshot)
+
+    item = json.loads(path.read_text())
+    assert item["seconds_left"] == 90
+    assert item["up_ask"] == "0.60"
+    assert item["spot_source"] == "POLYMARKET_CHAINLINK"
+
+
+def test_recorded_replay_uses_ask_slippage_and_settlement_direction() -> None:
+    def point(ts: int, left: int, spot: str, probability: str = "0.75") -> Snapshot:
+        return Snapshot(
+            slug="window",
+            observed_ts=ts,
+            seconds_left=left,
+            spot=Decimal(spot),
+            start_spot=Decimal("100"),
+            spot_source="POLYMARKET_CHAINLINK",
+            probability_up=Decimal(probability),
+            up_bid=Decimal("0.58"),
+            up_ask=Decimal("0.60"),
+            down_bid=Decimal("0.39"),
+            down_ask=Decimal("0.40"),
+        )
+
+    snapshots = [
+        point(0, 295, "100"),
+        point(1, 210, "102"),
+        point(2, 195, "102"),
+        point(3, 110, "104"),
+        point(4, 90, "105"),
+        point(5, 5, "106"),
+    ]
+    trade = simulate_window(
+        snapshots,
+        Params(Decimal("0.20"), Decimal("0.65"), Decimal("0.03")),
+        Decimal("1"),
+        Decimal("0.01"),
+        Decimal("0"),
+    )
+
+    assert trade is not None
+    assert trade.entry == Decimal("0.61")
+    assert trade.won is True
+    assert trade.profit == Decimal("1") / Decimal("0.61") - Decimal("1")
+    assert metrics([trade])["max_drawdown"] == Decimal("0")
+
+
+def test_live_fok_order_uses_two_step_sdk_path(monkeypatch) -> None:
+    calls = []
+
+    class OrderArgs:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class OrderType:
+        GTC = "GTC"
+        FOK = "FOK"
+
+    class Options:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class Client:
+        def create_and_post_order(self, *args, **kwargs):
+            raise AssertionError("FOK must not use the GTC convenience path")
+
+        def create_order(self, order_args, options=None):
+            calls.append(("create", order_args.kwargs, options.kwargs))
+            return "signed"
+
+        def post_order(self, order, order_type):
+            calls.append(("post", order, order_type))
+            return {"success": True, "status": "matched"}
+
+    monkeypatch.setattr(
+        "src.polymarket._import_order_types",
+        lambda: (OrderArgs, OrderType, Options, "BUY"),
+    )
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+
+    response = trader.buy_limit(
+        token_id="down",
+        price=Decimal("0.48"),
+        size=Decimal("5"),
+        tick_size="0.01",
+        neg_risk=False,
+        order_type="FOK",
+    )
+
+    assert response["status"] == "matched"
+    assert calls[-1] == ("post", "signed", "FOK")
+
+
+def test_live_fok_order_uses_v2_order_type(monkeypatch) -> None:
+    calls = []
+
+    class OrderArgs:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class OrderType:
+        GTC = "GTC"
+        FOK = "FOK"
+
+    class Options:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class Client:
+        def create_and_post_order(self, order_args, options=None, order_type=None):
+            calls.append((order_args.kwargs, options.kwargs, order_type))
+            return {"success": True, "status": "matched"}
+
+    monkeypatch.setattr(
+        "src.polymarket._import_order_types",
+        lambda: (OrderArgs, OrderType, Options, "BUY"),
+    )
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+    trader._client_v2 = True
+
+    response = trader.buy_limit(
+        token_id="up",
+        price=Decimal("0.68"),
+        size=Decimal("5"),
+        tick_size="0.01",
+        neg_risk=False,
+        order_type="FOK",
+    )
+
+    assert response["status"] == "matched"
+    assert calls[-1][2] == "FOK"
+
+
+def test_live_fok_sell_uses_sell_side(monkeypatch) -> None:
+    calls = []
+
+    class OrderArgs:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class OrderType:
+        GTC = "GTC"
+        FOK = "FOK"
+
+    class Options:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class Client:
+        def create_and_post_order(self, order_args, options=None, order_type=None):
+            calls.append((order_args.kwargs, options.kwargs, order_type))
+            return {"success": True, "status": "matched"}
+
+    monkeypatch.setattr(
+        "src.polymarket._import_sell_order_types",
+        lambda: (OrderArgs, OrderType, Options, "SELL"),
+    )
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+    trader._client_v2 = True
+
+    response = trader.sell_limit(
+        token_id="up",
+        price=Decimal("0.67"),
+        size=Decimal("5"),
+        tick_size="0.01",
+        neg_risk=False,
+        order_type="FOK",
+    )
+
+    assert response["status"] == "matched"
+    assert calls[-1][0]["side"] == "SELL"
+    assert calls[-1][2] == "FOK"
+
+
+def test_trading_quote_selects_best_prices_from_v2_book_order() -> None:
+    class Client:
+        def get_order_book(self, token_id):
+            assert token_id == "up"
+            return {
+                "bids": [{"price": "0.01"}, {"price": "0.46"}, {"price": "0.45"}],
+                "asks": [{"price": "0.99"}, {"price": "0.48"}, {"price": "0.47"}],
+            }
+
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+
+    assert trader.quote("up") == OrderBookQuote(bid=Decimal("0.46"), ask=Decimal("0.47"))
+
+
+def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["watch_updown", "--slug", "btc-updown-5m-1"])
+
+    args = parse_watch_args()
+
+    assert args.max_live_orders == 0
+    assert args.max_trades == 2
+    assert args.duration == 0
+
+
+def test_live_response_requires_conclusive_match() -> None:
+    assert live_response_is_matched({"success": True, "status": "matched", "orderID": "0x1"}) is True
+    assert live_response_is_matched({"success": True, "status": "live", "orderID": "0x1"}) is False
+    assert live_response_is_matched({"success": False, "status": "matched", "orderID": "0x1"}) is False
+
+
+def test_zero_live_order_limit_means_unlimited() -> None:
+    assert live_order_limit_reached(100, 0) is False
+    assert live_order_limit_reached(1, 2) is False
+    assert live_order_limit_reached(2, 2) is True
+    assert live_session_should_continue(100, 0) is True
+    assert live_session_should_continue(2, 2) is False
+
+
 def build_chainlink_v3_report(feed_id: str, price: int) -> str:
     word = lambda value: int(value).to_bytes(32, "big", signed=False)
     signed_word = lambda value: int(value).to_bytes(32, "big", signed=True)
@@ -340,6 +675,11 @@ def test_theoretical_action_requires_edge() -> None:
 def test_watch_updown_slug_helpers() -> None:
     assert slug_from_value("https://polymarket.com/zh/event/btc-updown-5m-1783685100") == "btc-updown-5m-1783685100"
     assert next_5m_slug("btc-updown-5m-1783685100") == "btc-updown-5m-1783685400"
+
+
+def test_start_capture_rejects_fresh_price_after_deadline() -> None:
+    assert start_capture_is_too_late(Decimal("-16"), Decimal("15")) is True
+    assert start_capture_is_too_late(Decimal("-15"), Decimal("15")) is False
 
 
 def test_near_even_momentum_signal_detects_trade() -> None:

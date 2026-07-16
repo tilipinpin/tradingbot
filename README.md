@@ -58,11 +58,16 @@ MARKET_DIRECTION_QUERY=up down higher lower above below
 LIVE_TRADING=true
 DRY_RUN=false
 PRIVATE_KEY=0x...
-FUNDER_ADDRESS=0x...
-SIGNATURE_TYPE=0
+FUNDER_ADDRESS=0x... # deployed deposit wallet, not the owner EOA
+DEPOSIT_WALLET=0x...
+SIGNATURE_TYPE=3
 ```
 
-新用户通常应优先阅读 Polymarket 的 deposit wallet/signature type 文档；本项目不替你处理入金、授权或资金划转。
+V2 新账户必须先通过 Polymarket Builder Relayer 部署 deposit wallet，再把 pUSD
+转入该钱包并由该钱包授权交易合约。EOA 中的余额和授权不能用于 deposit wallet
+订单。部署和钱包批处理还需要 `RELAYER_URL`、`RPC_URL`、
+`RELAYER_API_KEY` 和 `RELAYER_API_KEY_ADDRESS`；CLOB 下单使用 `SIGNATURE_TYPE=3`，且 `FUNDER_ADDRESS`
+必须是已部署的 deposit wallet。本项目不会自动转移资金或发起授权。
 
 ## 运行
 
@@ -96,10 +101,10 @@ python -m src.simulate_updown --duration 300 --interval 15 --up-ask 0.52 --down-
 python -m src.watch_updown --slug https://polymarket.com/zh/event/btc-updown-5m-1783685100 --duration 900 --interval 10
 ```
 
-BTC 5m Up/Down 的正式结算源是 Chainlink BTC/USD Data Stream。`watch_updown` 默认使用
+BTC 5m Up/Down 的正式结算源是 Chainlink BTC/USD Data Stream。`watch_updown` 默认严格使用
 免费的 `AUTO` 模式，优先订阅 Polymarket 公开的 Chainlink 实时流，失败时再依次尝试
 Binance、Coinbase、Kraken 和 CoinGecko。需要代理时传入
-`--ws-proxy socks5h://127.0.0.1:7898`。为了禁止交易所回退并严格使用结算源，可传入
+`--ws-proxy socks5h://127.0.0.1:7898`，不会回退到交易所价格。也可以显式传入
 `--price-source POLYMARKET_CHAINLINK`。
 
 使用付费 Chainlink Data Streams API 时传入 `--price-source CHAINLINK`，并配置
@@ -127,6 +132,37 @@ python -m src.watch_updown \
 ```
 
 真实下单必须额外显式加 `--live-trading`，并在环境变量中配置 `PRIVATE_KEY` 和 `FUNDER_ADDRESS`。
+默认不限制会话累计订单数，每个 5 分钟窗口最多尝试 2 单；每单仍受 5 份和
+3.50 pUSD 上限约束。订单被拒、请求异常或返回非 `matched` 状态时会写入摘要并继续，
+失败尝试仍占用当前窗口的一次额度。
+默认 `--duration 0` 持续运行，直到手动停止；可传正秒数设置时限，也可传
+`--max-live-orders N` 临时恢复累计订单上限。
+实盘进程结束后会写入 `data/live_trade_summary.json`，可运行
+`python3 live_trade_summary.py` 查看最后一次会话、订单尝试和 CLOB 响应。
+
+### Telegram 通知
+
+在本机 `.env` 中配置 Telegram BotFather 创建的 bot token 和接收者 chat ID：
+
+```dotenv
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=<bot-token>
+TELEGRAM_CHAT_ID=<chat-id>
+TELEGRAM_TIMEZONE=Asia/Shanghai
+```
+
+先在 Telegram 中主动给机器人发送一条消息，确保 bot 可以向该 chat ID 回复。未配置 token
+或 chat ID 时通知模块自动关闭，不影响交易。配置后 `watch_updown` 会发送：
+
+- 启动：版本、服务器、模式、策略和钱包余额。
+- 成交：仅实际 `matched` 订单，包含实际均价、数量、投入、获胜时毛收益和可计算的模型期望收益。
+- 异常：签名、余额/授权、RPC/API 超时、网络/代理和订单未成交；持续同类行情异常默认冷却 5 分钟。
+- 日报：上海时区午夜后的第一个轮询，统计实际成交、已结算胜率、策略毛盈亏、余额变化和手续费/余额差额估算。
+- 停止：正常结束、`Ctrl+C` 或未捕获异常，包含运行时长、累计尝试、累计成交、最终余额和最后错误。
+
+日报成交账本保存在 `data/live_trade_events.jsonl`，每日余额快照保存在
+`data/telegram_daily_state.json`；二者均位于 Git 忽略的 `data/` 目录。断电或 `SIGKILL`
+会让进程无法发送停止通知，这是操作系统层面的限制。
 
 纸面账户模拟，初始 20 USDC，每次信号投入 1 USDC，不止盈，余额归零则退出：
 
@@ -159,7 +195,87 @@ python -m src.watch_updown \
   --pause-windows-after-losses 2
 ```
 
+开盘动量 + 双边锁利纸面策略：开盘 10 秒后用 0.50 pUSD 建仓，组合成本不超过
+0.90 时买入相同份额的反方向；方向反转时按 12% 软止损处理：
+
+```bash
+python -m src.watch_updown \
+  --slug btc-updown-5m-<timestamp> \
+  --duration 1800 \
+  --interval 10 \
+  --auto-trade \
+  --strategy paired_lock \
+  --price-source POLYMARKET_CHAINLINK \
+  --ws-proxy socks5h://127.0.0.1:7898 \
+  --paper-trading \
+  --paper-bankroll 20 \
+  --paired-initial-stake 0.50 \
+  --paired-profit-sum 0.90 \
+  --paired-emergency-sum 1.05 \
+  --paired-stop-loss 0.12
+```
+
+`paired_lock` 目前只允许纸面测试；在真实卖出和双腿成交处理完成验证前，程序会拒绝
+与 `--live-trading` 同时启用。
+
+三阶段趋势纸面策略把每个 5 分钟窗口分为三个 100 秒区间。前两段按趋势强度标记为
+`U`、`D` 或 `N`，默认仅在剩余 100 秒内交易同向延续的 `UU`、`DD`。首轮 6 小时测试中
+反转形态 `UD`、`DU` 表现较差，现已默认关闭；只有显式传入
+`--three-phase-allow-reversals` 才会重新启用：
+
+```bash
+python -m src.watch_updown \
+  --slug btc-updown-5m-<timestamp> \
+  --duration 1800 \
+  --interval 10 \
+  --auto-trade \
+  --strategy three_phase \
+  --price-source POLYMARKET_CHAINLINK \
+  --ws-proxy socks5h://127.0.0.1:7898 \
+  --paper-trading \
+  --paper-bankroll 20 \
+  --paper-stake 1 \
+  --three-phase-edge 0.03 \
+  --three-phase-trend-threshold 0.25 \
+  --three-phase-reversal-ratio 1.20 \
+  --three-phase-min-entry 0.35 \
+  --three-phase-max-entry 0.82 \
+  --three-phase-confirmations 1 \
+  --three-phase-entry-start-seconds 95 \
+  --three-phase-entry-cutoff-seconds 40
+```
+
+`three_phase` 目前只允许纸面测试。趋势为 `N`、价格未穿越开盘价、盘口价格不在
+0.35–0.82、spread 超过 0.04 或理论 edge 低于配置值时都会跳过。第三段开始后先观察
+5 秒，只在剩余 95–40 秒的窗口内确认并开仓，最后 40 秒禁止新单。
+
 `fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在理论概率相对盘口 ask 有足够 edge 时入场。默认要求同方向连续出现两次信号、理论胜率至少 62%，并避开最后 25 秒、过期现货价格、宽 spread、交叉报价和异常 ask 总价。高价或临近结算的入场还需要额外 edge；纸面模拟连续亏损达到阈值后会暂停若干窗口。
+
+## 采集与 walk-forward 回测
+
+只采集 Chainlink BTC 与 Polymarket 实际 bid/ask，不生成交易信号：
+
+```bash
+python -m src.watch_updown \
+  --slug btc-updown-5m-<timestamp> \
+  --duration 604800 \
+  --interval 10 \
+  --price-source POLYMARKET_CHAINLINK \
+  --ws-proxy socks5h://127.0.0.1:7898 \
+  --record-jsonl data/btc_updown_5m.jsonl
+```
+
+采集至少 7 天后，用前 70% 窗口选择参数、后 30% 窗口做一次样本外验证。默认在记录的 ask 上增加 0.01 滑点；`--cost-rate` 可加入额外成本：
+
+```bash
+python -m src.replay_recorded data/btc_updown_5m.jsonl \
+  --train-ratio 0.70 \
+  --slippage 0.01 \
+  --cost-rate 0 \
+  --min-train-trades 20
+```
+
+回放器只接纳开盘采样不晚于 20 秒、收盘采样不早于最后 15 秒的完整窗口，并报告交易数、胜率、净收益、最大回撤和最长连败。若训练集交易数不足，不会选择参数。
 
 回测 BTC 5m Up/Down 历史盘口策略：
 
