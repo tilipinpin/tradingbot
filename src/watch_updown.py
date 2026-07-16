@@ -743,6 +743,7 @@ def watch() -> None:
 
     while time.time() < stop_at:
         now = datetime.now(timezone.utc)
+        notifications.maybe_send_settlements(fetch_winner)
         notifications.maybe_send_daily(fetch_winner)
         if args.paper_trading:
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)

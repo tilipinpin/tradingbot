@@ -91,6 +91,76 @@ def format_fill_message(order: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def settlement_key(order: dict[str, Any]) -> str:
+    response = order.get("response") if isinstance(order.get("response"), dict) else {}
+    order_id = str(response.get("orderID") or "").strip()
+    if order_id:
+        return order_id
+    return ":".join(
+        str(order.get(key) or "")
+        for key in ("slug", "side", "matched_at", "price", "size")
+    )
+
+
+def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
+    cost, shares, price = fill_amounts(order)
+    side = str(order.get("side") or "").upper()
+    won = side == winner.upper()
+    payout = shares if won else Decimal("0")
+    gross_pnl = payout - cost
+    return_rate = gross_pnl / cost if cost > 0 else None
+    return {
+        "slug": str(order.get("slug") or ""),
+        "side": side,
+        "winner": winner.upper(),
+        "won": won,
+        "cost": str(cost),
+        "shares": str(shares),
+        "entry_price": str(price),
+        "payout": str(payout),
+        "gross_pnl": str(gross_pnl),
+        "return_rate": str(return_rate) if return_rate is not None else None,
+    }
+
+
+def format_settlement_message(
+    settlement: dict[str, Any],
+    balance: Decimal | None,
+    all_settlements: list[dict[str, Any]],
+) -> str:
+    won = bool(settlement.get("won"))
+    cost = _as_decimal(settlement.get("cost"))
+    payout = _as_decimal(settlement.get("payout"))
+    gross_pnl = _as_decimal(settlement.get("gross_pnl"))
+    return_rate = settlement.get("return_rate")
+    settled_count = len(all_settlements)
+    wins = sum(1 for item in all_settlements if item.get("won") is True)
+    cumulative_pnl = sum(
+        (_as_decimal(item.get("gross_pnl")) for item in all_settlements),
+        Decimal("0"),
+    )
+    win_rate = Decimal(wins) / Decimal(settled_count) if settled_count else Decimal("0")
+    return_text = "N/A" if return_rate in (None, "") else f"{_as_decimal(return_rate):+.2%}"
+    return "\n".join(
+        [
+            "🏁 Polymarket 交易已结算",
+            f"市场: {settlement.get('slug', 'N/A')}",
+            f"买入方向: {settlement.get('side', 'N/A')}",
+            f"结算方向: {settlement.get('winner', 'N/A')}",
+            f"结果: {'✅ 盈利' if won else '❌ 亏损'}",
+            f"实际投入: {_money(cost)}",
+            f"结算返还: {_money(payout)}",
+            f"本单毛盈亏: {gross_pnl:+.4f} pUSD",
+            f"本单收益率: {return_text}",
+            f"当前钱包余额: {_money(balance)}",
+            f"累计结算: {settled_count} 单（{wins} 胜 / {settled_count - wins} 负）",
+            f"累计胜率: {win_rate:.2%}",
+            f"累计毛盈亏: {cumulative_pnl:+.4f} pUSD",
+            "注: 毛盈亏按成交投入和每份 1 pUSD 结算计算，钱包余额可能受手续费、赎回及转账影响。",
+        ]
+    )
+
+
 @dataclass(frozen=True)
 class DailyStats:
     fills: int
@@ -244,6 +314,7 @@ class TradingNotificationService:
         ledger_path: Path = Path("data/live_trade_events.jsonl"),
         state_path: Path = Path("data/telegram_daily_state.json"),
         timezone_name: str = "Asia/Shanghai",
+        settlement_interval: float = 30,
     ) -> None:
         self.notifier = notifier
         self.trader = trader
@@ -258,6 +329,8 @@ class TradingNotificationService:
         self.started_at = datetime.now(timezone.utc)
         self._stopped = False
         self._next_daily_attempt = 0.0
+        self._next_settlement_attempt = 0.0
+        self.settlement_interval = max(5, settlement_interval)
         try:
             self.local_timezone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
@@ -286,6 +359,7 @@ class TradingNotificationService:
             ledger_path=Path(os.getenv("TELEGRAM_TRADE_LEDGER", "data/live_trade_events.jsonl")),
             state_path=Path(os.getenv("TELEGRAM_DAILY_STATE", "data/telegram_daily_state.json")),
             timezone_name=os.getenv("TELEGRAM_TIMEZONE", "Asia/Shanghai"),
+            settlement_interval=float(os.getenv("TELEGRAM_SETTLEMENT_INTERVAL", "30")),
         )
 
     @property
@@ -365,6 +439,52 @@ class TradingNotificationService:
             cooldown=cooldown,
         )
 
+    def maybe_send_settlements(self, winner_lookup: Callable[[str], str | None]) -> None:
+        now = time.monotonic()
+        if not self.enabled or now < self._next_settlement_attempt:
+            return
+        self._next_settlement_attempt = now + self.settlement_interval
+        settlements = self.state.setdefault("settlements", {})
+        pending: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for order in self._ledger_orders():
+            key = settlement_key(order)
+            if not key or key in settlements or key in seen:
+                continue
+            seen.add(key)
+            pending.append(order)
+        if not pending:
+            return
+
+        winners: dict[str, str | None] = {}
+        try:
+            for slug in sorted({str(order.get("slug") or "") for order in pending}):
+                winners[slug] = winner_lookup(slug)
+        except Exception as exc:
+            self.notify_exception("检查逐单结算", exc, key="settlement-check")
+            return
+
+        resolved = [
+            (order, winners.get(str(order.get("slug") or "")))
+            for order in pending
+            if winners.get(str(order.get("slug") or "")) in {"UP", "DOWN"}
+        ]
+        if not resolved:
+            return
+        balance = self.current_balance()
+        changed = False
+        for order, winner in resolved:
+            assert winner is not None
+            key = settlement_key(order)
+            record = settlement_values(order, winner)
+            record["settled_at"] = datetime.now(timezone.utc).isoformat()
+            cumulative = list(settlements.values()) + [record]
+            if self.notifier.send(format_settlement_message(record, balance, cumulative)):
+                settlements[key] = record
+                changed = True
+        if changed:
+            self._save_state()
+
     def maybe_send_daily(self, winner_lookup: Callable[[str], str | None]) -> None:
         if not self.enabled or time.monotonic() < self._next_daily_attempt:
             return
@@ -430,12 +550,15 @@ class TradingNotificationService:
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
-            return {"days": {}}
+            return {"days": {}, "settlements": {}}
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-            return payload if isinstance(payload, dict) and isinstance(payload.get("days"), dict) else {"days": {}}
+            if isinstance(payload, dict) and isinstance(payload.get("days"), dict):
+                payload.setdefault("settlements", {})
+                return payload
+            return {"days": {}, "settlements": {}}
         except (OSError, json.JSONDecodeError):
-            return {"days": {}}
+            return {"days": {}, "settlements": {}}
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -470,16 +593,31 @@ class TradingNotificationService:
             self._save_state()
 
     def _orders_for_date(self, report_date: date) -> list[dict[str, Any]]:
+        orders: list[dict[str, Any]] = []
+        for order in self._ledger_orders():
+            try:
+                matched_at = datetime.fromisoformat(str(order["matched_at"]).replace("Z", "+00:00"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if matched_at.astimezone(self.local_timezone).date() == report_date:
+                orders.append(order)
+        return orders
+
+    def _ledger_orders(self) -> list[dict[str, Any]]:
         if not self.ledger_path.exists():
             return []
         orders: list[dict[str, Any]] = []
-        for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
+        try:
+            lines = self.ledger_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            self.notify_exception("读取成交账本", exc, key="trade-ledger-read")
+            return []
+        for line in lines:
             try:
                 order = json.loads(line)
-                matched_at = datetime.fromisoformat(str(order["matched_at"]).replace("Z", "+00:00"))
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            except (json.JSONDecodeError, TypeError):
                 continue
-            if matched_at.astimezone(self.local_timezone).date() == report_date:
+            if isinstance(order, dict):
                 orders.append(order)
         return orders
 
