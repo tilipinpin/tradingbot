@@ -127,14 +127,20 @@ python -m src.watch_updown \
   --signal-confirmations 2 \
   --market-data-timeout 3 \
   --min-entry 0.45 \
-  --max-entry 0.70 \
+  --max-entry 0.75 \
+  --low-entry-cutoff 0.50 \
+  --low-entry-min-win-probability 0.68 \
+  --low-entry-confirmation-samples 3 \
   --order-size 5
 ```
 
 真实下单必须额外显式加 `--live-trading`，并在环境变量中配置 `PRIVATE_KEY` 和 `FUNDER_ADDRESS`。
 默认不限制会话累计订单数，每个 5 分钟窗口最多尝试 2 单；每单仍受 5 份和
-3.50 pUSD 上限约束。订单被拒、请求异常或返回非 `matched` 状态时会写入摘要并继续，
+3.75 pUSD 本金上限约束。订单被拒、请求异常或返回非 `matched` 状态时会写入摘要并继续，
 失败尝试仍占用当前窗口的一次额度。
+`fair_value_edge` 对入场价格分层过滤：`0.50–0.75` 至少要求 62% 模型胜率，
+其中 `0.65` 以上继续按价格提高所需 edge；`0.45–<0.50` 至少要求 68% 模型胜率，
+并要求最近 3 次 BTC 采样都位于开盘价的买入方向一侧，且净走势没有反向。
 默认 `--duration 0` 持续运行，直到手动停止；可传正秒数设置时限，也可传
 `--max-live-orders N` 临时恢复累计订单上限。
 实盘进程结束后会写入 `data/live_trade_summary.json`，可运行
@@ -199,9 +205,12 @@ python -m src.watch_updown \
   --signal-confirmations 2 \
   --market-data-timeout 3 \
   --min-win-probability 0.62 \
+  --low-entry-cutoff 0.50 \
+  --low-entry-min-win-probability 0.68 \
+  --low-entry-confirmation-samples 3 \
   --edge 0.06 \
   --min-entry 0.45 \
-  --max-entry 0.70 \
+  --max-entry 0.75 \
   --max-spread 0.04 \
   --min-ask-sum 0.90 \
   --max-ask-sum 1.10 \

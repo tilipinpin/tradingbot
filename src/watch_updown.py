@@ -87,8 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-spot-age", type=int, default=20, help="Maximum cached spot-price age allowed for entries.")
     parser.add_argument("--max-start-capture-delay", type=int, default=15, help="Skip a window if its start price is captured later than this many seconds.")
     parser.add_argument("--min-win-probability", default="0.62")
+    parser.add_argument("--low-entry-cutoff", default="0.50")
+    parser.add_argument("--low-entry-min-win-probability", default="0.68")
+    parser.add_argument("--low-entry-confirmation-samples", type=int, default=3)
     parser.add_argument("--min-entry", default="0.45")
-    parser.add_argument("--max-entry", default="0.70")
+    parser.add_argument("--max-entry", default="0.75")
     parser.add_argument("--max-spread", default="0.04", help="Max bid/ask spread allowed for the selected side.")
     parser.add_argument("--min-ask-sum", default="0.90", help="Skip markets where Up ask + Down ask is below this.")
     parser.add_argument("--max-ask-sum", default="1.10", help="Skip markets where Up ask + Down ask is above this.")
@@ -100,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Hard session cap on live order attempts; 0 means unlimited.",
     )
-    parser.add_argument("--max-live-notional", default="3.50", help="Hard principal cap per live order in USDC.")
+    parser.add_argument("--max-live-notional", default="3.75", help="Hard principal cap per live order in pUSD.")
     parser.add_argument("--live-order-type", choices=["FOK"], default="FOK")
     parser.add_argument(
         "--live-summary-json",
@@ -366,6 +369,22 @@ def quotes_pass_sanity_checks(
     return True, "ok"
 
 
+def recent_spot_samples_support_side(
+    prices: list[Decimal],
+    start_price: Decimal,
+    side: str,
+    sample_count: int,
+) -> bool:
+    if sample_count < 1 or len(prices) < sample_count:
+        return False
+    recent = prices[-sample_count:]
+    if side == "UP":
+        return all(price > start_price for price in recent) and recent[-1] >= recent[0]
+    if side == "DOWN":
+        return all(price < start_price for price in recent) and recent[-1] <= recent[0]
+    return False
+
+
 def choose_fair_value_edge_signal(
     market: Market,
     probability_up: Decimal,
@@ -381,6 +400,11 @@ def choose_fair_value_edge_signal(
     max_ask_sum: Decimal,
     min_seconds_before_end: Decimal = Decimal("0"),
     min_win_probability: Decimal = Decimal("0"),
+    recent_spot_prices: list[Decimal] | None = None,
+    start_price: Decimal | None = None,
+    low_entry_cutoff: Decimal = Decimal("0.50"),
+    low_entry_min_win_probability: Decimal = Decimal("0.68"),
+    low_entry_confirmation_samples: int = 3,
 ) -> AutoTradeSignal | None:
     if seconds_to_end > decision_seconds_before_end or seconds_to_end < min_seconds_before_end:
         return None
@@ -407,7 +431,21 @@ def choose_fair_value_edge_signal(
     if entry < min_entry or entry > max_entry:
         return None
     selected_probability = probability_up if side == "UP" else down_probability
-    if selected_probability < min_win_probability:
+    required_probability = min_win_probability
+    if entry < low_entry_cutoff:
+        required_probability = max(required_probability, low_entry_min_win_probability)
+        if (
+            recent_spot_prices is None
+            or start_price is None
+            or not recent_spot_samples_support_side(
+                recent_spot_prices,
+                start_price,
+                side,
+                low_entry_confirmation_samples,
+            )
+        ):
+            return None
+    if selected_probability < required_probability:
         return None
 
     # Late and expensive entries need extra model margin because small price errors
@@ -427,6 +465,7 @@ def choose_fair_value_edge_signal(
         reason=(
             f"fair_value_edge entry={entry} edge={edge.quantize(Decimal('0.0001'))} "
             f"required_edge={required_edge.quantize(Decimal('0.0001'))} "
+            f"required_probability={required_probability.quantize(Decimal('0.0001'))} "
             f"p_up={probability_up.quantize(Decimal('0.0001'))} seconds_left={int(seconds_to_end)}"
         ),
     )
@@ -644,6 +683,8 @@ def watch() -> None:
     min_ask_sum = Decimal(args.min_ask_sum)
     max_ask_sum = Decimal(args.max_ask_sum)
     min_win_probability = Decimal(args.min_win_probability)
+    low_entry_cutoff = Decimal(args.low_entry_cutoff)
+    low_entry_min_win_probability = Decimal(args.low_entry_min_win_probability)
     order_size = Decimal(args.order_size)
     max_live_notional = Decimal(args.max_live_notional)
     decision_seconds_before_end = Decimal(str(args.decision_seconds_before_end))
@@ -721,6 +762,12 @@ def watch() -> None:
             raise ValueError(
                 "Live order size, per-window limit, and notional must be positive; session limit may be zero"
             )
+        if not min_entry <= low_entry_cutoff <= max_entry:
+            raise ValueError("Low-entry cutoff must be within the configured entry range")
+        if not Decimal("0") <= low_entry_min_win_probability <= Decimal("1"):
+            raise ValueError("Low-entry minimum win probability must be between zero and one")
+        if args.low_entry_confirmation_samples < 1:
+            raise ValueError("Low-entry confirmation samples must be positive")
         if args.three_phase_entry_cutoff_seconds >= args.three_phase_entry_start_seconds:
             raise ValueError("three_phase entry cutoff must be lower than entry start")
         trader = build_live_trader(args)
@@ -1082,6 +1129,11 @@ def watch() -> None:
                     max_ask_sum,
                     min_seconds_before_end,
                     min_win_probability,
+                    prices,
+                    start_price,
+                    low_entry_cutoff,
+                    low_entry_min_win_probability,
+                    args.low_entry_confirmation_samples,
                 )
             if signal is not None:
                 if notifications.trading_paused:

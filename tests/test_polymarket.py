@@ -42,6 +42,7 @@ from src.watch_updown import (
     paired_lock_roi,
     phase_trend,
     quotes_pass_sanity_checks,
+    recent_spot_samples_support_side,
     settle_all_paper_positions,
     settle_paper_positions,
     AutoTradeSignal,
@@ -561,8 +562,11 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.max_trades == 2
     assert args.duration == 0
     assert args.min_entry == "0.45"
-    assert args.max_entry == "0.70"
-    assert args.max_live_notional == "3.50"
+    assert args.max_entry == "0.75"
+    assert args.max_live_notional == "3.75"
+    assert args.low_entry_cutoff == "0.50"
+    assert args.low_entry_min_win_probability == "0.68"
+    assert args.low_entry_confirmation_samples == 3
 
 
 def test_live_response_requires_conclusive_match() -> None:
@@ -782,6 +786,111 @@ def test_fair_value_edge_signal_requires_minimum_win_probability() -> None:
     )
 
     assert signal is None
+
+
+def test_50_cent_entry_uses_normal_probability_tier_without_spot_samples() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+    signal = choose_fair_value_edge_signal(
+        market=market,
+        probability_up=Decimal("0.62"),
+        up_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
+        down_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
+        seconds_to_end=Decimal("70"),
+        decision_seconds_before_end=Decimal("90"),
+        min_entry=Decimal("0.45"),
+        max_entry=Decimal("0.75"),
+        edge_threshold=Decimal("0.06"),
+        max_spread=Decimal("0.04"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+        min_win_probability=Decimal("0.62"),
+    )
+
+    assert signal is not None
+    assert signal.price == Decimal("0.50")
+    assert "required_probability=0.6200" in signal.reason
+
+
+def test_recent_spot_samples_require_same_side_and_supporting_net_move() -> None:
+    start = Decimal("100")
+
+    assert recent_spot_samples_support_side(
+        [Decimal("99"), Decimal("101"), Decimal("100.5"), Decimal("102")],
+        start,
+        "UP",
+        3,
+    ) is True
+    assert recent_spot_samples_support_side(
+        [Decimal("101"), Decimal("103"), Decimal("102"), Decimal("101.5")],
+        start,
+        "UP",
+        3,
+    ) is False
+    assert recent_spot_samples_support_side(
+        [Decimal("101"), Decimal("99"), Decimal("99.5"), Decimal("98")],
+        start,
+        "DOWN",
+        3,
+    ) is True
+
+
+def test_low_entry_requires_68_percent_and_three_supporting_samples() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+    base = {
+        "market": market,
+        "up_quote": OrderBookQuote(bid=Decimal("0.46"), ask=Decimal("0.47")),
+        "down_quote": OrderBookQuote(bid=Decimal("0.52"), ask=Decimal("0.53")),
+        "seconds_to_end": Decimal("70"),
+        "decision_seconds_before_end": Decimal("90"),
+        "min_entry": Decimal("0.45"),
+        "max_entry": Decimal("0.75"),
+        "edge_threshold": Decimal("0.06"),
+        "max_spread": Decimal("0.04"),
+        "min_ask_sum": Decimal("0.90"),
+        "max_ask_sum": Decimal("1.10"),
+        "min_win_probability": Decimal("0.62"),
+        "recent_spot_prices": [Decimal("101"), Decimal("100.5"), Decimal("102")],
+        "start_price": Decimal("100"),
+    }
+
+    accepted = choose_fair_value_edge_signal(probability_up=Decimal("0.70"), **base)
+    low_probability = choose_fair_value_edge_signal(probability_up=Decimal("0.67"), **base)
+    reversed_samples = choose_fair_value_edge_signal(
+        probability_up=Decimal("0.70"),
+        **{
+            **base,
+            "recent_spot_prices": [Decimal("102"), Decimal("101"), Decimal("100.5")],
+        },
+    )
+
+    assert accepted is not None
+    assert accepted.side == "UP"
+    assert "required_probability=0.6800" in accepted.reason
+    assert low_probability is None
+    assert reversed_samples is None
+
+
+def test_75_cent_entry_requires_existing_dynamic_high_price_edge() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+    signal = choose_fair_value_edge_signal(
+        market=market,
+        probability_up=Decimal("0.86"),
+        up_quote=OrderBookQuote(bid=Decimal("0.74"), ask=Decimal("0.75")),
+        down_quote=OrderBookQuote(bid=Decimal("0.24"), ask=Decimal("0.25")),
+        seconds_to_end=Decimal("60"),
+        decision_seconds_before_end=Decimal("90"),
+        min_entry=Decimal("0.45"),
+        max_entry=Decimal("0.75"),
+        edge_threshold=Decimal("0.06"),
+        max_spread=Decimal("0.04"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+        min_win_probability=Decimal("0.62"),
+    )
+
+    assert signal is not None
+    assert signal.price == Decimal("0.75")
+    assert "required_edge=0.0850" in signal.reason
 
 
 def test_fair_value_edge_signal_rejects_late_entry() -> None:
