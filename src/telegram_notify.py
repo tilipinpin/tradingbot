@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
-from src.telegram_commands import TelegramCommandPoller
+from src.telegram_commands import TelegramCommandPoller, reply_keyboard_markup
 
 
 logger = logging.getLogger("telegram-notify")
@@ -274,15 +274,15 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.token and self.chat_id)
 
-    def send(self, message: str) -> bool:
-        return self.api_request(
-            "sendMessage",
-            {
-                "chat_id": self.chat_id,
-                "text": sanitize_sensitive_text(message),
-                "disable_web_page_preview": True,
-            },
-        ) is not None
+    def send(self, message: str, reply_markup: dict[str, Any] | None = None) -> bool:
+        payload: dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "text": sanitize_sensitive_text(message),
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self.api_request("sendMessage", payload) is not None
 
     def api_request(
         self,
@@ -465,7 +465,8 @@ class TradingNotificationService:
                     f"启动时间: {local_now.isoformat(timespec='seconds')}",
                     f"钱包余额: {_money(balance)}",
                 ]
-            )
+            ),
+            reply_markup=reply_keyboard_markup(),
         )
         self._start_command_polling()
 
@@ -487,14 +488,14 @@ class TradingNotificationService:
                 self._send_status()
             elif item.command == "/stop":
                 self._set_trading_paused(True)
-                self.notifier.send(
+                self._send_command_reply(
                     "⛔ 已暂停自动交易\n不会再提交新订单；已提交或已成交的订单不会被撤销。"
                 )
             elif item.command == "/start":
                 self._set_trading_paused(False)
-                self.notifier.send("▶️ 已恢复自动交易\n机器人将从下一次有效信号开始允许下单。")
+                self._send_command_reply("▶️ 已恢复自动交易\n机器人将从下一次有效信号开始允许下单。")
             elif item.command == "/restart":
-                self.notifier.send("🔄 已收到重启指令\n正在保存状态并重启机器人。")
+                self._send_command_reply("🔄 已收到重启指令\n正在保存状态并重启机器人。")
                 restart_requested = True
         if drained_offset != self._saved_command_offset:
             self.state.setdefault("telegram", {})["offset"] = drained_offset
@@ -705,6 +706,13 @@ class TradingNotificationService:
                 ]
             },
         )
+        self.notifier.api_request(
+            "setChatMenuButton",
+            {
+                "chat_id": self.notifier.chat_id,
+                "menu_button": {"type": "commands"},
+            },
+        )
         self._command_poller = TelegramCommandPoller(
             notifier=self.notifier,
             allowed_chat_id=self.notifier.chat_id,
@@ -725,7 +733,7 @@ class TradingNotificationService:
 
     def _send_balance(self) -> None:
         balance = self.current_balance()
-        self.notifier.send(
+        self._send_command_reply(
             "\n".join(
                 [
                     "📈 Polymarket 钱包余额",
@@ -751,7 +759,7 @@ class TradingNotificationService:
         )
         settled = len(resolved)
         win_rate = "N/A" if settled == 0 else f"{Decimal(wins) / Decimal(settled):.2%}"
-        self.notifier.send(
+        self._send_command_reply(
             "\n".join(
                 [
                     f"📊 今日盈亏 {today.isoformat()}",
@@ -767,7 +775,7 @@ class TradingNotificationService:
 
     def _send_positions(self) -> None:
         if not self.wallet_address:
-            self.notifier.send("📋 无法查询持仓\n未配置 DEPOSIT_WALLET/FUNDER_ADDRESS。")
+            self._send_command_reply("📋 无法查询持仓\n未配置 DEPOSIT_WALLET/FUNDER_ADDRESS。")
             return
         try:
             response = requests.get(
@@ -784,10 +792,10 @@ class TradingNotificationService:
             positions = payload if isinstance(payload, list) else []
         except Exception as exc:
             self.notify_exception("查询持仓", exc, key="positions-read", cooldown=60)
-            self.notifier.send("📋 持仓查询失败\n请检查 Data API、代理和网络连接。")
+            self._send_command_reply("📋 持仓查询失败\n请检查 Data API、代理和网络连接。")
             return
         if not positions:
-            self.notifier.send("📋 当前持仓\n暂无大于 0.01 份的持仓。")
+            self._send_command_reply("📋 当前持仓\n暂无大于 0.01 份的持仓。")
             return
 
         total_value = sum(
@@ -822,7 +830,7 @@ class TradingNotificationService:
             )
         if len(positions) > 10:
             lines.append(f"\n另有 {len(positions) - 10} 项未展开。")
-        self.notifier.send("\n".join(lines))
+        self._send_command_reply("\n".join(lines))
 
     def _send_status(self) -> None:
         heartbeat_age = max(0, int(time.monotonic() - self._runtime["heartbeat"]))
@@ -847,7 +855,10 @@ class TradingNotificationService:
             lines.append(
                 f"BTC/USD: {_as_decimal(spot):.2f}（{self._runtime.get('spot_source') or 'N/A'}）"
             )
-        self.notifier.send("\n".join(lines))
+        self._send_command_reply("\n".join(lines))
+
+    def _send_command_reply(self, message: str) -> bool:
+        return self.notifier.send(message, reply_markup=reply_keyboard_markup())
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

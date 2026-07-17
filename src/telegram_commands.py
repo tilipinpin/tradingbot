@@ -19,6 +19,30 @@ SUPPORTED_COMMANDS = {
     "/start",
     "/restart",
 }
+BUTTON_COMMANDS = {
+    "📈 查看余额": "/balance",
+    "📊 今日盈亏": "/pnl",
+    "📋 查看持仓": "/positions",
+    "❤️ 运行状态": "/status",
+    "⛔ 停止交易": "/stop",
+    "▶️ 恢复交易": "/start",
+    "🔄 重启机器人": "/restart",
+}
+
+
+def reply_keyboard_markup() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": "📈 查看余额"}, {"text": "📊 今日盈亏"}],
+            [{"text": "📋 查看持仓"}, {"text": "❤️ 运行状态"}],
+            [{"text": "⛔ 停止交易"}, {"text": "▶️ 恢复交易"}],
+            [{"text": "🔄 重启机器人"}],
+        ],
+        "is_persistent": True,
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "input_field_placeholder": "选择机器人操作",
+    }
 
 
 @dataclass(frozen=True)
@@ -97,9 +121,10 @@ class TelegramCommandPoller:
                 if str(chat.get("id")) != self.allowed_chat_id:
                     continue
                 text = str(message.get("text") or "").strip()
-                if not text.startswith("/"):
-                    continue
-                command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+                if text.startswith("/"):
+                    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+                else:
+                    command = BUTTON_COMMANDS.get(text, "")
                 if command not in SUPPORTED_COMMANDS:
                     continue
                 if command in {"/stop", "/restart"}:

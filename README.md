@@ -178,6 +178,11 @@ TELEGRAM_COMMANDS_ENABLED=true
 - `/start`：清除暂停状态，从下一次有效信号开始恢复下单。
 - `/restart`：保存 Telegram offset 和实盘摘要，使用原命令行参数替换并重启当前进程。
 
+启动通知会附带一个 `is_persistent=true` 的 Telegram 大按钮键盘，普通账号在与机器人
+私聊时即可使用，不需要 Premium。键盘提供余额、盈亏、持仓、状态、停止、恢复和重启
+七个按钮；每次按钮回复都会再次附带键盘。程序还会通过 `setMyCommands` 和
+`setChatMenuButton` 保留输入框旁的 `/` 命令菜单作为备用。Reply Keyboard 不用于频道。
+
 首次启用命令轮询时会丢弃启动前积压的旧消息，避免历史 `/stop` 或 `/restart` 被误执行。
 控制状态和 Telegram offset 也保存在 `data/telegram_daily_state.json`，所以进程重启后不会重复执行指令。
 

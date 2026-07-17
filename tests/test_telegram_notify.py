@@ -98,6 +98,16 @@ def test_notifier_posts_message_and_redacts_private_keys() -> None:
     assert timeout == 10
 
 
+def test_notifier_sends_persistent_reply_keyboard() -> None:
+    session = FakeSession()
+    notifier = TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session)
+    markup = {"keyboard": [[{"text": "📈 查看余额"}]], "is_persistent": True}
+
+    assert notifier.send("controls", reply_markup=markup) is True
+
+    assert session.calls[0][1]["reply_markup"] == markup
+
+
 def test_alert_cooldown_suppresses_duplicate(monkeypatch) -> None:
     session = FakeSession()
     notifier = TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session)

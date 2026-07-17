@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from threading import Event
 
-from src.telegram_commands import TelegramCommandPoller
+from src.telegram_commands import TelegramCommandPoller, reply_keyboard_markup
 
 
 class FakeNotifier:
@@ -90,3 +90,29 @@ def test_poller_discards_first_successful_backlog_after_startup_failure() -> Non
     assert poller.drain() == []
     assert pause_event.is_set() is False
     assert poller.discard_pending is False
+
+
+def test_persistent_keyboard_has_all_control_buttons() -> None:
+    markup = reply_keyboard_markup()
+    labels = [button["text"] for row in markup["keyboard"] for button in row]
+
+    assert markup["is_persistent"] is True
+    assert markup["resize_keyboard"] is True
+    assert labels == [
+        "📈 查看余额",
+        "📊 今日盈亏",
+        "📋 查看持仓",
+        "❤️ 运行状态",
+        "⛔ 停止交易",
+        "▶️ 恢复交易",
+        "🔄 重启机器人",
+    ]
+
+
+def test_poller_maps_large_keyboard_button_to_command() -> None:
+    notifier = FakeNotifier([telegram_update(30, 42, "📋 查看持仓")])
+    poller = TelegramCommandPoller(notifier, "42", 30, Event())
+
+    poller.poll_once()
+
+    assert [item.command for item in poller.drain()] == ["/positions"]
