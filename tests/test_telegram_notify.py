@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from src.telegram_commands import TelegramCommand
 from src.telegram_notify import (
+    DiscordNotifier,
     TelegramNotifier,
     TradingNotificationService,
     calculate_daily_stats,
@@ -81,6 +82,43 @@ def test_disabled_notifier_is_a_noop() -> None:
     notifier = TelegramNotifier(None, None, session=session)
     assert notifier.send("hello") is False
     assert session.calls == []
+
+
+def test_disabled_discord_notifier_is_a_noop() -> None:
+    session = FakeSession()
+    notifier = DiscordNotifier(None, session=session)
+
+    assert notifier.send("hello") is False
+    assert session.calls == []
+
+
+def test_discord_notifier_sanitizes_content_and_disables_mentions() -> None:
+    session = FakeSession()
+    webhook = "https://discord.com/api/webhooks/123456/secret_webhook_token"
+    notifier = DiscordNotifier(webhook, username="Trading Bot", session=session)
+    private_key = "0x" + "a" * 64
+
+    assert notifier.send(f"failed with {private_key} via {webhook}") is True
+
+    url, payload, timeout = session.calls[0]
+    assert url == webhook
+    assert private_key not in payload["content"]
+    assert webhook not in payload["content"]
+    assert payload["allowed_mentions"] == {"parse": []}
+    assert payload["username"] == "Trading Bot"
+    assert timeout == 10
+
+
+def test_discord_notifier_splits_messages_at_2000_characters() -> None:
+    session = FakeSession()
+    notifier = DiscordNotifier(
+        "https://discord.com/api/webhooks/123456/secret_webhook_token",
+        session=session,
+    )
+
+    assert notifier.send("x" * 2001) is True
+
+    assert [len(call[1]["content"]) for call in session.calls] == [2000, 1]
 
 
 def test_notifier_posts_message_and_redacts_private_keys() -> None:
@@ -183,6 +221,92 @@ def test_settlement_service_persists_and_deduplicates_notifications(tmp_path) ->
     assert settlement_key(order) in saved["settlements"]
 
 
+def test_start_notification_is_sent_to_telegram_and_discord(tmp_path) -> None:
+    telegram_session = FakeSession()
+    discord_session = FakeSession()
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=telegram_session),
+        discord_notifier=DiscordNotifier(
+            "https://discord.com/api/webhooks/123456/secret_webhook_token",
+            session=discord_session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=tmp_path / "state.json",
+    )
+
+    service.start()
+
+    assert "机器人启动成功" in telegram_session.calls[0][1]["text"]
+    assert "机器人启动成功" in discord_session.calls[0][1]["content"]
+    assert "reply_markup" in telegram_session.calls[0][1]
+    assert "reply_markup" not in discord_session.calls[0][1]
+
+
+def test_settlement_retries_only_missing_discord_delivery(tmp_path) -> None:
+    class FlakyResponse(FakeResponse):
+        def __init__(self, should_fail: bool) -> None:
+            self.should_fail = should_fail
+
+        def raise_for_status(self) -> None:
+            if self.should_fail:
+                raise RuntimeError("temporary Discord outage")
+
+    class FlakyDiscordSession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.should_fail = True
+
+        def post(self, url: str, json: dict, timeout: float) -> FlakyResponse:
+            self.calls.append((url, json, timeout))
+            return FlakyResponse(self.should_fail)
+
+    telegram_session = FakeSession()
+    discord_session = FlakyDiscordSession()
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    order = matched_order()
+    order["matched_at"] = "2026-07-16T20:44:16+00:00"
+    ledger.write_text(json.dumps(order) + "\n")
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=telegram_session),
+        discord_notifier=DiscordNotifier(
+            "https://discord.com/api/webhooks/123456/secret_webhook_token",
+            session=discord_session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+        settlement_interval=5,
+    )
+
+    service.maybe_send_settlements(lambda slug: "UP")
+
+    key = settlement_key(order)
+    saved = json.loads(state.read_text())
+    assert saved["settlements"][key]["notified_channels"] == ["telegram"]
+    assert len(telegram_session.calls) == 1
+    assert len(discord_session.calls) == 1
+
+    discord_session.should_fail = False
+    service._next_settlement_attempt = 0
+    service.maybe_send_settlements(lambda slug: None)
+
+    saved = json.loads(state.read_text())
+    assert saved["settlements"][key]["notified_channels"] == ["discord", "telegram"]
+    assert len(telegram_session.calls) == 1
+    assert len(discord_session.calls) == 2
+
+
 def test_record_fill_is_silent_until_settlement_by_default(tmp_path) -> None:
     session = FakeSession()
     service = TradingNotificationService(
@@ -228,6 +352,8 @@ def test_daily_stats_count_only_resolved_orders_in_win_rate() -> None:
 def test_sensitive_text_redacts_telegram_tokens() -> None:
     token = "123456789:abcdefghijklmnopqrstuvwxyz_ABCD"
     assert token not in sanitize_sensitive_text(f"request {token} failed")
+    webhook = "https://discord.com/api/webhooks/123456/secret_webhook_token"
+    assert webhook not in sanitize_sensitive_text(f"request {webhook} failed")
 
 
 def test_command_stop_and_start_persist_trading_gate(tmp_path) -> None:

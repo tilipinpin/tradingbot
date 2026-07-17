@@ -146,7 +146,7 @@ python -m src.watch_updown \
 实盘进程结束后会写入 `data/live_trade_summary.json`，可运行
 `python3 live_trade_summary.py` 查看最后一次会话、订单尝试和 CLOB 响应。
 
-### Telegram 通知
+### Telegram 与 Discord 通知
 
 在本机 `.env` 中配置 Telegram BotFather 创建的 bot token 和接收者 chat ID：
 
@@ -156,19 +156,25 @@ TELEGRAM_BOT_TOKEN=<bot-token>
 TELEGRAM_CHAT_ID=<chat-id>
 TELEGRAM_TIMEZONE=Asia/Shanghai
 TELEGRAM_COMMANDS_ENABLED=true
+
+DISCORD_ENABLED=true
+DISCORD_WEBHOOK_URL=<discord-webhook-url>
+DISCORD_USERNAME=Polymarket Trading Bot
 ```
 
 先在 Telegram 中主动给机器人发送一条消息，确保 bot 可以向该 chat ID 回复。未配置 token
-或 chat ID 时通知模块自动关闭，不影响交易。配置后 `watch_updown` 会发送：
+或 chat ID 时 Telegram 自动关闭；未配置 Webhook 时 Discord 自动关闭，均不影响交易。Discord
+仅接收通知，不提供交易控制命令，并会禁用 `@everyone`、角色和用户提及。配置后
+`watch_updown` 会向所有已启用通道发送：
 
 - 启动：版本、服务器、模式、策略和钱包余额。
-- 成交：实际 `matched` 订单只写入本地成交账本，默认不立即发送 Telegram；设置 `TELEGRAM_NOTIFY_ON_MATCHED=true` 可恢复即时通知。
+- 成交：实际 `matched` 订单只写入本地成交账本，默认不立即通知；设置 `TELEGRAM_NOTIFY_ON_MATCHED=true` 可恢复即时通知。
 - 结算：默认每笔订单只在正式结算后通知一次，包含胜负、返还、本单毛盈亏、收益率、当前余额和累计战绩；每 30 秒检查一次，重启后会补查且不会重复推送。
 - 异常：签名、余额/授权、RPC/API 超时、网络/代理和订单未成交；持续同类行情异常默认冷却 5 分钟。
 - 日报：上海时区午夜后的第一个轮询，统计实际成交、已结算胜率、策略毛盈亏、余额变化和手续费/余额差额估算。
 - 停止：正常结束、`Ctrl+C` 或未捕获异常，包含运行时长、累计尝试、累计成交、最终余额和最后错误。
 
-同一个已授权 chat ID 可以直接控制和查询机器人，其他 chat 的消息会被忽略：
+同一个已授权 Telegram chat ID 可以直接控制和查询机器人，其他 chat 的消息会被忽略：
 
 - `/balance`：读取交易钱包的可用抵押余额。
 - `/pnl`：读取本地成交账本和逐单结算记录，汇总今日胜率与毛盈亏。

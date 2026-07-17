@@ -30,7 +30,11 @@ from src.telegram_commands import (
 
 logger = logging.getLogger("telegram-notify")
 
-BOT_TOKEN_PATTERN = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
+BOT_TOKEN_PATTERN = re.compile(r"\d{6,15}:[A-Za-z0-9_-]{20,}")
+DISCORD_WEBHOOK_PATTERN = re.compile(
+    r"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9._-]+",
+    re.IGNORECASE,
+)
 PRIVATE_KEY_PATTERN = re.compile(r"\b(?:0x)?[0-9a-fA-F]{64}\b")
 PROBABILITY_PATTERN = re.compile(r"\b(?:probability|p_up)=([01](?:\.\d+)?)")
 MICRO_UNITS = Decimal("1000000")
@@ -58,6 +62,7 @@ def _duration(seconds: float) -> str:
 def sanitize_sensitive_text(value: Any) -> str:
     text = str(value)
     text = BOT_TOKEN_PATTERN.sub("<telegram-token-redacted>", text)
+    text = DISCORD_WEBHOOK_PATTERN.sub("<discord-webhook-redacted>", text)
     return PRIVATE_KEY_PATTERN.sub("<private-key-redacted>", text)
 
 
@@ -325,6 +330,69 @@ class TelegramNotifier:
         return self.send(message)
 
 
+class DiscordNotifier:
+    def __init__(
+        self,
+        webhook_url: str | None,
+        timeout: float = 10,
+        username: str = "Polymarket Trading Bot",
+        session: Any = requests,
+    ) -> None:
+        self.webhook_url = (webhook_url or "").strip()
+        self.timeout = timeout
+        self.username = username.strip()[:80] or "Polymarket Trading Bot"
+        self.session = session
+        self._last_alert_at: dict[str, float] = {}
+
+    @classmethod
+    def from_env(cls) -> "DiscordNotifier":
+        enabled = os.getenv("DISCORD_ENABLED", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        webhook_url = os.getenv("DISCORD_WEBHOOK_URL") if enabled else None
+        return cls(
+            webhook_url,
+            timeout=float(os.getenv("DISCORD_TIMEOUT", "10")),
+            username=os.getenv("DISCORD_USERNAME", "Polymarket Trading Bot"),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.webhook_url)
+
+    def send(self, message: str) -> bool:
+        if not self.enabled:
+            return False
+        content = sanitize_sensitive_text(message) or " "
+        try:
+            for offset in range(0, len(content), 2000):
+                response = self.session.post(
+                    self.webhook_url,
+                    json={
+                        "content": content[offset : offset + 2000],
+                        "username": self.username,
+                        "allowed_mentions": {"parse": []},
+                    },
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Discord webhook failed: %s", sanitize_sensitive_text(exc))
+            return False
+
+    def alert(self, key: str, message: str, cooldown: float = 300) -> bool:
+        now = time.monotonic()
+        previous = self._last_alert_at.get(key)
+        if previous is not None and now - previous < cooldown:
+            return False
+        self._last_alert_at[key] = now
+        return self.send(message)
+
+
 class TradingNotificationService:
     def __init__(
         self,
@@ -343,8 +411,10 @@ class TradingNotificationService:
         commands_enabled: bool = False,
         wallet_address: str | None = None,
         positions_api: str = POSITIONS_API,
+        discord_notifier: DiscordNotifier | None = None,
     ) -> None:
         self.notifier = notifier
+        self.discord_notifier = discord_notifier or DiscordNotifier(None)
         self.trader = trader
         self.signature_type = signature_type
         self.launch_strategy = strategy
@@ -396,6 +466,7 @@ class TradingNotificationService:
     ) -> "TradingNotificationService":
         return cls(
             notifier=TelegramNotifier.from_env(),
+            discord_notifier=DiscordNotifier.from_env(),
             trader=trader,
             signature_type=signature_type,
             strategy=strategy,
@@ -416,7 +487,57 @@ class TradingNotificationService:
 
     @property
     def enabled(self) -> bool:
-        return self.notifier.enabled
+        return self.notifier.enabled or self.discord_notifier.enabled
+
+    def _enabled_channels(self) -> set[str]:
+        channels: set[str] = set()
+        if self.notifier.enabled:
+            channels.add("telegram")
+        if self.discord_notifier.enabled:
+            channels.add("discord")
+        return channels
+
+    def _send_channel(
+        self,
+        channel: str,
+        message: str,
+        telegram_reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        if channel == "telegram":
+            return self.notifier.send(message, reply_markup=telegram_reply_markup)
+        if channel == "discord":
+            return self.discord_notifier.send(message)
+        return False
+
+    @staticmethod
+    def _ordered_channels(channels: set[str]) -> list[str]:
+        return [channel for channel in ("telegram", "discord") if channel in channels]
+
+    def _broadcast(
+        self,
+        message: str,
+        telegram_reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        results = [
+            self._send_channel(channel, message, telegram_reply_markup)
+            for channel in self._ordered_channels(self._enabled_channels())
+        ]
+        return any(results)
+
+    def _deliver_missing_channels(self, message: str, delivered: set[str]) -> set[str]:
+        updated = set(delivered)
+        for channel in self._ordered_channels(self._enabled_channels() - delivered):
+            if self._send_channel(channel, message):
+                updated.add(channel)
+        return updated
+
+    def _broadcast_alert(self, key: str, message: str, cooldown: float) -> bool:
+        results = []
+        if self.notifier.enabled:
+            results.append(self.notifier.alert(key, message, cooldown=cooldown))
+        if self.discord_notifier.enabled:
+            results.append(self.discord_notifier.alert(key, message, cooldown=cooldown))
+        return any(results)
 
     @property
     def trading_paused(self) -> bool:
@@ -511,12 +632,12 @@ class TradingNotificationService:
 
     def start(self) -> None:
         if not self.enabled:
-            logger.info("Telegram notifications disabled: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured")
+            logger.info("Telegram and Discord notifications are disabled or not configured")
             return
         balance = self.current_balance()
         local_now = datetime.now(self.local_timezone)
         self._ensure_day(local_now.date(), balance)
-        self.notifier.send(
+        self._broadcast(
             "\n".join(
                 [
                     "🚀 Polymarket 机器人启动成功",
@@ -528,7 +649,7 @@ class TradingNotificationService:
                     f"钱包余额: {_money(balance)}",
                 ]
             ),
-            reply_markup=reply_keyboard_markup(),
+            telegram_reply_markup=reply_keyboard_markup(),
         )
         self._start_command_polling()
 
@@ -597,7 +718,7 @@ class TradingNotificationService:
             except OSError as exc:
                 self.notify_exception("写入成交账本", exc, key="trade-ledger")
         if self.notify_on_matched:
-            self.notifier.send(format_fill_message(order))
+            self._broadcast(format_fill_message(order))
 
     def notify_exception(
         self,
@@ -608,7 +729,7 @@ class TradingNotificationService:
     ) -> None:
         error = sanitize_sensitive_text(f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else exc)
         category = self._exception_category(error)
-        self.notifier.alert(
+        self._broadcast_alert(
             key or f"{category}:{context}",
             "\n".join(
                 [
@@ -619,7 +740,7 @@ class TradingNotificationService:
                     f"时间: {datetime.now(self.local_timezone).isoformat(timespec='seconds')}",
                 ]
             ),
-            cooldown=cooldown,
+            cooldown,
         )
 
     def maybe_send_settlements(self, winner_lookup: Callable[[str], str | None]) -> None:
@@ -628,6 +749,14 @@ class TradingNotificationService:
             return
         self._next_settlement_attempt = now + self.settlement_interval
         settlements = self.state.setdefault("settlements", {})
+        required_channels = self._enabled_channels()
+        delivery_keys = [
+            key
+            for key, record in settlements.items()
+            if isinstance(record, dict)
+            and "notified_channels" in record
+            and not required_channels.issubset(set(record.get("notified_channels") or []))
+        ]
         pending: list[dict[str, Any]] = []
         seen: set[str] = set()
         for order in self._ledger_orders():
@@ -636,35 +765,49 @@ class TradingNotificationService:
                 continue
             seen.add(key)
             pending.append(order)
-        if not pending:
+        if not pending and not delivery_keys:
             return
 
         winners: dict[str, str | None] = {}
-        try:
-            for slug in sorted({str(order.get("slug") or "") for order in pending}):
-                winners[slug] = winner_lookup(slug)
-        except Exception as exc:
-            self.notify_exception("检查逐单结算", exc, key="settlement-check")
-            return
+        if pending:
+            try:
+                for slug in sorted({str(order.get("slug") or "") for order in pending}):
+                    winners[slug] = winner_lookup(slug)
+            except Exception as exc:
+                self.notify_exception("检查逐单结算", exc, key="settlement-check")
+                return
 
         resolved = [
             (order, winners.get(str(order.get("slug") or "")))
             for order in pending
             if winners.get(str(order.get("slug") or "")) in {"UP", "DOWN"}
         ]
-        if not resolved:
-            return
-        balance = self.current_balance()
         changed = False
         for order, winner in resolved:
             assert winner is not None
             key = settlement_key(order)
             record = settlement_values(order, winner)
             record["settled_at"] = datetime.now(timezone.utc).isoformat()
-            cumulative = list(settlements.values()) + [record]
-            if self.notifier.send(format_settlement_message(record, balance, cumulative)):
-                settlements[key] = record
-                changed = True
+            record["notified_channels"] = []
+            settlements[key] = record
+            delivery_keys.append(key)
+            changed = True
+
+        if delivery_keys:
+            balance = self.current_balance()
+            cumulative = list(settlements.values())
+            for key in dict.fromkeys(delivery_keys):
+                record = settlements.get(key)
+                if not isinstance(record, dict):
+                    continue
+                before = set(record.get("notified_channels") or [])
+                after = self._deliver_missing_channels(
+                    format_settlement_message(record, balance, cumulative),
+                    before,
+                )
+                if after != before:
+                    record["notified_channels"] = sorted(after)
+                    changed = True
         if changed:
             self._save_state()
 
@@ -706,10 +849,16 @@ class TradingNotificationService:
         day_state = self.state["days"][report_day.isoformat()]
         start_balance = self._optional_decimal(day_state.get("start_balance"))
         end_balance = self._optional_decimal(day_state.get("end_balance"))
-        if self.notifier.send(format_daily_message(report_day, stats, start_balance, end_balance)):
+        delivered = set(day_state.get("reported_channels") or [])
+        delivered = self._deliver_missing_channels(
+            format_daily_message(report_day, stats, start_balance, end_balance),
+            delivered,
+        )
+        day_state["reported_channels"] = sorted(delivered)
+        if self._enabled_channels().issubset(delivered):
             day_state["reported"] = True
             day_state["reported_at"] = datetime.now(timezone.utc).isoformat()
-            self._save_state()
+        self._save_state()
 
     def stop(self, reason: str, error: Any = None) -> None:
         if self._stopped:
@@ -732,7 +881,7 @@ class TradingNotificationService:
         ]
         if latest_error:
             lines.append(f"最后错误: {sanitize_sensitive_text(latest_error)[:500]}")
-        self.notifier.send("\n".join(lines))
+        self._broadcast("\n".join(lines))
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -749,7 +898,7 @@ class TradingNotificationService:
             return {"days": {}, "settlements": {}, "control": {}, "telegram": {}}
 
     def _start_command_polling(self) -> None:
-        if not self.commands_enabled or not self.enabled:
+        if not self.commands_enabled or not self.notifier.enabled:
             return
         offset = self._saved_command_offset
         discard_pending = False
