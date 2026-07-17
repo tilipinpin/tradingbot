@@ -313,45 +313,6 @@ def quote_outcomes(clob: ClobDataClient, market: Market) -> tuple[OrderBookQuote
     return up_quote, down_quote
 
 
-def choose_near_even_momentum_signal(
-    market: Market,
-    initial_up_ask: Decimal | None,
-    up_quote: OrderBookQuote | None,
-    down_quote: OrderBookQuote | None,
-    seconds_to_end: Decimal,
-    decision_seconds_before_end: Decimal,
-    min_entry: Decimal,
-    max_entry: Decimal,
-) -> AutoTradeSignal | None:
-    if initial_up_ask is None or up_quote is None or down_quote is None:
-        return None
-    if seconds_to_end > decision_seconds_before_end or seconds_to_end <= 0:
-        return None
-    if up_quote.ask is None or down_quote.ask is None:
-        return None
-
-    if up_quote.ask >= initial_up_ask:
-        side = "UP"
-        token_id = market.token_ids[0]
-        entry = up_quote.ask
-        reason = f"UP ask {up_quote.ask} >= initial UP ask {initial_up_ask}"
-    else:
-        side = "DOWN"
-        token_id = market.token_ids[1]
-        entry = down_quote.ask
-        reason = f"UP ask {up_quote.ask} < initial UP ask {initial_up_ask}"
-
-    if entry < min_entry or entry > max_entry:
-        return None
-
-    return AutoTradeSignal(
-        side=side,
-        token_id=token_id,
-        price=entry,
-        reason=f"near_even_momentum entry={entry} seconds_left={int(seconds_to_end)}; {reason}",
-    )
-
-
 def quote_spread(quote: OrderBookQuote | None) -> Decimal | None:
     if quote is None or quote.bid is None or quote.ask is None:
         return None
@@ -779,7 +740,6 @@ def watch() -> None:
     stop_at = float("inf") if args.duration == 0 else time.time() + args.duration
     current_market: Market | None = None
     start_price: Decimal | None = None
-    initial_up_ask: Decimal | None = None
     last_spot_price: Decimal | None = None
     last_spot_fetched_at: float | None = None
     prices: list[Decimal] = []
@@ -961,7 +921,6 @@ def watch() -> None:
                 logger.info("Window ended. Looking for next slug: %s", slug)
             current_market = load_updown_market(gamma, slug)
             start_price = None
-            initial_up_ask = None
             prices = []
             phase_prices = [[], [], []]
             signals_this_window = 0
@@ -1080,9 +1039,6 @@ def watch() -> None:
         up_quote, down_quote = quote_outcomes(clob, current_market)
         up_ask = up_quote.ask if up_quote else None
         down_ask = down_quote.ask if down_quote else None
-        if initial_up_ask is None and up_ask is not None:
-            initial_up_ask = up_ask
-            logger.info("Captured initial_up_ask=%s for %s", initial_up_ask, current_market.slug)
         action = choose_theoretical_action(fair.probability_up, up_ask, down_ask, edge_threshold)
 
         if snapshot_writer is not None:
@@ -1226,18 +1182,7 @@ def watch() -> None:
             and not risk_pause_active_for_window
             and not notifications.trading_paused
         ):
-            if args.strategy == "near_even_momentum":
-                signal = choose_near_even_momentum_signal(
-                    current_market,
-                    initial_up_ask,
-                    up_quote,
-                    down_quote,
-                    seconds_to_end,
-                    decision_seconds_before_end,
-                    min_entry,
-                    max_entry,
-                )
-            elif args.strategy == "three_phase":
+            if args.strategy == "three_phase":
                 signal = (
                     choose_three_phase_signal(
                         current_market,

@@ -186,8 +186,8 @@ TELEGRAM_COMMANDS_ENABLED=true
 
 策略选择需要二次确认，并持久化到 `data/telegram_daily_state.json`，只在下一个完整
 5 分钟窗口生效。纸面和 dry-run 模式可选择全部策略；实盘 Telegram 选择器目前只开放
-`fair_value_edge`，`near_even_momentum` 标记为实盘待验证，`paired_lock`、`three_phase`
-和 `late_favorite` 标记为仅纸面。选择“跟随启动参数”可清除 Telegram 策略覆盖。
+`fair_value_edge`，`paired_lock`、`three_phase` 和 `late_favorite` 标记为仅纸面。选择
+“跟随启动参数”可清除 Telegram 策略覆盖。
 
 首次启用命令轮询时会丢弃启动前积压的旧消息，避免历史 `/stop` 或 `/restart` 被误执行。
 控制状态和 Telegram offset 也保存在 `data/telegram_daily_state.json`，所以进程重启后不会重复执行指令。

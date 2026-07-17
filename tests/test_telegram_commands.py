@@ -141,8 +141,8 @@ def test_live_strategy_menu_marks_paper_strategies_unavailable() -> None:
     by_data = {button["callback_data"]: button["text"] for button in buttons}
 
     assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
-    assert "盘口动量（实盘待验证）" in by_data["strategy:unavailable:near_even_momentum"]
     assert "尾盘高置信度（仅纸面）" in by_data["strategy:unavailable:late_favorite"]
+    assert len(by_data) == 6
 
 
 def test_poller_parses_strategy_callback_from_authorized_chat() -> None:

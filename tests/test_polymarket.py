@@ -33,7 +33,6 @@ from src.watch_updown import (
     account_new_paper_settlements,
     close_paper_position,
     consume_pause_window,
-    choose_near_even_momentum_signal,
     choose_fair_value_edge_signal,
     choose_late_favorite_signal,
     choose_three_phase_signal,
@@ -720,41 +719,6 @@ def test_watch_updown_slug_helpers() -> None:
 def test_start_capture_rejects_fresh_price_after_deadline() -> None:
     assert start_capture_is_too_late(Decimal("-16"), Decimal("15")) is True
     assert start_capture_is_too_late(Decimal("-15"), Decimal("15")) is False
-
-
-def test_near_even_momentum_signal_detects_trade() -> None:
-    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
-    signal = choose_near_even_momentum_signal(
-        market=market,
-        initial_up_ask=Decimal("0.45"),
-        up_quote=OrderBookQuote(bid=Decimal("0.44"), ask=Decimal("0.46")),
-        down_quote=OrderBookQuote(bid=Decimal("0.53"), ask=Decimal("0.48")),
-        seconds_to_end=Decimal("100"),
-        decision_seconds_before_end=Decimal("120"),
-        min_entry=Decimal("0.40"),
-        max_entry=Decimal("0.50"),
-    )
-
-    assert signal is not None
-    assert signal.side == "UP"
-    assert signal.token_id == "up"
-    assert signal.price == Decimal("0.46")
-
-
-def test_near_even_momentum_signal_skips_outside_entry_range() -> None:
-    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
-    signal = choose_near_even_momentum_signal(
-        market=market,
-        initial_up_ask=Decimal("0.45"),
-        up_quote=OrderBookQuote(bid=Decimal("0.58"), ask=Decimal("0.60")),
-        down_quote=OrderBookQuote(bid=Decimal("0.39"), ask=Decimal("0.40")),
-        seconds_to_end=Decimal("100"),
-        decision_seconds_before_end=Decimal("120"),
-        min_entry=Decimal("0.40"),
-        max_entry=Decimal("0.50"),
-    )
-
-    assert signal is None
 
 
 def test_fair_value_edge_signal_buys_best_edge() -> None:

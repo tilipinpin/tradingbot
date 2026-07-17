@@ -28,7 +28,6 @@ INTERNAL_CALLBACK_COMMANDS = {
 }
 STRATEGY_LABELS = {
     "fair_value_edge": "公允价值差",
-    "near_even_momentum": "盘口动量",
     "three_phase": "三段趋势",
     "paired_lock": "配对锁利",
     "late_favorite": "尾盘高置信度",
