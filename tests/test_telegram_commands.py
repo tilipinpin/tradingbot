@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from threading import Event
 
-from src.telegram_commands import TelegramCommandPoller, reply_keyboard_markup
+from src.telegram_commands import (
+    TelegramCommandPoller,
+    reply_keyboard_markup,
+    strategy_selection_markup,
+)
 
 
 class FakeNotifier:
@@ -24,6 +28,18 @@ def telegram_update(update_id: int, chat_id: int, text: str) -> dict:
     return {
         "update_id": update_id,
         "message": {"chat": {"id": chat_id}, "text": text},
+    }
+
+
+def telegram_callback(update_id: int, chat_id: int, data: str) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"callback-{update_id}",
+            "from": {"id": chat_id},
+            "message": {"chat": {"id": chat_id}},
+            "data": data,
+        },
     }
 
 
@@ -105,6 +121,7 @@ def test_persistent_keyboard_has_all_control_buttons() -> None:
         "❤️ 运行状态",
         "⛔ 停止交易",
         "▶️ 恢复交易",
+        "🧠 选择策略",
         "🔄 重启机器人",
     ]
 
@@ -116,3 +133,26 @@ def test_poller_maps_large_keyboard_button_to_command() -> None:
     poller.poll_once()
 
     assert [item.command for item in poller.drain()] == ["/positions"]
+
+
+def test_live_strategy_menu_marks_paper_strategies_unavailable() -> None:
+    markup = strategy_selection_markup("live", "fair_value_edge", "late_favorite")
+    buttons = [button for row in markup["inline_keyboard"] for button in row]
+    by_data = {button["callback_data"]: button["text"] for button in buttons}
+
+    assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
+    assert "盘口动量（实盘待验证）" in by_data["strategy:unavailable:near_even_momentum"]
+    assert "尾盘高置信度（仅纸面）" in by_data["strategy:unavailable:late_favorite"]
+
+
+def test_poller_parses_strategy_callback_from_authorized_chat() -> None:
+    notifier = FakeNotifier([telegram_callback(40, 42, "strategy:select:late_favorite")])
+    poller = TelegramCommandPoller(notifier, "42", 40, Event())
+
+    poller.poll_once()
+    commands = poller.drain()
+
+    assert len(commands) == 1
+    assert commands[0].command == "/strategy_select"
+    assert commands[0].argument == "late_favorite"
+    assert commands[0].callback_query_id == "callback-40"

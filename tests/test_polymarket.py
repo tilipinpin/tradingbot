@@ -32,8 +32,10 @@ from src.replay_recorded import Params, Snapshot, metrics, simulate_window
 from src.watch_updown import (
     account_new_paper_settlements,
     close_paper_position,
+    consume_pause_window,
     choose_near_even_momentum_signal,
     choose_fair_value_edge_signal,
+    choose_late_favorite_signal,
     choose_three_phase_signal,
     live_order_limit_reached,
     live_response_is_matched,
@@ -45,6 +47,7 @@ from src.watch_updown import (
     recent_spot_samples_support_side,
     settle_all_paper_positions,
     settle_paper_positions,
+    strategy_trade_limit,
     AutoTradeSignal,
     next_5m_slug,
     slug_from_value,
@@ -289,6 +292,28 @@ def test_close_paper_position_returns_sale_proceeds() -> None:
     assert bankroll == Decimal("19.94")
     assert positions[0].profit == Decimal("-0.06")
     assert positions[0].settled is True
+
+
+def test_paper_position_fee_is_deducted_from_bankroll_and_profit(monkeypatch) -> None:
+    positions = []
+    signal = AutoTradeSignal(side="UP", token_id="up", price=Decimal("0.75"), reason="late")
+    bankroll = open_paper_position(
+        positions,
+        Decimal("20"),
+        "slug",
+        signal,
+        Decimal("1"),
+        fee_rate=Decimal("0.07"),
+    )
+
+    assert positions[0].fee == Decimal("0.0175")
+    assert bankroll == Decimal("18.9825")
+
+    monkeypatch.setattr("src.watch_updown.fetch_winner", lambda slug: "UP")
+    bankroll = settle_paper_positions(positions, "slug", bankroll)
+
+    assert positions[0].profit.quantize(Decimal("0.0001")) == Decimal("0.3158")
+    assert bankroll.quantize(Decimal("0.0001")) == Decimal("20.3158")
 
 
 def test_phase_trend_classifies_direction_and_noise() -> None:
@@ -567,6 +592,14 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.low_entry_cutoff == "0.50"
     assert args.low_entry_min_win_probability == "0.68"
     assert args.low_entry_confirmation_samples == 3
+    assert args.late_entry_start_seconds == 40
+    assert args.late_entry_cutoff_seconds == 22
+    assert args.late_min_entry == "0.70"
+    assert args.late_max_entry == "0.75"
+    assert args.late_min_win_probability == "0.82"
+    assert args.late_edge_margin == "0.05"
+    assert args.late_fee_rate == "0.07"
+    assert args.late_confirmation_samples == 3
 
 
 def test_live_response_requires_conclusive_match() -> None:
@@ -891,6 +924,85 @@ def test_75_cent_entry_requires_existing_dynamic_high_price_edge() -> None:
     assert signal is not None
     assert signal.price == Decimal("0.75")
     assert "required_edge=0.0850" in signal.reason
+
+
+def test_late_favorite_accepts_fee_adjusted_high_confidence_signal() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+    signal = choose_late_favorite_signal(
+        market=market,
+        probability_up=Decimal("0.84"),
+        up_quote=OrderBookQuote(bid=Decimal("0.74"), ask=Decimal("0.75")),
+        down_quote=OrderBookQuote(bid=Decimal("0.24"), ask=Decimal("0.25")),
+        seconds_to_end=Decimal("30"),
+        recent_spot_prices=[Decimal("101"), Decimal("100.5"), Decimal("102")],
+        start_price=Decimal("100"),
+    )
+
+    assert signal is not None
+    assert signal.side == "UP"
+    assert signal.price == Decimal("0.75")
+    assert "required_probability=0.8200" in signal.reason
+    assert "fee_per_share=0.0131" in signal.reason
+
+
+def test_late_favorite_rejects_weak_probability_time_and_reversal() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+    base = {
+        "market": market,
+        "up_quote": OrderBookQuote(bid=Decimal("0.74"), ask=Decimal("0.75")),
+        "down_quote": OrderBookQuote(bid=Decimal("0.24"), ask=Decimal("0.25")),
+        "recent_spot_prices": [Decimal("101"), Decimal("100.5"), Decimal("102")],
+        "start_price": Decimal("100"),
+    }
+
+    assert choose_late_favorite_signal(
+        probability_up=Decimal("0.81"),
+        seconds_to_end=Decimal("30"),
+        **base,
+    ) is None
+    assert choose_late_favorite_signal(
+        probability_up=Decimal("0.84"),
+        seconds_to_end=Decimal("45"),
+        **base,
+    ) is None
+    assert choose_late_favorite_signal(
+        probability_up=Decimal("0.84"),
+        seconds_to_end=Decimal("30"),
+        **{
+            **base,
+            "recent_spot_prices": [Decimal("102"), Decimal("101"), Decimal("100.5")],
+        },
+    ) is None
+
+
+def test_late_favorite_rejects_wide_spread() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+    signal = choose_late_favorite_signal(
+        market=market,
+        probability_up=Decimal("0.90"),
+        up_quote=OrderBookQuote(bid=Decimal("0.72"), ask=Decimal("0.75")),
+        down_quote=OrderBookQuote(bid=Decimal("0.24"), ask=Decimal("0.25")),
+        seconds_to_end=Decimal("30"),
+        recent_spot_prices=[Decimal("101"), Decimal("102"), Decimal("103")],
+        start_price=Decimal("100"),
+    )
+
+    assert signal is None
+
+
+def test_late_favorite_is_limited_to_one_trade_per_window() -> None:
+    assert strategy_trade_limit("late_favorite", 5) == 1
+    assert strategy_trade_limit("fair_value_edge", 5) == 5
+
+
+def test_loss_pause_consumes_each_full_window_without_off_by_one() -> None:
+    remaining = 3
+    states = []
+    for _ in range(4):
+        active, remaining = consume_pause_window(remaining)
+        states.append(active)
+
+    assert states == [True, True, True, False]
 
 
 def test_fair_value_edge_signal_rejects_late_entry() -> None:

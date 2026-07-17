@@ -23,6 +23,7 @@ from src.fair_value import btc_up_probability, choose_theoretical_action, estima
 from src.market_recorder import JsonlSnapshotWriter, build_snapshot
 from src.polymarket import ClobDataClient, ClobTradingClient, GammaClient, Market, OrderBookQuote
 from src.price_signal import SpotPriceClient
+from src.telegram_commands import LIVE_STRATEGIES, STRATEGY_LABELS
 from src.telegram_notify import TradingNotificationService
 
 
@@ -50,6 +51,7 @@ class PaperPosition:
     entry_price: Decimal
     stake: Decimal
     shares: Decimal
+    fee: Decimal = Decimal("0")
     settled: bool = False
     profit: Decimal | None = None
     accounted: bool = False
@@ -79,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         default="fair_value_edge",
-        choices=["near_even_momentum", "fair_value_edge", "paired_lock", "three_phase"],
+        choices=list(STRATEGY_LABELS),
     )
     parser.add_argument("--decision-seconds-before-end", type=int, default=90)
     parser.add_argument("--min-seconds-before-end", type=int, default=25)
@@ -147,6 +149,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--three-phase-max-entry", default="0.82")
     parser.add_argument("--three-phase-edge", default="0.03")
     parser.add_argument("--three-phase-confirmations", type=int, default=1)
+    parser.add_argument("--late-entry-start-seconds", type=int, default=40)
+    parser.add_argument("--late-entry-cutoff-seconds", type=int, default=22)
+    parser.add_argument("--late-min-entry", default="0.70")
+    parser.add_argument("--late-max-entry", default="0.75")
+    parser.add_argument("--late-min-win-probability", default="0.82")
+    parser.add_argument("--late-edge-margin", default="0.05")
+    parser.add_argument("--late-fee-rate", default="0.07")
+    parser.add_argument("--late-max-spread", default="0.02")
+    parser.add_argument("--late-min-ask-sum", default="0.95")
+    parser.add_argument("--late-max-ask-sum", default="1.05")
+    parser.add_argument("--late-confirmation-samples", type=int, default=3)
+    parser.add_argument("--late-pause-windows-after-loss", type=int, default=3)
     parser.add_argument("--stop-when-bust", action="store_true", help="Exit when paper bankroll reaches zero.")
     parser.add_argument("--chain-id", type=int, default=int(os.getenv("CHAIN_ID", "137")))
     parser.add_argument("--signature-type", type=int, default=int(os.getenv("SIGNATURE_TYPE", "0")))
@@ -385,6 +399,18 @@ def recent_spot_samples_support_side(
     return False
 
 
+def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
+    if strategy == "late_favorite":
+        return 1
+    return configured_limit
+
+
+def consume_pause_window(remaining_windows: int) -> tuple[bool, int]:
+    if remaining_windows <= 0:
+        return False, 0
+    return True, remaining_windows - 1
+
+
 def choose_fair_value_edge_signal(
     market: Market,
     probability_up: Decimal,
@@ -471,6 +497,83 @@ def choose_fair_value_edge_signal(
     )
 
 
+def choose_late_favorite_signal(
+    market: Market,
+    probability_up: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    recent_spot_prices: list[Decimal],
+    start_price: Decimal,
+    entry_start_seconds: Decimal = Decimal("40"),
+    entry_cutoff_seconds: Decimal = Decimal("22"),
+    min_entry: Decimal = Decimal("0.70"),
+    max_entry: Decimal = Decimal("0.75"),
+    min_win_probability: Decimal = Decimal("0.82"),
+    edge_margin: Decimal = Decimal("0.05"),
+    fee_rate: Decimal = Decimal("0.07"),
+    max_spread: Decimal = Decimal("0.02"),
+    min_ask_sum: Decimal = Decimal("0.95"),
+    max_ask_sum: Decimal = Decimal("1.05"),
+    confirmation_samples: int = 3,
+) -> AutoTradeSignal | None:
+    if not entry_cutoff_seconds < seconds_to_end <= entry_start_seconds:
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and up_quote.ask is not None
+    assert down_quote is not None and down_quote.ask is not None
+
+    if up_quote.ask == down_quote.ask:
+        return None
+    if up_quote.ask > down_quote.ask:
+        side = "UP"
+        token_id = market.token_ids[0]
+        entry = up_quote.ask
+        probability = probability_up
+    else:
+        side = "DOWN"
+        token_id = market.token_ids[1]
+        entry = down_quote.ask
+        probability = Decimal("1") - probability_up
+
+    if entry < min_entry or entry > max_entry:
+        return None
+    if not recent_spot_samples_support_side(
+        recent_spot_prices,
+        start_price,
+        side,
+        confirmation_samples,
+    ):
+        return None
+    fee_per_share = fee_rate * entry * (Decimal("1") - entry)
+    required_probability = max(
+        min_win_probability,
+        entry + fee_per_share + edge_margin,
+    )
+    if probability < required_probability:
+        return None
+
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=entry,
+        reason=(
+            f"late_favorite entry={entry} probability={probability.quantize(Decimal('0.0001'))} "
+            f"required_probability={required_probability.quantize(Decimal('0.0001'))} "
+            f"fee_per_share={fee_per_share.quantize(Decimal('0.0001'))} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
 def live_response_is_matched(response: Any) -> bool:
     return (
         isinstance(response, dict)
@@ -512,16 +615,23 @@ def open_paper_position(
     market_slug: str,
     signal: AutoTradeSignal,
     stake: Decimal,
+    fee_rate: Decimal = Decimal("0"),
 ) -> Decimal:
     if stake <= 0:
         raise ValueError("--paper-stake must be positive")
     if signal.price <= 0:
         raise ValueError("Cannot paper trade at non-positive price")
-    if bankroll < stake:
-        logger.info("PAPER_SKIP insufficient bankroll=%s stake=%s", bankroll, stake)
-        return bankroll
-
     shares = stake / signal.price
+    fee = shares * fee_rate * signal.price * (Decimal("1") - signal.price)
+    total_cost = stake + fee
+    if bankroll < total_cost:
+        logger.info(
+            "PAPER_SKIP insufficient bankroll=%s stake=%s fee=%s",
+            bankroll,
+            stake,
+            fee,
+        )
+        return bankroll
     positions.append(
         PaperPosition(
             slug=market_slug,
@@ -529,15 +639,17 @@ def open_paper_position(
             entry_price=signal.price,
             stake=stake,
             shares=shares,
+            fee=fee,
         )
     )
-    bankroll -= stake
+    bankroll -= total_cost
     logger.info(
-        "PAPER_OPEN slug=%s side=%s entry=%s stake=%s shares=%s bankroll=%s",
+        "PAPER_OPEN slug=%s side=%s entry=%s stake=%s fee=%s shares=%s bankroll=%s",
         market_slug,
         signal.side,
         signal.price,
         stake,
+        fee.quantize(Decimal("0.0001")),
         shares.quantize(Decimal("0.0001")),
         bankroll.quantize(Decimal("0.0001")),
     )
@@ -549,7 +661,7 @@ def close_paper_position(position: PaperPosition, bankroll: Decimal, exit_price:
         return bankroll
     proceeds = position.shares * exit_price
     position.settled = True
-    position.profit = proceeds - position.stake
+    position.profit = proceeds - position.stake - position.fee
     bankroll += proceeds
     logger.info(
         "PAPER_CLOSE slug=%s side=%s exit=%s proceeds=%s profit=%s bankroll=%s reason=%s",
@@ -589,7 +701,7 @@ def settle_paper_positions(positions: list[PaperPosition], slug: str, bankroll: 
         position.settled = True
         payout = position.shares if position.side == winner else Decimal("0")
         bankroll += payout
-        profit = payout - position.stake
+        profit = payout - position.stake - position.fee
         position.profit = profit
         logger.info(
             "PAPER_SETTLE slug=%s side=%s winner=%s payout=%s profit=%s bankroll=%s",
@@ -685,6 +797,14 @@ def watch() -> None:
     min_win_probability = Decimal(args.min_win_probability)
     low_entry_cutoff = Decimal(args.low_entry_cutoff)
     low_entry_min_win_probability = Decimal(args.low_entry_min_win_probability)
+    late_min_entry = Decimal(args.late_min_entry)
+    late_max_entry = Decimal(args.late_max_entry)
+    late_min_win_probability = Decimal(args.late_min_win_probability)
+    late_edge_margin = Decimal(args.late_edge_margin)
+    late_fee_rate = Decimal(args.late_fee_rate)
+    late_max_spread = Decimal(args.late_max_spread)
+    late_min_ask_sum = Decimal(args.late_min_ask_sum)
+    late_max_ask_sum = Decimal(args.late_max_ask_sum)
     order_size = Decimal(args.order_size)
     max_live_notional = Decimal(args.max_live_notional)
     decision_seconds_before_end = Decimal(str(args.decision_seconds_before_end))
@@ -700,6 +820,7 @@ def watch() -> None:
     paired_state: PairedLockState | None = None
     consecutive_losses = 0
     pause_windows_remaining = 0
+    risk_pause_active_for_window = False
     live_orders_submitted = 0
     live_orders_matched = 0
     live_summary = {
@@ -743,6 +864,8 @@ def watch() -> None:
         summary=live_summary,
         wallet_address=os.getenv(args.funder_address_env) or os.getenv("DEPOSIT_WALLET"),
     )
+    args.strategy = notifications.resolve_effective_strategy()
+    live_summary["strategy"] = args.strategy
     _ACTIVE_NOTIFICATIONS = notifications
     atexit.register(notifications.stop, "进程退出")
 
@@ -751,8 +874,8 @@ def watch() -> None:
             raise ValueError("--live-trading requires --auto-trade")
         if args.duration < 0:
             raise ValueError("--duration must be zero (unlimited) or positive")
-        if args.live_trading and args.strategy in {"paired_lock", "three_phase"}:
-            raise ValueError(f"{args.strategy} is paper-only until its execution is validated")
+        if args.live_trading and args.strategy not in LIVE_STRATEGIES:
+            raise ValueError(f"{args.strategy} is not approved for live strategy selection")
         if args.live_trading and (
             args.max_live_orders < 0
             or args.max_trades < 1
@@ -768,6 +891,16 @@ def watch() -> None:
             raise ValueError("Low-entry minimum win probability must be between zero and one")
         if args.low_entry_confirmation_samples < 1:
             raise ValueError("Low-entry confirmation samples must be positive")
+        if args.late_entry_cutoff_seconds >= args.late_entry_start_seconds:
+            raise ValueError("late_favorite entry cutoff must be lower than entry start")
+        if not Decimal("0") < late_min_entry <= late_max_entry < Decimal("1"):
+            raise ValueError("late_favorite entry range must be within zero and one")
+        if not Decimal("0") <= late_min_win_probability <= Decimal("1"):
+            raise ValueError("late_favorite minimum win probability must be between zero and one")
+        if late_edge_margin < 0 or late_fee_rate < 0 or late_max_spread < 0:
+            raise ValueError("late_favorite edge, fee rate, and spread must not be negative")
+        if args.late_confirmation_samples < 1 or args.late_pause_windows_after_loss < 0:
+            raise ValueError("late_favorite confirmations must be positive and pause must not be negative")
         if args.three_phase_entry_cutoff_seconds >= args.three_phase_entry_start_seconds:
             raise ValueError("three_phase entry cutoff must be lower than entry start")
         trader = build_live_trader(args)
@@ -805,11 +938,17 @@ def watch() -> None:
         notifications.maybe_send_daily(fetch_winner)
         if args.paper_trading:
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
+            loss_limit = 1 if args.strategy == "late_favorite" else args.max_consecutive_losses
+            loss_pause = (
+                args.late_pause_windows_after_loss
+                if args.strategy == "late_favorite"
+                else args.pause_windows_after_losses
+            )
             consecutive_losses, new_pause_windows = account_new_paper_settlements(
                 paper_positions,
                 consecutive_losses,
-                args.max_consecutive_losses,
-                args.pause_windows_after_losses,
+                loss_limit,
+                loss_pause,
             )
             pause_windows_remaining = max(pause_windows_remaining, new_pause_windows)
             if args.stop_when_bust and paper_bankroll <= 0 and all(position.settled for position in paper_positions):
@@ -829,9 +968,6 @@ def watch() -> None:
             candidate_side = None
             candidate_confirmations = 0
             paired_state = None
-            if pause_windows_remaining > 0:
-                pause_windows_remaining -= 1
-                logger.info("RISK_PAUSE_ACTIVE remaining_windows=%s", pause_windows_remaining)
             if current_market is None:
                 notifications.notify_exception(
                     "读取 Polymarket 市场",
@@ -855,6 +991,18 @@ def watch() -> None:
                 slug = next_5m_slug(current_market.slug)
                 current_market = None
                 continue
+            risk_pause_active_for_window, pause_windows_remaining = consume_pause_window(
+                pause_windows_remaining
+            )
+            if risk_pause_active_for_window:
+                logger.info(
+                    "RISK_PAUSE_ACTIVE remaining_windows_after_this=%s",
+                    pause_windows_remaining,
+                )
+            activated_strategy = notifications.activate_pending_strategy(current_market.slug)
+            if activated_strategy is not None:
+                args.strategy = activated_strategy
+                live_summary["strategy"] = activated_strategy
             logger.info(
                 "Watching %s | start=%s end=%s liquidity=%s outcomes=%s",
                 current_market.slug,
@@ -970,7 +1118,7 @@ def watch() -> None:
         if (
             args.auto_trade
             and args.strategy == "paired_lock"
-            and pause_windows_remaining <= 0
+            and not risk_pause_active_for_window
             and not notifications.trading_paused
         ):
             elapsed_seconds = Decimal("300") - seconds_to_end
@@ -1074,8 +1222,8 @@ def watch() -> None:
         if (
             args.auto_trade
             and args.strategy != "paired_lock"
-            and signals_this_window < args.max_trades
-            and pause_windows_remaining <= 0
+            and signals_this_window < strategy_trade_limit(args.strategy, args.max_trades)
+            and not risk_pause_active_for_window
             and not notifications.trading_paused
         ):
             if args.strategy == "near_even_momentum":
@@ -1112,6 +1260,27 @@ def watch() -> None:
                         <= Decimal(str(args.three_phase_entry_start_seconds))
                     )
                     else None
+                )
+            elif args.strategy == "late_favorite":
+                signal = choose_late_favorite_signal(
+                    current_market,
+                    fair.probability_up,
+                    up_quote,
+                    down_quote,
+                    seconds_to_end,
+                    prices,
+                    start_price,
+                    Decimal(str(args.late_entry_start_seconds)),
+                    Decimal(str(args.late_entry_cutoff_seconds)),
+                    late_min_entry,
+                    late_max_entry,
+                    late_min_win_probability,
+                    late_edge_margin,
+                    late_fee_rate,
+                    late_max_spread,
+                    late_min_ask_sum,
+                    late_max_ask_sum,
+                    args.late_confirmation_samples,
                 )
             else:
                 signal = choose_fair_value_edge_signal(
@@ -1186,6 +1355,7 @@ def watch() -> None:
                             current_market.slug,
                             signal,
                             paper_stake,
+                            late_fee_rate if args.strategy == "late_favorite" else Decimal("0"),
                         )
                         if args.stop_when_bust and paper_bankroll <= 0:
                             logger.info("PAPER_BUST bankroll=%s. Exiting after open position.", paper_bankroll)

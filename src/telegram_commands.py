@@ -15,15 +15,33 @@ SUPPORTED_COMMANDS = {
     "/pnl",
     "/positions",
     "/status",
+    "/strategy",
     "/stop",
     "/start",
     "/restart",
 }
+INTERNAL_CALLBACK_COMMANDS = {
+    "/strategy_select",
+    "/strategy_confirm",
+    "/strategy_unavailable",
+    "/strategy_cancel",
+}
+STRATEGY_LABELS = {
+    "fair_value_edge": "公允价值差",
+    "near_even_momentum": "盘口动量",
+    "three_phase": "三段趋势",
+    "paired_lock": "配对锁利",
+    "late_favorite": "尾盘高置信度",
+}
+PAPER_ONLY_STRATEGIES = {"three_phase", "paired_lock", "late_favorite"}
+LIVE_STRATEGIES = {"fair_value_edge"}
+DEFAULT_STRATEGY = "__default__"
 BUTTON_COMMANDS = {
     "📈 查看余额": "/balance",
     "📊 今日盈亏": "/pnl",
     "📋 查看持仓": "/positions",
     "❤️ 运行状态": "/status",
+    "🧠 选择策略": "/strategy",
     "⛔ 停止交易": "/stop",
     "▶️ 恢复交易": "/start",
     "🔄 重启机器人": "/restart",
@@ -36,7 +54,7 @@ def reply_keyboard_markup() -> dict[str, Any]:
             [{"text": "📈 查看余额"}, {"text": "📊 今日盈亏"}],
             [{"text": "📋 查看持仓"}, {"text": "❤️ 运行状态"}],
             [{"text": "⛔ 停止交易"}, {"text": "▶️ 恢复交易"}],
-            [{"text": "🔄 重启机器人"}],
+            [{"text": "🧠 选择策略"}, {"text": "🔄 重启机器人"}],
         ],
         "is_persistent": True,
         "resize_keyboard": True,
@@ -45,10 +63,56 @@ def reply_keyboard_markup() -> dict[str, Any]:
     }
 
 
+def strategy_selection_markup(
+    mode: str,
+    active_strategy: str,
+    pending_strategy: str | None,
+) -> dict[str, Any]:
+    buttons: list[dict[str, str]] = []
+    for strategy, label in STRATEGY_LABELS.items():
+        unavailable = mode == "live" and strategy not in LIVE_STRATEGIES
+        prefix = "✅ " if strategy == active_strategy else "⏳ " if strategy == pending_strategy else ""
+        suffix = (
+            "（仅纸面）"
+            if unavailable and strategy in PAPER_ONLY_STRATEGIES
+            else "（实盘待验证）"
+            if unavailable
+            else ""
+        )
+        action = "unavailable" if unavailable else "select"
+        buttons.append(
+            {
+                "text": f"{prefix}{label}{suffix}",
+                "callback_data": f"strategy:{action}:{strategy}",
+            }
+        )
+    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    rows.extend(
+        [
+            [{"text": "↩️ 跟随启动参数", "callback_data": f"strategy:select:{DEFAULT_STRATEGY}"}],
+            [{"text": "取消", "callback_data": "strategy:cancel"}],
+        ]
+    )
+    return {"inline_keyboard": rows}
+
+
+def strategy_confirmation_markup(strategy: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "确认下个窗口切换", "callback_data": f"strategy:confirm:{strategy}"},
+                {"text": "取消", "callback_data": "strategy:cancel"},
+            ]
+        ]
+    }
+
+
 @dataclass(frozen=True)
 class TelegramCommand:
     update_id: int
     command: str
+    argument: str | None = None
+    callback_query_id: str | None = None
 
 
 class TelegramCommandPoller:
@@ -100,7 +164,7 @@ class TelegramCommandPoller:
             {
                 "offset": self.offset,
                 "timeout": self.poll_timeout,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             },
             timeout=self.poll_timeout + 5,
         )
@@ -116,22 +180,49 @@ class TelegramCommandPoller:
                 self.offset = max(self.offset, update_id + 1)
                 if discard_updates:
                     continue
-                message = update.get("message") or {}
+                callback_query = update.get("callback_query") or {}
+                message = update.get("message") or callback_query.get("message") or {}
                 chat = message.get("chat") or {}
                 if str(chat.get("id")) != self.allowed_chat_id:
                     continue
-                text = str(message.get("text") or "").strip()
-                if text.startswith("/"):
-                    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+                argument = None
+                callback_query_id = None
+                if callback_query:
+                    data = str(callback_query.get("data") or "")
+                    parts = data.split(":", 2)
+                    if len(parts) < 2 or parts[0] != "strategy":
+                        continue
+                    action = parts[1]
+                    argument = parts[2] if len(parts) == 3 else None
+                    command = f"/strategy_{action}"
+                    callback_query_id = str(callback_query.get("id") or "") or None
+                    if command not in INTERNAL_CALLBACK_COMMANDS:
+                        continue
+                    if command != "/strategy_cancel" and argument not in {
+                        *STRATEGY_LABELS,
+                        DEFAULT_STRATEGY,
+                    }:
+                        continue
                 else:
-                    command = BUTTON_COMMANDS.get(text, "")
-                if command not in SUPPORTED_COMMANDS:
-                    continue
+                    text = str(message.get("text") or "").strip()
+                    if text.startswith("/"):
+                        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+                    else:
+                        command = BUTTON_COMMANDS.get(text, "")
+                    if command not in SUPPORTED_COMMANDS:
+                        continue
                 if command in {"/stop", "/restart"}:
                     self.pause_event.set()
                 elif command == "/start":
                     self.pause_event.clear()
-                self._commands.put(TelegramCommand(update_id=update_id, command=command))
+                self._commands.put(
+                    TelegramCommand(
+                        update_id=update_id,
+                        command=command,
+                        argument=argument,
+                        callback_query_id=callback_query_id,
+                    )
+                )
             self.discard_pending = False
         return True
 

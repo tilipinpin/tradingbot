@@ -398,3 +398,119 @@ def test_status_command_reports_health_and_trading_pause(tmp_path) -> None:
     assert "累计尝试/成交: 3/1" in message
     assert "窗口剩余: 42 秒" in message
     assert "BTC/USD: 118000.50（CHAINLINK）" in message
+
+
+def test_paper_strategy_switch_is_queued_and_activated_next_window(tmp_path) -> None:
+    session = FakeSession()
+    state = tmp_path / "state.json"
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="paper",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+
+    service._queue_strategy("late_favorite")
+
+    assert service.strategy == "fair_value_edge"
+    assert service.pending_strategy == "late_favorite"
+    assert service.activate_pending_strategy("btc-updown-5m-2") == "late_favorite"
+    assert service.strategy == "late_favorite"
+    saved = json.loads(state.read_text())
+    assert saved["control"]["strategy_override"] == "late_favorite"
+    assert "pending_strategy" not in saved["control"]
+    assert "生效市场: btc-updown-5m-2" in session.calls[-1][1]["text"]
+
+
+def test_live_strategy_switch_rejects_paper_only_strategy(tmp_path) -> None:
+    session = FakeSession()
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=tmp_path / "state.json",
+    )
+
+    service._queue_strategy("late_favorite")
+
+    assert service.pending_strategy is None
+    assert "仅允许纸面或 dry-run" in session.calls[-1][1]["text"]
+
+
+def test_strategy_override_persists_for_paper_and_is_ignored_for_live(tmp_path) -> None:
+    state = tmp_path / "state.json"
+    paper = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="paper",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+    paper._queue_strategy("late_favorite")
+    paper.activate_pending_strategy("btc-updown-5m-2")
+
+    restarted_paper = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="paper",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+    restarted_live = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+
+    assert restarted_paper.resolve_effective_strategy() == "late_favorite"
+    assert restarted_live.resolve_effective_strategy() == "fair_value_edge"
+
+
+def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path) -> None:
+    state = tmp_path / "state.json"
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="paper",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+    service.update_runtime(slug="btc-updown-5m-1")
+    service._queue_strategy("late_favorite")
+
+    restarted = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="paper",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+
+    assert restarted.activate_pending_strategy("btc-updown-5m-1") is None
+    assert restarted.pending_strategy == "late_favorite"
+    assert restarted.activate_pending_strategy("btc-updown-5m-2") == "late_favorite"

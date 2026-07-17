@@ -174,14 +174,20 @@ TELEGRAM_COMMANDS_ENABLED=true
 - `/pnl`：读取本地成交账本和逐单结算记录，汇总今日胜率与毛盈亏。
 - `/positions`：用 `DEPOSIT_WALLET`/`FUNDER_ADDRESS` 查询 Polymarket Data API 当前持仓。
 - `/status`：查看进程心跳、运行时间、策略、窗口和累计尝试/成交。
+- `/strategy`：查看当前策略并通过内联按钮选择下个窗口使用的策略。
 - `/stop`：立即阻止提交新订单并持久化暂停状态；不会撤销已经提交或成交的订单。
 - `/start`：清除暂停状态，从下一次有效信号开始恢复下单。
 - `/restart`：保存 Telegram offset 和实盘摘要，使用原命令行参数替换并重启当前进程。
 
 启动通知会附带一个 `is_persistent=true` 的 Telegram 大按钮键盘，普通账号在与机器人
-私聊时即可使用，不需要 Premium。键盘提供余额、盈亏、持仓、状态、停止、恢复和重启
-七个按钮；每次按钮回复都会再次附带键盘。程序还会通过 `setMyCommands` 和
+私聊时即可使用，不需要 Premium。键盘提供余额、盈亏、持仓、状态、策略、停止、恢复和重启
+八个按钮；每次按钮回复都会再次附带键盘。程序还会通过 `setMyCommands` 和
 `setChatMenuButton` 保留输入框旁的 `/` 命令菜单作为备用。Reply Keyboard 不用于频道。
+
+策略选择需要二次确认，并持久化到 `data/telegram_daily_state.json`，只在下一个完整
+5 分钟窗口生效。纸面和 dry-run 模式可选择全部策略；实盘 Telegram 选择器目前只开放
+`fair_value_edge`，`near_even_momentum` 标记为实盘待验证，`paired_lock`、`three_phase`
+和 `late_favorite` 标记为仅纸面。选择“跟随启动参数”可清除 Telegram 策略覆盖。
 
 首次启用命令轮询时会丢弃启动前积压的旧消息，避免历史 `/stop` 或 `/restart` 被误执行。
 控制状态和 Telegram offset 也保存在 `data/telegram_daily_state.json`，所以进程重启后不会重复执行指令。
@@ -277,6 +283,39 @@ python -m src.watch_updown \
 `three_phase` 目前只允许纸面测试。趋势为 `N`、价格未穿越开盘价、盘口价格不在
 0.35–0.82、spread 超过 0.04 或理论 edge 低于配置值时都会跳过。第三段开始后先观察
 5 秒，只在剩余 95–40 秒的窗口内确认并开仓，最后 40 秒禁止新单。
+
+尾盘高置信度纸面策略只在剩余 40–22 秒观察价格较高的一侧。它要求入场价为
+0.70–0.75、模型胜率至少 82%、最近 3 次 Chainlink 采样都支持该方向、spread 不超过
+0.02，并在买入价和 taker fee 之上保留 5% 概率安全边际。同一窗口最多一单；发生一次
+纸面亏损后默认暂停 3 个窗口。纸面余额和盈亏会扣除配置的 taker fee：
+
+```bash
+python -m src.watch_updown \
+  --slug btc-updown-5m-<timestamp> \
+  --duration 21600 \
+  --interval 10 \
+  --auto-trade \
+  --strategy late_favorite \
+  --price-source POLYMARKET_CHAINLINK \
+  --ws-proxy socks5h://127.0.0.1:7898 \
+  --paper-trading \
+  --paper-bankroll 20 \
+  --paper-stake 1 \
+  --stop-when-bust \
+  --late-entry-start-seconds 40 \
+  --late-entry-cutoff-seconds 22 \
+  --late-min-entry 0.70 \
+  --late-max-entry 0.75 \
+  --late-min-win-probability 0.82 \
+  --late-edge-margin 0.05 \
+  --late-fee-rate 0.07 \
+  --late-max-spread 0.02 \
+  --late-confirmation-samples 3 \
+  --late-pause-windows-after-loss 3
+```
+
+`late_favorite` 通过多个独立窗口重复正期望交易来测试统计优势，不承诺盈利，也不会在
+同一盘口重复加仓。累计足够纸面样本并验证费后盈亏和回撤前，程序拒绝实盘启用。
 
 `fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在理论概率相对盘口 ask 有足够 edge 时入场。默认要求同方向连续出现两次信号、理论胜率至少 62%，并避开最后 25 秒、过期现货价格、宽 spread、交叉报价和异常 ask 总价。高价或临近结算的入场还需要额外 edge；纸面模拟连续亏损达到阈值后会暂停若干窗口。
 

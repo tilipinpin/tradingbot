@@ -16,7 +16,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
-from src.telegram_commands import TelegramCommandPoller, reply_keyboard_markup
+from src.telegram_commands import (
+    DEFAULT_STRATEGY,
+    LIVE_STRATEGIES,
+    PAPER_ONLY_STRATEGIES,
+    STRATEGY_LABELS,
+    TelegramCommandPoller,
+    reply_keyboard_markup,
+    strategy_confirmation_markup,
+    strategy_selection_markup,
+)
 
 
 logger = logging.getLogger("telegram-notify")
@@ -338,6 +347,7 @@ class TradingNotificationService:
         self.notifier = notifier
         self.trader = trader
         self.signature_type = signature_type
+        self.launch_strategy = strategy
         self.strategy = strategy
         self.mode = mode
         self.version = version
@@ -412,6 +422,58 @@ class TradingNotificationService:
     def trading_paused(self) -> bool:
         return self._pause_event.is_set()
 
+    @property
+    def pending_strategy(self) -> str | None:
+        value = self.state.get("control", {}).get("pending_strategy")
+        return str(value) if value in {*STRATEGY_LABELS, DEFAULT_STRATEGY} else None
+
+    def resolve_effective_strategy(self) -> str:
+        override = self.state.get("control", {}).get("strategy_override")
+        if override in STRATEGY_LABELS and self._strategy_available(str(override)):
+            self.strategy = str(override)
+        else:
+            self.strategy = self.launch_strategy
+        self.summary["strategy"] = self.strategy
+        return self.strategy
+
+    def activate_pending_strategy(self, market_slug: str) -> str | None:
+        pending = self.pending_strategy
+        if pending is None:
+            return None
+        target = self.launch_strategy if pending == DEFAULT_STRATEGY else pending
+        control = self.state.setdefault("control", {})
+        requested_market = control.get("strategy_requested_market")
+        if requested_market and requested_market == market_slug:
+            return None
+        control.pop("pending_strategy", None)
+        control.pop("strategy_requested_market", None)
+        if not self._strategy_available(target):
+            self._save_state()
+            self._send_command_reply(
+                f"⚠️ 策略切换未执行\n{self._strategy_label(target)} 在 {self.mode} 模式下不可用。"
+            )
+            return None
+        previous = self.strategy
+        if pending == DEFAULT_STRATEGY:
+            control.pop("strategy_override", None)
+        else:
+            control["strategy_override"] = target
+        control["strategy_updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.strategy = target
+        self.summary["strategy"] = target
+        self._save_state()
+        self._send_command_reply(
+            "\n".join(
+                [
+                    "🧠 交易策略已切换",
+                    f"原策略: {self._strategy_label(previous)}",
+                    f"新策略: {self._strategy_label(target)}",
+                    f"生效市场: {market_slug}",
+                ]
+            )
+        )
+        return target
+
     def update_runtime(
         self,
         slug: str | None = None,
@@ -478,6 +540,11 @@ class TradingNotificationService:
 
         restart_requested = False
         for item in commands:
+            if item.callback_query_id is not None:
+                self.notifier.api_request(
+                    "answerCallbackQuery",
+                    {"callback_query_id": item.callback_query_id},
+                )
             if item.command == "/balance":
                 self._send_balance()
             elif item.command == "/pnl":
@@ -486,6 +553,18 @@ class TradingNotificationService:
                 self._send_positions()
             elif item.command == "/status":
                 self._send_status()
+            elif item.command == "/strategy":
+                self._send_strategy_menu()
+            elif item.command == "/strategy_select" and item.argument is not None:
+                self._send_strategy_confirmation(item.argument)
+            elif item.command == "/strategy_confirm" and item.argument is not None:
+                self._queue_strategy(item.argument)
+            elif item.command == "/strategy_unavailable" and item.argument is not None:
+                self._send_command_reply(
+                    f"⚠️ {self._strategy_label(item.argument)} 当前仅允许纸面或 dry-run 测试。"
+                )
+            elif item.command == "/strategy_cancel":
+                self._send_command_reply("已取消策略选择。")
             elif item.command == "/stop":
                 self._set_trading_paused(True)
                 self._send_command_reply(
@@ -677,7 +756,7 @@ class TradingNotificationService:
         if offset <= 0:
             payload = self.notifier.api_request(
                 "getUpdates",
-                {"offset": 0, "timeout": 0, "allowed_updates": ["message"]},
+                {"offset": 0, "timeout": 0, "allowed_updates": ["message", "callback_query"]},
                 timeout=self.notifier.timeout,
             )
             discard_pending = payload is None
@@ -700,6 +779,7 @@ class TradingNotificationService:
                     {"command": "pnl", "description": "查看今日盈亏"},
                     {"command": "positions", "description": "查看当前持仓"},
                     {"command": "status", "description": "查看机器人状态"},
+                    {"command": "strategy", "description": "查看或切换交易策略"},
                     {"command": "stop", "description": "紧急暂停新交易"},
                     {"command": "start", "description": "恢复自动交易"},
                     {"command": "restart", "description": "重启机器人"},
@@ -855,7 +935,77 @@ class TradingNotificationService:
             lines.append(
                 f"BTC/USD: {_as_decimal(spot):.2f}（{self._runtime.get('spot_source') or 'N/A'}）"
             )
+        pending = self.pending_strategy
+        if pending is not None:
+            target = self.launch_strategy if pending == DEFAULT_STRATEGY else pending
+            lines.append(f"待切换策略: {self._strategy_label(target)}（下个窗口）")
         self._send_command_reply("\n".join(lines))
+
+    def _send_strategy_menu(self) -> None:
+        pending = self.pending_strategy
+        target = self.launch_strategy if pending == DEFAULT_STRATEGY else pending
+        lines = [
+            "🧠 选择交易策略",
+            f"当前策略: {self._strategy_label(self.strategy)}",
+            f"运行模式: {self.mode}",
+        ]
+        if target is not None:
+            lines.append(f"待切换: {self._strategy_label(target)}（下个窗口）")
+        lines.append("策略确认后只在下一个完整 5 分钟窗口生效。")
+        self.notifier.send(
+            "\n".join(lines),
+            reply_markup=strategy_selection_markup(self.mode, self.strategy, pending),
+        )
+
+    def _send_strategy_confirmation(self, strategy: str) -> None:
+        target = self.launch_strategy if strategy == DEFAULT_STRATEGY else strategy
+        if not self._strategy_available(target):
+            self._send_command_reply(
+                f"⚠️ {self._strategy_label(target)} 当前仅允许纸面或 dry-run 测试。"
+            )
+            return
+        self.notifier.send(
+            "\n".join(
+                [
+                    "确认策略切换",
+                    f"当前: {self._strategy_label(self.strategy)}",
+                    f"目标: {self._strategy_label(target)}",
+                    "生效时间: 下一个完整 5 分钟窗口",
+                ]
+            ),
+            reply_markup=strategy_confirmation_markup(strategy),
+        )
+
+    def _queue_strategy(self, strategy: str) -> None:
+        target = self.launch_strategy if strategy == DEFAULT_STRATEGY else strategy
+        if not self._strategy_available(target):
+            self._send_command_reply(
+                f"⚠️ {self._strategy_label(target)} 当前仅允许纸面或 dry-run 测试。"
+            )
+            return
+        control = self.state.setdefault("control", {})
+        control["pending_strategy"] = strategy
+        control["strategy_requested_at"] = datetime.now(timezone.utc).isoformat()
+        requested_market = self._runtime.get("slug")
+        if requested_market:
+            control["strategy_requested_market"] = requested_market
+        else:
+            control.pop("strategy_requested_market", None)
+        self._save_state()
+        self._send_command_reply(
+            f"⏳ 已排队切换至 {self._strategy_label(target)}\n将在下一个完整 5 分钟窗口生效。"
+        )
+
+    def _strategy_available(self, strategy: str) -> bool:
+        if strategy not in STRATEGY_LABELS:
+            return False
+        return self.mode != "live" or strategy in LIVE_STRATEGIES
+
+    @staticmethod
+    def _strategy_label(strategy: str) -> str:
+        label = STRATEGY_LABELS.get(strategy, strategy)
+        suffix = "（仅纸面）" if strategy in PAPER_ONLY_STRATEGIES else ""
+        return f"{label}{suffix} [{strategy}]"
 
     def _send_command_reply(self, message: str) -> bool:
         return self.notifier.send(message, reply_markup=reply_keyboard_markup())
