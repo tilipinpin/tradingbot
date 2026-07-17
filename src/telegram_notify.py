@@ -39,6 +39,22 @@ PRIVATE_KEY_PATTERN = re.compile(r"\b(?:0x)?[0-9a-fA-F]{64}\b")
 PROBABILITY_PATTERN = re.compile(r"\b(?:probability|p_up)=([01](?:\.\d+)?)")
 MICRO_UNITS = Decimal("1000000")
 POSITIONS_API = "https://data-api.polymarket.com/positions"
+DISCORD_COLOR_BLURPLE = 0x5865F2
+DISCORD_COLOR_GREEN = 0x57F287
+DISCORD_COLOR_YELLOW = 0xFEE75C
+DISCORD_COLOR_RED = 0xED4245
+DISCORD_COLOR_BLUE = 0x3498DB
+DISCORD_COLOR_GRAY = 0x95A5A6
+DISCORD_NON_INLINE_FIELDS = {
+    "市场",
+    "订单",
+    "详情",
+    "原因",
+    "最后错误",
+    "服务器",
+    "策略",
+    "当前市场",
+}
 
 
 def _as_decimal(value: Any, default: str = "0") -> Decimal:
@@ -64,6 +80,87 @@ def sanitize_sensitive_text(value: Any) -> str:
     text = BOT_TOKEN_PATTERN.sub("<telegram-token-redacted>", text)
     text = DISCORD_WEBHOOK_PATTERN.sub("<discord-webhook-redacted>", text)
     return PRIVATE_KEY_PATTERN.sub("<private-key-redacted>", text)
+
+
+def _truncate_discord(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def _parse_discord_allowed_mentions(value: str | None) -> list[str]:
+    requested = {
+        item.strip().lower()
+        for item in (value or "users,roles").split(",")
+        if item.strip()
+    }
+    return [
+        mention_type
+        for mention_type in ("users", "roles", "everyone")
+        if mention_type in requested
+    ]
+
+
+def _discord_embed_color(message: str) -> int:
+    if "交易已结算" in message:
+        if "✅ 盈利" in message:
+            return DISCORD_COLOR_GREEN
+        if "❌ 亏损" in message:
+            return DISCORD_COLOR_RED
+        return DISCORD_COLOR_BLURPLE
+    if "异常" in message:
+        return DISCORD_COLOR_RED
+    if "机器人已停止" in message:
+        return DISCORD_COLOR_GRAY
+    if "日报" in message:
+        return DISCORD_COLOR_BLUE
+    if "实际成交" in message:
+        return DISCORD_COLOR_YELLOW
+    if "启动成功" in message or "测试成功" in message:
+        return DISCORD_COLOR_GREEN
+    return DISCORD_COLOR_BLURPLE
+
+
+def build_discord_embed(message: str) -> dict[str, Any]:
+    sanitized = sanitize_sensitive_text(message)
+    lines = [line.strip() for line in sanitized.splitlines() if line.strip()]
+    title = _truncate_discord(lines[0] if lines else "Polymarket 通知", 256)
+    fields: list[dict[str, Any]] = []
+    descriptions: list[str] = []
+
+    for line in lines[1:]:
+        if ":" not in line:
+            descriptions.append(line)
+            continue
+        name, value = (part.strip() for part in line.split(":", 1))
+        if not name or not value:
+            descriptions.append(line)
+            continue
+        if name == "注":
+            descriptions.append(f"*{value}*")
+            continue
+        if len(fields) >= 25:
+            descriptions.append(line)
+            continue
+        fields.append(
+            {
+                "name": _truncate_discord(name, 256),
+                "value": _truncate_discord(value, 1024),
+                "inline": name not in DISCORD_NON_INLINE_FIELDS and len(value) <= 48,
+            }
+        )
+
+    embed: dict[str, Any] = {
+        "title": title,
+        "color": _discord_embed_color(sanitized),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "footer": {"text": "Polymarket BTC 5m • 自动通知"},
+    }
+    if descriptions:
+        embed["description"] = _truncate_discord("\n".join(descriptions), 4096)
+    if fields:
+        embed["fields"] = fields
+    return embed
 
 
 def fill_amounts(order: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal]:
@@ -336,11 +433,15 @@ class DiscordNotifier:
         webhook_url: str | None,
         timeout: float = 10,
         username: str = "Polymarket Trading Bot",
+        mention: str = "",
+        allowed_mentions: str = "users,roles",
         session: Any = requests,
     ) -> None:
         self.webhook_url = (webhook_url or "").strip()
         self.timeout = timeout
         self.username = username.strip()[:80] or "Polymarket Trading Bot"
+        self.mention = sanitize_sensitive_text(mention).strip()[:200]
+        self.allowed_mentions = _parse_discord_allowed_mentions(allowed_mentions)
         self.session = session
         self._last_alert_at: dict[str, float] = {}
 
@@ -357,6 +458,8 @@ class DiscordNotifier:
             webhook_url,
             timeout=float(os.getenv("DISCORD_TIMEOUT", "10")),
             username=os.getenv("DISCORD_USERNAME", "Polymarket Trading Bot"),
+            mention=os.getenv("DISCORD_MENTION", ""),
+            allowed_mentions=os.getenv("DISCORD_ALLOWED_MENTIONS", "users,roles"),
         )
 
     @property
@@ -366,19 +469,20 @@ class DiscordNotifier:
     def send(self, message: str) -> bool:
         if not self.enabled:
             return False
-        content = sanitize_sensitive_text(message) or " "
+        payload: dict[str, Any] = {
+            "embeds": [build_discord_embed(message)],
+            "username": self.username,
+            "allowed_mentions": {"parse": self.allowed_mentions},
+        }
+        if self.mention:
+            payload["content"] = self.mention
         try:
-            for offset in range(0, len(content), 2000):
-                response = self.session.post(
-                    self.webhook_url,
-                    json={
-                        "content": content[offset : offset + 2000],
-                        "username": self.username,
-                        "allowed_mentions": {"parse": []},
-                    },
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
+            response = self.session.post(
+                self.webhook_url,
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
             return True
         except Exception as exc:
             logger.warning("Discord webhook failed: %s", sanitize_sensitive_text(exc))

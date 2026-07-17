@@ -160,11 +160,15 @@ TELEGRAM_COMMANDS_ENABLED=true
 DISCORD_ENABLED=true
 DISCORD_WEBHOOK_URL=<discord-webhook-url>
 DISCORD_USERNAME=Polymarket Trading Bot
+DISCORD_MENTION=
+DISCORD_ALLOWED_MENTIONS=users,roles
 ```
 
 先在 Telegram 中主动给机器人发送一条消息，确保 bot 可以向该 chat ID 回复。未配置 token
 或 chat ID 时 Telegram 自动关闭；未配置 Webhook 时 Discord 自动关闭，均不影响交易。Discord
-仅接收通知，不提供交易控制命令，并会禁用 `@everyone`、角色和用户提及。配置后
+仅接收彩色 Embed 通知，不提供交易控制命令。`DISCORD_MENTION` 可填写 `<@用户ID>` 或
+`<@&角色ID>`，默认允许用户和角色提及；如确需 `@everyone`，将它加入
+`DISCORD_ALLOWED_MENTIONS=users,roles,everyone` 并把 `DISCORD_MENTION` 设为 `@everyone`。配置后
 `watch_updown` 会向所有已启用通道发送：
 
 - 启动：版本、服务器、模式、策略和钱包余额。

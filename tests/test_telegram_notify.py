@@ -10,6 +10,7 @@ from src.telegram_notify import (
     DiscordNotifier,
     TelegramNotifier,
     TradingNotificationService,
+    build_discord_embed,
     calculate_daily_stats,
     fill_amounts,
     format_daily_message,
@@ -92,7 +93,7 @@ def test_disabled_discord_notifier_is_a_noop() -> None:
     assert session.calls == []
 
 
-def test_discord_notifier_sanitizes_content_and_disables_mentions() -> None:
+def test_discord_notifier_sanitizes_embed_and_allows_user_role_mentions() -> None:
     session = FakeSession()
     webhook = "https://discord.com/api/webhooks/123456/secret_webhook_token"
     notifier = DiscordNotifier(webhook, username="Trading Bot", session=session)
@@ -102,23 +103,60 @@ def test_discord_notifier_sanitizes_content_and_disables_mentions() -> None:
 
     url, payload, timeout = session.calls[0]
     assert url == webhook
-    assert private_key not in payload["content"]
-    assert webhook not in payload["content"]
-    assert payload["allowed_mentions"] == {"parse": []}
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert private_key not in serialized
+    assert webhook not in serialized
+    assert "<private-key-redacted>" in serialized
+    assert "<discord-webhook-redacted>" in serialized
+    assert payload["allowed_mentions"] == {"parse": ["users", "roles"]}
     assert payload["username"] == "Trading Bot"
+    assert payload["embeds"][0]["title"].startswith("failed with")
+    assert "content" not in payload
     assert timeout == 10
 
 
-def test_discord_notifier_splits_messages_at_2000_characters() -> None:
+def test_discord_notifier_sends_configured_mention() -> None:
+    session = FakeSession()
+    notifier = DiscordNotifier(
+        "https://discord.com/api/webhooks/123456/secret_webhook_token",
+        mention="<@&987654321>",
+        allowed_mentions="users,roles",
+        session=session,
+    )
+
+    assert notifier.send("⚠️ Polymarket 异常\n详情: RPC timeout") is True
+
+    payload = session.calls[0][1]
+    assert payload["content"] == "<@&987654321>"
+    assert payload["allowed_mentions"] == {"parse": ["users", "roles"]}
+
+
+def test_discord_embed_truncates_long_messages_and_posts_once() -> None:
     session = FakeSession()
     notifier = DiscordNotifier(
         "https://discord.com/api/webhooks/123456/secret_webhook_token",
         session=session,
     )
 
-    assert notifier.send("x" * 2001) is True
+    assert notifier.send("通知\n" + "x" * 5000) is True
 
-    assert [len(call[1]["content"]) for call in session.calls] == [2000, 1]
+    assert len(session.calls) == 1
+    assert len(session.calls[0][1]["embeds"][0]["description"]) == 4096
+
+
+def test_discord_embed_uses_event_colors_and_structured_fields() -> None:
+    winning = build_discord_embed(
+        "🏁 Polymarket 交易已结算\n结果: ✅ 盈利\n本单毛盈亏: +1.2500 pUSD"
+    )
+    losing = build_discord_embed("🏁 Polymarket 交易已结算\n结果: ❌ 亏损")
+    error = build_discord_embed("⚠️ Polymarket 异常\n详情: RPC timeout")
+
+    assert winning["color"] == 0x57F287
+    assert losing["color"] == 0xED4245
+    assert error["color"] == 0xED4245
+    assert winning["fields"][0]["name"] == "结果"
+    assert winning["fields"][1]["value"] == "+1.2500 pUSD"
+    assert winning["footer"]["text"] == "Polymarket BTC 5m • 自动通知"
 
 
 def test_notifier_posts_message_and_redacts_private_keys() -> None:
@@ -242,7 +280,7 @@ def test_start_notification_is_sent_to_telegram_and_discord(tmp_path) -> None:
     service.start()
 
     assert "机器人启动成功" in telegram_session.calls[0][1]["text"]
-    assert "机器人启动成功" in discord_session.calls[0][1]["content"]
+    assert "机器人启动成功" in discord_session.calls[0][1]["embeds"][0]["title"]
     assert "reply_markup" in telegram_session.calls[0][1]
     assert "reply_markup" not in discord_session.calls[0][1]
 
