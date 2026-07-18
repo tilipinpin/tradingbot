@@ -133,7 +133,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds.")
     parser.add_argument("--price-source", default="POLYMARKET_CHAINLINK", help="POLYMARKET_CHAINLINK (strict default), AUTO (Chainlink + free exchanges), CHAINLINK, BINANCE, COINBASE, KRAKEN, or COINGECKO.")
     parser.add_argument("--edge", default="0.06", help="Minimum theoretical edge for BUY_UP/BUY_DOWN.")
-    parser.add_argument("--fallback-sigma", default="0.00005", help="Fallback volatility per sqrt(second).")
+    parser.add_argument(
+        "--fallback-sigma",
+        default="0.00005",
+        help="Fallback and long-run floor for volatility per sqrt(second).",
+    )
     parser.add_argument("--clob-host", default="https://clob.polymarket.com")
     parser.add_argument("--market-data-timeout", type=int, default=3, help="Per-request timeout for CLOB and spot data.")
     parser.add_argument("--ws-proxy", help="Optional WebSocket proxy, e.g. socks5h://127.0.0.1:7898.")
@@ -148,6 +152,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decision-seconds-before-end", type=int, default=90)
     parser.add_argument("--min-seconds-before-end", type=int, default=25)
     parser.add_argument("--signal-confirmations", type=int, default=2)
+    parser.add_argument("--trend-confirmation-samples", type=int, default=3)
+    parser.add_argument("--confirmation-jump-sigma-multiplier", default="1.25")
+    parser.add_argument("--confirmation-min-jump-usd", default="3.00")
+    parser.add_argument("--hedge-signal-confirmations", type=int, default=2)
+    parser.add_argument("--hedge-min-win-probability", default="0.62")
     parser.add_argument("--max-spot-age", type=int, default=20, help="Maximum cached spot-price age allowed for entries.")
     parser.add_argument("--max-start-capture-delay", type=int, default=15, help="Skip a window if its start price is captured later than this many seconds.")
     parser.add_argument(
@@ -183,7 +192,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--low-entry-cutoff", default="0.50")
     parser.add_argument("--low-entry-min-win-probability", default="0.68")
     parser.add_argument("--low-entry-confirmation-samples", type=int, default=3)
-    parser.add_argument("--min-entry", default="0.50")
+    parser.add_argument("--min-entry", default="0.55")
     parser.add_argument("--max-entry", default="0.78")
     parser.add_argument("--max-spread", default="0.04", help="Max bid/ask spread allowed for the selected side.")
     parser.add_argument("--min-ask-sum", default="0.90", help="Skip markets where Up ask + Down ask is below this.")
@@ -388,6 +397,35 @@ def recent_spot_samples_support_side(
     return False
 
 
+def adverse_jump_exceeds_dynamic_threshold(
+    prices: list[Decimal],
+    side: str,
+    sigma_per_sqrt_second: Decimal,
+    interval_seconds: Decimal,
+    sigma_multiplier: Decimal,
+    minimum_jump_usd: Decimal,
+) -> tuple[bool, Decimal, Decimal]:
+    if (
+        len(prices) < 2
+        or prices[-2] <= 0
+        or interval_seconds <= 0
+        or sigma_per_sqrt_second < 0
+        or sigma_multiplier < 0
+        or minimum_jump_usd < 0
+    ):
+        return False, Decimal("0"), minimum_jump_usd
+    dynamic_threshold = (
+        prices[-2]
+        * sigma_per_sqrt_second
+        * Decimal(str(math.sqrt(float(interval_seconds))))
+        * sigma_multiplier
+    )
+    threshold = max(minimum_jump_usd, dynamic_threshold)
+    move = prices[-1] - prices[-2]
+    adverse_move = -move if side == "UP" else move if side == "DOWN" else Decimal("0")
+    return adverse_move > threshold, max(Decimal("0"), adverse_move), threshold
+
+
 def shrink_probability_toward_even(probability: Decimal, shrinkage: Decimal) -> Decimal:
     if probability < 0 or probability > 1:
         raise ValueError("probability must be between zero and one")
@@ -560,6 +598,58 @@ def choose_fair_value_edge_signal(
             f"p_up={probability_up.quantize(Decimal('0.0001'))} "
             f"raw_p_up={raw_probability_up.quantize(Decimal('0.0001'))} "
             f"shrinkage={probability_shrinkage.quantize(Decimal('0.01'))} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def choose_protective_hedge_signal(
+    market: Market,
+    primary_side: str,
+    probability_up: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    decision_seconds_before_end: Decimal,
+    min_seconds_before_end: Decimal,
+    max_entry: Decimal,
+    edge_threshold: Decimal,
+    min_win_probability: Decimal,
+    max_spread: Decimal,
+    min_ask_sum: Decimal,
+    max_ask_sum: Decimal,
+) -> AutoTradeSignal | None:
+    if seconds_to_end > decision_seconds_before_end or seconds_to_end < min_seconds_before_end:
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and down_quote is not None
+    side = "DOWN" if primary_side == "UP" else "UP" if primary_side == "DOWN" else ""
+    if not side:
+        return None
+    probability = probability_up if side == "UP" else Decimal("1") - probability_up
+    quote = up_quote if side == "UP" else down_quote
+    entry = quote.ask
+    edge = probability - entry
+    if probability < min_win_probability or entry <= 0 or entry > max_entry or edge < edge_threshold:
+        return None
+    token_id = market.token_ids[0] if side == "UP" else market.token_ids[1]
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=entry,
+        reason=(
+            f"protective_hedge primary_side={primary_side} entry={entry} "
+            f"edge={edge.quantize(Decimal('0.0001'))} "
+            f"probability={probability.quantize(Decimal('0.0001'))} "
+            f"required_probability={min_win_probability.quantize(Decimal('0.0001'))} "
             f"seconds_left={int(seconds_to_end)}"
         ),
     )
@@ -1282,8 +1372,12 @@ def watch() -> None:
     signals_this_window = 0
     candidate_side: str | None = None
     candidate_confirmations = 0
+    primary_side_this_window: str | None = None
     edge_threshold = Decimal(args.edge)
     fallback_sigma = Decimal(args.fallback_sigma)
+    confirmation_jump_sigma_multiplier = Decimal(args.confirmation_jump_sigma_multiplier)
+    confirmation_min_jump_usd = Decimal(args.confirmation_min_jump_usd)
+    hedge_min_win_probability = Decimal(args.hedge_min_win_probability)
     min_entry = Decimal(args.min_entry)
     max_entry = Decimal(args.max_entry)
     max_spread = Decimal(args.max_spread)
@@ -1408,12 +1502,22 @@ def watch() -> None:
             raise ValueError(
                 "Live order size, per-window limit, and notional must be positive; session limit may be zero"
             )
-        if not min_entry <= low_entry_cutoff <= max_entry:
-            raise ValueError("Low-entry cutoff must be within the configured entry range")
+        if not Decimal("0") <= low_entry_cutoff <= max_entry:
+            raise ValueError("Low-entry cutoff must be between zero and maximum entry")
         if not Decimal("0") <= low_entry_min_win_probability <= Decimal("1"):
             raise ValueError("Low-entry minimum win probability must be between zero and one")
         if not Decimal("0") <= probability_shrinkage <= Decimal("1"):
             raise ValueError("Probability shrinkage must be between zero and one")
+        if fallback_sigma <= 0:
+            raise ValueError("Fallback sigma must be positive")
+        if args.trend_confirmation_samples < 1:
+            raise ValueError("Trend confirmation samples must be positive")
+        if args.hedge_signal_confirmations < 1:
+            raise ValueError("Hedge signal confirmations must be positive")
+        if not Decimal("0") <= hedge_min_win_probability <= Decimal("1"):
+            raise ValueError("Hedge minimum win probability must be between zero and one")
+        if confirmation_jump_sigma_multiplier < 0 or confirmation_min_jump_usd < 0:
+            raise ValueError("Confirmation jump thresholds must be non-negative")
         if args.low_entry_confirmation_samples < 1:
             raise ValueError("Low-entry confirmation samples must be positive")
         if max_price_alignment_difference < 0:
@@ -1552,6 +1656,7 @@ def watch() -> None:
             signals_this_window = 0
             candidate_side = None
             candidate_confirmations = 0
+            primary_side_this_window = None
             split_maker_state = None
             maker_momentum_state = MakerMomentumProbe()
             if current_market is None:
@@ -2198,6 +2303,23 @@ def watch() -> None:
                     args.low_entry_confirmation_samples,
                     probability_shrinkage,
                 )
+                if signal is None and primary_side_this_window is not None:
+                    signal = choose_protective_hedge_signal(
+                        current_market,
+                        primary_side_this_window,
+                        fair.probability_up,
+                        up_quote,
+                        down_quote,
+                        seconds_to_end,
+                        decision_seconds_before_end,
+                        min_seconds_before_end,
+                        max_entry,
+                        edge_threshold,
+                        hedge_min_win_probability,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                    )
             if signal is not None:
                 if notifications.trading_paused:
                     logger.warning("AUTO_SIGNAL blocked because Telegram trading pause is active.")
@@ -2211,8 +2333,47 @@ def watch() -> None:
                     candidate_confirmations = 0
                     time.sleep(args.interval)
                     continue
+                is_protective_hedge = signal.reason.startswith("protective_hedge")
+                if (
+                    args.strategy == "fair_value_edge"
+                    and not is_protective_hedge
+                    and not recent_spot_samples_support_side(
+                        prices,
+                        start_price,
+                        signal.side,
+                        args.trend_confirmation_samples,
+                    )
+                ):
+                    logger.info(
+                        "SIGNAL_REJECTED side=%s reason=recent_spot_distance_narrowing samples=%s",
+                        signal.side,
+                        args.trend_confirmation_samples,
+                    )
+                    candidate_side = None
+                    candidate_confirmations = 0
+                    time.sleep(args.interval)
+                    continue
+                jump_reset, adverse_jump, jump_threshold = adverse_jump_exceeds_dynamic_threshold(
+                    prices,
+                    signal.side,
+                    fair.sigma_per_sqrt_second,
+                    Decimal(str(args.interval)),
+                    confirmation_jump_sigma_multiplier,
+                    confirmation_min_jump_usd,
+                )
+                if jump_reset:
+                    logger.info(
+                        "SIGNAL_CONFIRMATION_RESET side=%s adverse_jump=%s threshold=%s",
+                        signal.side,
+                        adverse_jump.quantize(Decimal("0.01")),
+                        jump_threshold.quantize(Decimal("0.01")),
+                    )
+                    candidate_side = None
+                    candidate_confirmations = 0
                 required_confirmations = (
-                    args.late_signal_confirmations
+                    args.hedge_signal_confirmations
+                    if is_protective_hedge
+                    else args.late_signal_confirmations
                     if args.strategy == "late_favorite"
                     else args.signal_confirmations
                 )
@@ -2259,6 +2420,8 @@ def watch() -> None:
                             return
                     else:
                         logger.info("DRY RUN: would buy %s at %s x %s", signal.side, signal.price, order_size)
+                    if primary_side_this_window is None:
+                        primary_side_this_window = signal.side
                 else:
                     notional = signal.price * order_size
                     if not live_session_should_continue(live_orders_submitted, args.max_live_orders):
@@ -2358,6 +2521,8 @@ def watch() -> None:
                         time.sleep(args.interval)
                         continue
                     live_orders_matched += 1
+                    if primary_side_this_window is None:
+                        primary_side_this_window = signal.side
                     live_summary["matched_orders"] = live_orders_matched
                     order_record["matched_at"] = datetime.now(timezone.utc).isoformat()
                     notifications.record_fill(order_record)

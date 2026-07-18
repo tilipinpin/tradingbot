@@ -35,10 +35,15 @@ exec "$PYTHON" -u -m src.watch_updown \
   --decision-seconds-before-end 90 \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
+  --trend-confirmation-samples 3 \
+  --confirmation-jump-sigma-multiplier 1.25 \
+  --confirmation-min-jump-usd 3.00 \
+  --hedge-signal-confirmations 2 \
+  --hedge-min-win-probability 0.62 \
   --min-win-probability 0.62 \
   --probability-shrinkage 1.00 \
   --edge 0.06 \
-  --min-entry 0.50 \
+  --min-entry 0.55 \
   --low-entry-cutoff 0.50 \
   --low-entry-min-win-probability 0.68 \
   --low-entry-confirmation-samples 3 \

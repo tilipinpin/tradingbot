@@ -40,7 +40,9 @@ def estimate_sigma_per_sqrt_second(
     if interval_seconds <= 0:
         return fallback_sigma
     sigma = sigma_per_interval / Decimal(str(math.sqrt(float(interval_seconds))))
-    return max(sigma, fallback_sigma / Decimal("10"))
+    # Treat the fallback as a long-run volatility floor. A quiet handful of
+    # samples must not collapse the denominator and create false 0%/100% odds.
+    return max(sigma, fallback_sigma)
 
 
 def btc_up_probability(

@@ -6,7 +6,7 @@ from requests import HTTPError
 
 from src.config import _slug
 from src.backtest_updown import price_at_or_before, previous_slugs, winning_side, PricePoint
-from src.fair_value import btc_up_probability, choose_theoretical_action
+from src.fair_value import btc_up_probability, choose_theoretical_action, estimate_sigma_per_sqrt_second
 from src.market_recorder import JsonlSnapshotWriter, build_snapshot
 from src.polymarket import (
     GammaClient,
@@ -32,9 +32,11 @@ from src.price_signal import (
 from src.strategy import build_buy_intent
 from src.watch_updown import (
     account_new_paper_settlements,
+    adverse_jump_exceeds_dynamic_threshold,
     apply_split_maker_exit,
     consume_pause_window,
     choose_fair_value_edge_signal,
+    choose_protective_hedge_signal,
     choose_late_favorite_signal,
     choose_maker_momentum_signal,
     evaluate_maker_momentum_signal,
@@ -634,7 +636,10 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.max_live_orders == 0
     assert args.max_trades == 2
     assert args.duration == 0
-    assert args.min_entry == "0.50"
+    assert args.min_entry == "0.55"
+    assert args.trend_confirmation_samples == 3
+    assert args.hedge_signal_confirmations == 2
+    assert args.hedge_min_win_probability == "0.62"
     assert args.max_entry == "0.78"
     assert args.max_live_notional == "3.75"
     assert args.low_entry_cutoff == "0.50"
@@ -868,6 +873,42 @@ def test_btc_up_probability_moves_with_price() -> None:
     assert lower.probability_up < Decimal("0.5")
 
 
+def test_sigma_estimate_never_falls_below_long_run_floor() -> None:
+    floor = Decimal("0.00005")
+
+    sigma = estimate_sigma_per_sqrt_second(
+        [Decimal("64000"), Decimal("64000.01"), Decimal("64000.02"), Decimal("64000.03")],
+        Decimal("5"),
+        floor,
+    )
+
+    assert sigma == floor
+
+
+def test_adverse_jump_uses_dynamic_volatility_threshold() -> None:
+    reset, adverse, threshold = adverse_jump_exceeds_dynamic_threshold(
+        [Decimal("64000"), Decimal("64010")],
+        "DOWN",
+        Decimal("0.00005"),
+        Decimal("5"),
+        Decimal("1.25"),
+        Decimal("3"),
+    )
+    stable, _, _ = adverse_jump_exceeds_dynamic_threshold(
+        [Decimal("64000"), Decimal("64005")],
+        "DOWN",
+        Decimal("0.00005"),
+        Decimal("5"),
+        Decimal("1.25"),
+        Decimal("3"),
+    )
+
+    assert reset is True
+    assert adverse == Decimal("10")
+    assert threshold > Decimal("8")
+    assert stable is False
+
+
 def test_theoretical_action_requires_edge() -> None:
     assert choose_theoretical_action(Decimal("0.60"), Decimal("0.52"), Decimal("0.48"), Decimal("0.06")).startswith("BUY_UP")
     assert choose_theoretical_action(Decimal("0.55"), Decimal("0.52"), Decimal("0.48"), Decimal("0.06")).startswith("SKIP")
@@ -903,6 +944,32 @@ def test_fair_value_edge_signal_buys_best_edge() -> None:
     assert signal is not None
     assert signal.side == "UP"
     assert signal.price == Decimal("0.52")
+
+
+def test_protective_hedge_allows_opposite_low_price_after_model_flip() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+
+    signal = choose_protective_hedge_signal(
+        market=market,
+        primary_side="DOWN",
+        probability_up=Decimal("0.65"),
+        up_quote=OrderBookQuote(bid=Decimal("0.47"), ask=Decimal("0.48")),
+        down_quote=OrderBookQuote(bid=Decimal("0.51"), ask=Decimal("0.52")),
+        seconds_to_end=Decimal("66"),
+        decision_seconds_before_end=Decimal("90"),
+        min_seconds_before_end=Decimal("25"),
+        max_entry=Decimal("0.78"),
+        edge_threshold=Decimal("0.06"),
+        min_win_probability=Decimal("0.62"),
+        max_spread=Decimal("0.04"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+    )
+
+    assert signal is not None
+    assert signal.side == "UP"
+    assert signal.price == Decimal("0.48")
+    assert signal.reason.startswith("protective_hedge")
 
 
 def test_probability_shrinkage_moves_tail_confidence_toward_even() -> None:
