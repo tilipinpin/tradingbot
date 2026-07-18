@@ -142,6 +142,8 @@ def test_live_strategy_menu_marks_paper_strategies_unavailable() -> None:
 
     assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
     assert "尾盘高置信度（仅纸面）" in by_data["strategy:unavailable:late_favorite"]
+    assert "Split 双边做市（仅纸面）" in by_data["strategy:unavailable:split_maker"]
+    assert "Maker 触价动量（仅纸面）" in by_data["strategy:unavailable:maker_momentum"]
     assert len(by_data) == 6
 
 

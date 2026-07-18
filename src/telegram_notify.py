@@ -38,6 +38,7 @@ DISCORD_WEBHOOK_PATTERN = re.compile(
 PRIVATE_KEY_PATTERN = re.compile(r"\b(?:0x)?[0-9a-fA-F]{64}\b")
 PROBABILITY_PATTERN = re.compile(r"\b(?:probability|p_up)=([01](?:\.\d+)?)")
 MICRO_UNITS = Decimal("1000000")
+CRYPTO_TAKER_FEE_RATE = Decimal("0.07")
 POSITIONS_API = "https://data-api.polymarket.com/positions"
 DISCORD_COLOR_BLURPLE = 0x5865F2
 DISCORD_COLOR_GREEN = 0x57F287
@@ -150,6 +151,29 @@ def build_discord_embed(message: str) -> dict[str, Any]:
             }
         )
 
+    if "交易已结算" in sanitized:
+        result_field = next((field for field in fields if field["name"] == "结果"), None)
+        pnl_field = next(
+            (
+                field
+                for field in fields
+                if field["name"]
+                in {
+                    "本窗口净盈亏估算",
+                    "本窗口毛盈亏",
+                    "本单净盈亏估算",
+                    "本单毛盈亏",
+                }
+            ),
+            None,
+        )
+        if result_field is not None:
+            title = _truncate_discord(f"{title} · {result_field['value']}", 256)
+            fields.remove(result_field)
+        if pnl_field is not None:
+            title = _truncate_discord(f"{title} · 本单盈亏 {pnl_field['value']}", 256)
+            fields.remove(pnl_field)
+
     embed: dict[str, Any] = {
         "title": title,
         "color": _discord_embed_color(sanitized),
@@ -175,6 +199,63 @@ def fill_amounts(order: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal]:
     return cost, shares, price
 
 
+def estimated_crypto_taker_fee(order: dict[str, Any]) -> Decimal:
+    _, shares, price = fill_amounts(order)
+    if shares <= 0 or not Decimal("0") <= price <= Decimal("1"):
+        return Decimal("0")
+    return shares * CRYPTO_TAKER_FEE_RATE * price * (Decimal("1") - price)
+
+
+def settlement_estimated_fee(settlement: dict[str, Any]) -> Decimal:
+    stored = settlement.get("estimated_fee")
+    if stored not in (None, ""):
+        return _as_decimal(stored)
+    shares = _as_decimal(settlement.get("shares"))
+    price = _as_decimal(settlement.get("entry_price"))
+    if shares <= 0 or not Decimal("0") <= price <= Decimal("1"):
+        return Decimal("0")
+    return shares * CRYPTO_TAKER_FEE_RATE * price * (Decimal("1") - price)
+
+
+@dataclass(frozen=True)
+class AccountSnapshot:
+    available_balance: Decimal | None
+    active_position_value: Decimal | None
+    redeemable_value: Decimal | None
+    position_count: int = 0
+
+    @property
+    def estimated_equity(self) -> Decimal | None:
+        if (
+            self.available_balance is None
+            or self.active_position_value is None
+            or self.redeemable_value is None
+        ):
+            return None
+        return self.available_balance + self.active_position_value + self.redeemable_value
+
+
+def account_snapshot_lines(snapshot: AccountSnapshot) -> list[str]:
+    return [
+        f"可用 pUSD: {_money(snapshot.available_balance)}",
+        f"活跃持仓价值: {_money(snapshot.active_position_value)}",
+        f"待赎回价值: {_money(snapshot.redeemable_value)}",
+        f"估算总权益: {_money(snapshot.estimated_equity)}",
+    ]
+
+
+def position_value_breakdown(positions: list[dict[str, Any]]) -> tuple[Decimal, Decimal]:
+    active_value = Decimal("0")
+    redeemable_value = Decimal("0")
+    for item in positions:
+        value = max(Decimal("0"), _as_decimal(item.get("currentValue")))
+        if item.get("redeemable"):
+            redeemable_value += value
+        else:
+            active_value += value
+    return active_value, redeemable_value
+
+
 def model_probability(order: dict[str, Any]) -> Decimal | None:
     match = PROBABILITY_PATTERN.search(str(order.get("reason") or ""))
     if match is None:
@@ -187,9 +268,12 @@ def model_probability(order: dict[str, Any]) -> Decimal | None:
 
 def format_fill_message(order: dict[str, Any]) -> str:
     cost, shares, price = fill_amounts(order)
-    winning_profit = shares - cost
+    estimated_fee = estimated_crypto_taker_fee(order)
+    winning_profit = shares - cost - estimated_fee
     probability = model_probability(order)
-    expected_profit = probability * shares - cost if probability is not None else None
+    expected_profit = (
+        probability * shares - cost - estimated_fee if probability is not None else None
+    )
     order_id = str((order.get("response") or {}).get("orderID") or "N/A")
     lines = [
         "💰 Polymarket 实际成交",
@@ -198,7 +282,8 @@ def format_fill_message(order: dict[str, Any]) -> str:
         f"成交均价: {price.quantize(Decimal('0.0001'))}",
         f"数量: {shares.quantize(Decimal('0.0001'))} 份",
         f"实际投入: {_money(cost)}",
-        f"获胜时毛收益: {_money(winning_profit)}",
+        f"Taker 手续费估算: {_money(estimated_fee)}",
+        f"获胜时净收益估算: {_money(winning_profit)}",
     ]
     if expected_profit is not None:
         lines.append(f"模型期望收益: {_money(expected_profit)}（胜率 {probability:.2%}）")
@@ -223,7 +308,10 @@ def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
     won = side == winner.upper()
     payout = shares if won else Decimal("0")
     gross_pnl = payout - cost
+    estimated_fee = estimated_crypto_taker_fee(order)
+    net_pnl = gross_pnl - estimated_fee
     return_rate = gross_pnl / cost if cost > 0 else None
+    net_return_rate = net_pnl / cost if cost > 0 else None
     return {
         "slug": str(order.get("slug") or ""),
         "side": side,
@@ -234,46 +322,149 @@ def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
         "entry_price": str(price),
         "payout": str(payout),
         "gross_pnl": str(gross_pnl),
+        "estimated_fee": str(estimated_fee),
+        "net_pnl": str(net_pnl),
         "return_rate": str(return_rate) if return_rate is not None else None,
+        "net_return_rate": str(net_return_rate) if net_return_rate is not None else None,
     }
 
 
 def format_settlement_message(
     settlement: dict[str, Any],
-    balance: Decimal | None,
+    account: AccountSnapshot,
     all_settlements: list[dict[str, Any]],
 ) -> str:
     won = bool(settlement.get("won"))
     cost = _as_decimal(settlement.get("cost"))
     payout = _as_decimal(settlement.get("payout"))
     gross_pnl = _as_decimal(settlement.get("gross_pnl"))
-    return_rate = settlement.get("return_rate")
+    estimated_fee = settlement_estimated_fee(settlement)
+    net_pnl = gross_pnl - estimated_fee
+    net_return_rate = net_pnl / cost if cost > 0 else None
     settled_count = len(all_settlements)
     wins = sum(1 for item in all_settlements if item.get("won") is True)
-    cumulative_pnl = sum(
+    cumulative_gross_pnl = sum(
         (_as_decimal(item.get("gross_pnl")) for item in all_settlements),
         Decimal("0"),
     )
+    cumulative_fees = sum(
+        (settlement_estimated_fee(item) for item in all_settlements),
+        Decimal("0"),
+    )
+    cumulative_net_pnl = cumulative_gross_pnl - cumulative_fees
     win_rate = Decimal(wins) / Decimal(settled_count) if settled_count else Decimal("0")
-    return_text = "N/A" if return_rate in (None, "") else f"{_as_decimal(return_rate):+.2%}"
-    return "\n".join(
+    return_text = "N/A" if net_return_rate is None else f"{net_return_rate:+.2%}"
+    lines = [
+        "🏁 Polymarket 交易已结算",
+        f"结果: {'✅ 盈利' if won else '❌ 亏损'}",
+        f"本单净盈亏估算: {net_pnl:+.4f} pUSD",
+        f"市场: {settlement.get('slug', 'N/A')}",
+        f"买入方向: {settlement.get('side', 'N/A')}",
+        f"结算方向: {settlement.get('winner', 'N/A')}",
+        f"实际投入: {_money(cost)}",
+        f"结算返还: {_money(payout)}",
+        f"本单毛盈亏: {gross_pnl:+.4f} pUSD",
+        f"Taker 手续费估算: {_money(estimated_fee)}",
+        f"本单净收益率估算: {return_text}",
+        *account_snapshot_lines(account),
+        f"累计结算: {settled_count} 单（{wins} 胜 / {settled_count - wins} 负）",
+        f"累计胜率: {win_rate:.2%}",
+        f"累计毛盈亏: {cumulative_gross_pnl:+.4f} pUSD",
+        f"累计手续费估算: {_money(cumulative_fees)}",
+        f"累计净盈亏估算: {cumulative_net_pnl:+.4f} pUSD",
+        "注: 手续费按 BTC 5 分钟市场 Taker 费率估算；总权益为可用 pUSD 加持仓与待赎回价值。",
+    ]
+    return "\n".join(lines)
+
+
+def format_window_settlement_message(
+    window_settlements: list[dict[str, Any]],
+    account: AccountSnapshot,
+    all_settlements: list[dict[str, Any]],
+) -> str:
+    if not window_settlements:
+        raise ValueError("window settlement message requires at least one order")
+
+    cost = sum((_as_decimal(item.get("cost")) for item in window_settlements), Decimal("0"))
+    payout = sum(
+        (_as_decimal(item.get("payout")) for item in window_settlements),
+        Decimal("0"),
+    )
+    gross_pnl = sum(
+        (_as_decimal(item.get("gross_pnl")) for item in window_settlements),
+        Decimal("0"),
+    )
+    estimated_fee = sum(
+        (settlement_estimated_fee(item) for item in window_settlements),
+        Decimal("0"),
+    )
+    net_pnl = gross_pnl - estimated_fee
+    net_return_rate = net_pnl / cost if cost > 0 else None
+    settled_count = len(all_settlements)
+    wins = sum(1 for item in all_settlements if item.get("won") is True)
+    cumulative_gross_pnl = sum(
+        (_as_decimal(item.get("gross_pnl")) for item in all_settlements),
+        Decimal("0"),
+    )
+    cumulative_fees = sum(
+        (settlement_estimated_fee(item) for item in all_settlements),
+        Decimal("0"),
+    )
+    cumulative_net_pnl = cumulative_gross_pnl - cumulative_fees
+    win_rate = Decimal(wins) / Decimal(settled_count) if settled_count else Decimal("0")
+    window_wins = sum(1 for item in window_settlements if item.get("won") is True)
+    if net_pnl > 0:
+        result = "✅ 盈利"
+    elif net_pnl < 0:
+        result = "❌ 亏损"
+    else:
+        result = "持平"
+
+    side_counts: dict[str, int] = {}
+    for item in window_settlements:
+        side = str(item.get("side") or "N/A")
+        side_counts[side] = side_counts.get(side, 0) + 1
+    side_summary = " / ".join(
+        f"{side} × {count}" for side, count in side_counts.items()
+    )
+    return_text = "N/A" if net_return_rate is None else f"{net_return_rate:+.2%}"
+    first = window_settlements[0]
+    lines = [
+        "🏁 Polymarket 交易已结算",
+        f"结果: {result}",
+        f"本窗口净盈亏估算: {net_pnl:+.4f} pUSD",
+        f"市场: {first.get('slug', 'N/A')}",
+        f"本窗口成交: {len(window_settlements)} 单",
+        f"买入方向: {side_summary}",
+        f"结算方向: {first.get('winner', 'N/A')}",
+        f"窗口胜负: {window_wins} 胜 / {len(window_settlements) - window_wins} 负",
+        f"实际投入: {_money(cost)}",
+        f"结算返还: {_money(payout)}",
+        f"本窗口毛盈亏: {gross_pnl:+.4f} pUSD",
+        f"Taker 手续费估算: {_money(estimated_fee)}",
+        f"本窗口净收益率估算: {return_text}",
+    ]
+    for index, item in enumerate(window_settlements, start=1):
+        item_gross = _as_decimal(item.get("gross_pnl"))
+        item_net = item_gross - settlement_estimated_fee(item)
+        lines.append(
+            f"订单 {index}: {item.get('side', 'N/A')} "
+            f"{_as_decimal(item.get('shares')):.4f}份 @ "
+            f"{_as_decimal(item.get('entry_price')):.4f} | "
+            f"{'胜' if item.get('won') is True else '负'} {item_net:+.4f} pUSD"
+        )
+    lines.extend(
         [
-            "🏁 Polymarket 交易已结算",
-            f"市场: {settlement.get('slug', 'N/A')}",
-            f"买入方向: {settlement.get('side', 'N/A')}",
-            f"结算方向: {settlement.get('winner', 'N/A')}",
-            f"结果: {'✅ 盈利' if won else '❌ 亏损'}",
-            f"实际投入: {_money(cost)}",
-            f"结算返还: {_money(payout)}",
-            f"本单毛盈亏: {gross_pnl:+.4f} pUSD",
-            f"本单收益率: {return_text}",
-            f"当前钱包余额: {_money(balance)}",
+            *account_snapshot_lines(account),
             f"累计结算: {settled_count} 单（{wins} 胜 / {settled_count - wins} 负）",
             f"累计胜率: {win_rate:.2%}",
-            f"累计毛盈亏: {cumulative_pnl:+.4f} pUSD",
-            "注: 毛盈亏按成交投入和每份 1 pUSD 结算计算，钱包余额可能受手续费、赎回及转账影响。",
+            f"累计毛盈亏: {cumulative_gross_pnl:+.4f} pUSD",
+            f"累计手续费估算: {_money(cumulative_fees)}",
+            f"累计净盈亏估算: {cumulative_net_pnl:+.4f} pUSD",
+            "注: 同一5分钟窗口合并通知；手续费按BTC市场Taker费率估算。",
         ]
     )
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -284,6 +475,12 @@ class DailyStats:
     losses: int
     unresolved: int
     gross_pnl: Decimal
+    estimated_fees: Decimal
+    settled_estimated_fees: Decimal
+
+    @property
+    def net_pnl(self) -> Decimal:
+        return self.gross_pnl - self.settled_estimated_fees
 
     @property
     def win_rate(self) -> Decimal | None:
@@ -300,11 +497,16 @@ def calculate_daily_stats(
     losses = 0
     unresolved = 0
     gross_pnl = Decimal("0")
+    estimated_fees = Decimal("0")
+    settled_estimated_fees = Decimal("0")
     for order in orders:
+        fee = estimated_crypto_taker_fee(order)
+        estimated_fees += fee
         winner = winners.get(str(order.get("slug") or ""))
         if winner not in {"UP", "DOWN"}:
             unresolved += 1
             continue
+        settled_estimated_fees += fee
         cost, shares, _ = fill_amounts(order)
         if str(order.get("side") or "").upper() == winner:
             wins += 1
@@ -319,6 +521,8 @@ def calculate_daily_stats(
         losses=losses,
         unresolved=unresolved,
         gross_pnl=gross_pnl,
+        estimated_fees=estimated_fees,
+        settled_estimated_fees=settled_estimated_fees,
     )
 
 
@@ -327,32 +531,31 @@ def format_daily_message(
     stats: DailyStats,
     start_balance: Decimal | None,
     end_balance: Decimal | None,
+    account: AccountSnapshot | None = None,
 ) -> str:
     balance_change = (
         end_balance - start_balance
         if start_balance is not None and end_balance is not None
         else None
     )
-    estimated_costs = (
-        stats.gross_pnl - balance_change
-        if balance_change is not None and stats.unresolved == 0
-        else None
-    )
     win_rate = "N/A" if stats.win_rate is None else f"{stats.win_rate:.2%}"
-    return "\n".join(
-        [
-            f"📊 Polymarket 日报 {report_date.isoformat()}",
-            f"实际成交: {stats.fills} 单（已结算 {stats.settled}，待结算 {stats.unresolved}）",
-            f"胜负: {stats.wins} 胜 / {stats.losses} 负",
-            f"胜率: {win_rate}",
-            f"策略毛盈亏: {_money(stats.gross_pnl)}",
-            f"手续费/余额差额估算: {_money(estimated_costs)}",
-            f"期初余额: {_money(start_balance)}",
-            f"期末余额: {_money(end_balance)}",
-            f"余额变化: {_money(balance_change)}",
-            "注: 手续费为理论结算盈亏与钱包余额变化之差，充值、提现或未领取头寸会影响该估算。",
-        ]
-    )
+    lines = [
+        f"📊 Polymarket 日报 {report_date.isoformat()}",
+        f"实际成交: {stats.fills} 单（已结算 {stats.settled}，待结算 {stats.unresolved}）",
+        f"胜负: {stats.wins} 胜 / {stats.losses} 负",
+        f"胜率: {win_rate}",
+        f"已结算毛盈亏: {_money(stats.gross_pnl)}",
+        f"已结算手续费估算: {_money(stats.settled_estimated_fees)}",
+        f"已结算净盈亏估算: {_money(stats.net_pnl)}",
+        f"全部成交手续费估算: {_money(stats.estimated_fees)}",
+        f"期初可用 pUSD: {_money(start_balance)}",
+        f"期末可用 pUSD: {_money(end_balance)}",
+        f"可用余额变化: {_money(balance_change)}",
+    ]
+    if account is not None:
+        lines.extend(account_snapshot_lines(account))
+    lines.append("注: 净盈亏按 BTC 5 分钟市场 Taker 费率估算；充值、提现和赎回时差会影响余额变化。")
+    return "\n".join(lines)
 
 
 class TelegramNotifier:
@@ -629,19 +832,22 @@ class TradingNotificationService:
         return any(results)
 
     def _deliver_missing_channels(self, message: str, delivered: set[str]) -> set[str]:
+        return self._deliver_missing_channels_to(message, delivered, self._enabled_channels())
+
+    def _deliver_missing_channels_to(
+        self,
+        message: str,
+        delivered: set[str],
+        channels: set[str],
+    ) -> set[str]:
         updated = set(delivered)
-        for channel in self._ordered_channels(self._enabled_channels() - delivered):
+        for channel in self._ordered_channels(channels - delivered):
             if self._send_channel(channel, message):
                 updated.add(channel)
         return updated
 
     def _broadcast_alert(self, key: str, message: str, cooldown: float) -> bool:
-        results = []
-        if self.notifier.enabled:
-            results.append(self.notifier.alert(key, message, cooldown=cooldown))
-        if self.discord_notifier.enabled:
-            results.append(self.discord_notifier.alert(key, message, cooldown=cooldown))
-        return any(results)
+        return self.notifier.alert(key, message, cooldown=cooldown) if self.notifier.enabled else False
 
     @property
     def trading_paused(self) -> bool:
@@ -734,13 +940,47 @@ class TradingNotificationService:
             self.notify_exception("读取钱包余额", exc, key="balance-read")
             return None
 
+    def _fetch_positions(self, *, report_error: bool = True) -> list[dict[str, Any]] | None:
+        if not self.wallet_address:
+            return None
+        try:
+            response = requests.get(
+                self.positions_api,
+                params={
+                    "user": self.wallet_address,
+                    "sizeThreshold": "0.01",
+                    "limit": "100",
+                },
+                timeout=self.notifier.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return payload if isinstance(payload, list) else []
+        except Exception as exc:
+            if report_error:
+                self.notify_exception("查询持仓", exc, key="positions-read", cooldown=60)
+            return None
+
+    def current_account_snapshot(self) -> AccountSnapshot:
+        available_balance = self.current_balance()
+        positions = self._fetch_positions()
+        if positions is None:
+            return AccountSnapshot(available_balance, None, None)
+        active_value, redeemable_value = position_value_breakdown(positions)
+        return AccountSnapshot(
+            available_balance,
+            active_value,
+            redeemable_value,
+            len(positions),
+        )
+
     def start(self) -> None:
         if not self.enabled:
             logger.info("Telegram and Discord notifications are disabled or not configured")
             return
-        balance = self.current_balance()
+        account = self.current_account_snapshot()
         local_now = datetime.now(self.local_timezone)
-        self._ensure_day(local_now.date(), balance)
+        self._ensure_day(local_now.date(), account.available_balance)
         self._broadcast(
             "\n".join(
                 [
@@ -750,7 +990,7 @@ class TradingNotificationService:
                     f"模式: {self.mode}",
                     f"策略: {self.strategy}",
                     f"启动时间: {local_now.isoformat(timespec='seconds')}",
-                    f"钱包余额: {_money(balance)}",
+                    *account_snapshot_lines(account),
                 ]
             ),
             telegram_reply_markup=reply_keyboard_markup(),
@@ -822,7 +1062,7 @@ class TradingNotificationService:
             except OSError as exc:
                 self.notify_exception("写入成交账本", exc, key="trade-ledger")
         if self.notify_on_matched:
-            self._broadcast(format_fill_message(order))
+            self.notifier.send(format_fill_message(order))
 
     def notify_exception(
         self,
@@ -853,24 +1093,39 @@ class TradingNotificationService:
             return
         self._next_settlement_attempt = now + self.settlement_interval
         settlements = self.state.setdefault("settlements", {})
+        settlement_windows = self.state.setdefault("settlement_windows", {})
         required_channels = self._enabled_channels()
-        delivery_keys = [
-            key
-            for key, record in settlements.items()
-            if isinstance(record, dict)
-            and "notified_channels" in record
-            and not required_channels.issubset(set(record.get("notified_channels") or []))
-        ]
+        ledger_orders = self._ledger_orders()
+        orders_by_slug: dict[str, list[dict[str, Any]]] = {}
+        for order in ledger_orders:
+            slug = str(order.get("slug") or "")
+            if slug:
+                orders_by_slug.setdefault(slug, []).append(order)
+
+        changed = False
+        for slug, orders in orders_by_slug.items():
+            if slug in settlement_windows:
+                continue
+            legacy_channels: set[str] = set()
+            for order in orders:
+                record = settlements.get(settlement_key(order))
+                if isinstance(record, dict):
+                    legacy_channels.update(record.get("notified_channels") or [])
+            if legacy_channels:
+                settlement_windows[slug] = {
+                    "notified_channels": sorted(legacy_channels),
+                    "migrated_from_individual": True,
+                }
+                changed = True
+
         pending: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for order in self._ledger_orders():
+        for order in ledger_orders:
             key = settlement_key(order)
             if not key or key in settlements or key in seen:
                 continue
             seen.add(key)
             pending.append(order)
-        if not pending and not delivery_keys:
-            return
 
         winners: dict[str, str | None] = {}
         if pending:
@@ -886,7 +1141,6 @@ class TradingNotificationService:
             for order in pending
             if winners.get(str(order.get("slug") or "")) in {"UP", "DOWN"}
         ]
-        changed = False
         for order, winner in resolved:
             assert winner is not None
             key = settlement_key(order)
@@ -894,29 +1148,50 @@ class TradingNotificationService:
             record["settled_at"] = datetime.now(timezone.utc).isoformat()
             record["notified_channels"] = []
             settlements[key] = record
-            delivery_keys.append(key)
             changed = True
 
-        if delivery_keys:
-            balance = self.current_balance()
+        delivery_slugs: list[str] = []
+        for slug, orders in orders_by_slug.items():
+            keys = [settlement_key(order) for order in orders]
+            if not keys or not all(key in settlements for key in keys):
+                continue
+            window_record = settlement_windows.setdefault(
+                slug,
+                {"notified_channels": []},
+            )
+            before = set(window_record.get("notified_channels") or [])
+            if not required_channels.issubset(before):
+                delivery_slugs.append(slug)
+
+        if delivery_slugs:
+            account = self.current_account_snapshot()
             cumulative = list(settlements.values())
-            for key in dict.fromkeys(delivery_keys):
-                record = settlements.get(key)
-                if not isinstance(record, dict):
-                    continue
-                before = set(record.get("notified_channels") or [])
+            for slug in dict.fromkeys(delivery_slugs):
+                orders = orders_by_slug[slug]
+                records = [
+                    settlements[settlement_key(order)]
+                    for order in orders
+                    if isinstance(settlements.get(settlement_key(order)), dict)
+                ]
+                window_record = settlement_windows[slug]
+                before = set(window_record.get("notified_channels") or [])
                 after = self._deliver_missing_channels(
-                    format_settlement_message(record, balance, cumulative),
+                    format_window_settlement_message(records, account, cumulative),
                     before,
                 )
                 if after != before:
-                    record["notified_channels"] = sorted(after)
+                    window_record["notified_channels"] = sorted(after)
+                    window_record["notified_at"] = datetime.now(timezone.utc).isoformat()
+                    for order in orders:
+                        record = settlements.get(settlement_key(order))
+                        if isinstance(record, dict):
+                            record["notified_channels"] = sorted(after)
                     changed = True
         if changed:
             self._save_state()
 
     def maybe_send_daily(self, winner_lookup: Callable[[str], str | None]) -> None:
-        if not self.enabled or time.monotonic() < self._next_daily_attempt:
+        if not self.notifier.enabled or time.monotonic() < self._next_daily_attempt:
             return
         local_today = datetime.now(self.local_timezone).date()
         days = self.state.get("days", {})
@@ -930,8 +1205,8 @@ class TradingNotificationService:
         )
         if not needs_roll and not has_pending:
             return
-        balance = self.current_balance()
-        self._roll_days(local_today, balance)
+        account = self.current_account_snapshot()
+        self._roll_days(local_today, account.available_balance)
         pending = sorted(
             day_text
             for day_text, item in self.state.get("days", {}).items()
@@ -954,12 +1229,14 @@ class TradingNotificationService:
         start_balance = self._optional_decimal(day_state.get("start_balance"))
         end_balance = self._optional_decimal(day_state.get("end_balance"))
         delivered = set(day_state.get("reported_channels") or [])
-        delivered = self._deliver_missing_channels(
-            format_daily_message(report_day, stats, start_balance, end_balance),
+        daily_channels = {"telegram"}
+        delivered = self._deliver_missing_channels_to(
+            format_daily_message(report_day, stats, start_balance, end_balance, account),
             delivered,
+            daily_channels,
         )
         day_state["reported_channels"] = sorted(delivered)
-        if self._enabled_channels().issubset(delivered):
+        if daily_channels.issubset(delivered):
             day_state["reported"] = True
             day_state["reported_at"] = datetime.now(timezone.utc).isoformat()
         self._save_state()
@@ -973,7 +1250,7 @@ class TradingNotificationService:
             self._command_poller = None
         if not self.enabled:
             return
-        balance = self.current_balance()
+        account = self.current_account_snapshot()
         latest_error = error or self.summary.get("error")
         lines = [
             "🛑 Polymarket 机器人已停止",
@@ -981,7 +1258,7 @@ class TradingNotificationService:
             f"运行时长: {_duration(time.monotonic() - self.started_monotonic)}",
             f"累计尝试: {self.summary.get('order_attempts', 0)} 单",
             f"累计成交: {self.summary.get('matched_orders', 0)} 单",
-            f"最终余额: {_money(balance)}",
+            *account_snapshot_lines(account),
         ]
         if latest_error:
             lines.append(f"最后错误: {sanitize_sensitive_text(latest_error)[:500]}")
@@ -989,17 +1266,36 @@ class TradingNotificationService:
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
-            return {"days": {}, "settlements": {}, "control": {}, "telegram": {}}
+            return {
+                "days": {},
+                "settlements": {},
+                "settlement_windows": {},
+                "control": {},
+                "telegram": {},
+            }
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             if isinstance(payload, dict) and isinstance(payload.get("days"), dict):
                 payload.setdefault("settlements", {})
+                payload.setdefault("settlement_windows", {})
                 payload.setdefault("control", {})
                 payload.setdefault("telegram", {})
                 return payload
-            return {"days": {}, "settlements": {}, "control": {}, "telegram": {}}
+            return {
+                "days": {},
+                "settlements": {},
+                "settlement_windows": {},
+                "control": {},
+                "telegram": {},
+            }
         except (OSError, json.JSONDecodeError):
-            return {"days": {}, "settlements": {}, "control": {}, "telegram": {}}
+            return {
+                "days": {},
+                "settlements": {},
+                "settlement_windows": {},
+                "control": {},
+                "telegram": {},
+            }
 
     def _start_command_polling(self) -> None:
         if not self.commands_enabled or not self.notifier.enabled:
@@ -1065,12 +1361,12 @@ class TradingNotificationService:
         self._save_state()
 
     def _send_balance(self) -> None:
-        balance = self.current_balance()
+        account = self.current_account_snapshot()
         self._send_command_reply(
             "\n".join(
                 [
                     "📈 Polymarket 钱包余额",
-                    f"可用抵押余额: {_money(balance)}",
+                    *account_snapshot_lines(account),
                     f"查询时间: {datetime.now(self.local_timezone).isoformat(timespec='seconds')}",
                 ]
             )
@@ -1090,6 +1386,12 @@ class TradingNotificationService:
             (_as_decimal(item.get("gross_pnl")) for item in resolved),
             Decimal("0"),
         )
+        estimated_fees = sum(
+            (settlement_estimated_fee(item) for item in resolved),
+            Decimal("0"),
+        )
+        net_pnl = gross_pnl - estimated_fees
+        account = self.current_account_snapshot()
         settled = len(resolved)
         win_rate = "N/A" if settled == 0 else f"{Decimal(wins) / Decimal(settled):.2%}"
         self._send_command_reply(
@@ -1101,7 +1403,9 @@ class TradingNotificationService:
                     f"胜负: {wins} 胜 / {settled - wins} 负",
                     f"胜率: {win_rate}",
                     f"已结算毛盈亏: {gross_pnl:+.4f} pUSD",
-                    f"当前钱包余额: {_money(self.current_balance())}",
+                    f"已结算手续费估算: {_money(estimated_fees)}",
+                    f"已结算净盈亏估算: {net_pnl:+.4f} pUSD",
+                    *account_snapshot_lines(account),
                 ]
             )
         )
@@ -1110,21 +1414,8 @@ class TradingNotificationService:
         if not self.wallet_address:
             self._send_command_reply("📋 无法查询持仓\n未配置 DEPOSIT_WALLET/FUNDER_ADDRESS。")
             return
-        try:
-            response = requests.get(
-                self.positions_api,
-                params={
-                    "user": self.wallet_address,
-                    "sizeThreshold": "0.01",
-                    "limit": "100",
-                },
-                timeout=self.notifier.timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            positions = payload if isinstance(payload, list) else []
-        except Exception as exc:
-            self.notify_exception("查询持仓", exc, key="positions-read", cooldown=60)
+        positions = self._fetch_positions()
+        if positions is None:
             self._send_command_reply("📋 持仓查询失败\n请检查 Data API、代理和网络连接。")
             return
         if not positions:

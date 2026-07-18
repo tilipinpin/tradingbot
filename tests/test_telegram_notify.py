@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from src.telegram_commands import TelegramCommand
 from src.telegram_notify import (
+    AccountSnapshot,
     DiscordNotifier,
     TelegramNotifier,
     TradingNotificationService,
     build_discord_embed,
     calculate_daily_stats,
+    estimated_crypto_taker_fee,
     fill_amounts,
     format_daily_message,
     format_fill_message,
     format_settlement_message,
+    format_window_settlement_message,
     model_probability,
+    position_value_breakdown,
     sanitize_sensitive_text,
     settlement_key,
     settlement_values,
@@ -146,7 +150,12 @@ def test_discord_embed_truncates_long_messages_and_posts_once() -> None:
 
 def test_discord_embed_uses_event_colors_and_structured_fields() -> None:
     winning = build_discord_embed(
-        "🏁 Polymarket 交易已结算\n结果: ✅ 盈利\n本单毛盈亏: +1.2500 pUSD"
+        "🏁 Polymarket 交易已结算\n"
+        "市场: btc-updown-5m-1\n"
+        "买入方向: UP\n"
+        "结果: ✅ 盈利\n"
+        "本单毛盈亏: +1.2500 pUSD\n"
+        "累计毛盈亏: +3.0000 pUSD"
     )
     losing = build_discord_embed("🏁 Polymarket 交易已结算\n结果: ❌ 亏损")
     error = build_discord_embed("⚠️ Polymarket 异常\n详情: RPC timeout")
@@ -154,8 +163,12 @@ def test_discord_embed_uses_event_colors_and_structured_fields() -> None:
     assert winning["color"] == 0x57F287
     assert losing["color"] == 0xED4245
     assert error["color"] == 0xED4245
-    assert winning["fields"][0]["name"] == "结果"
-    assert winning["fields"][1]["value"] == "+1.2500 pUSD"
+    assert winning["title"] == "🏁 Polymarket 交易已结算 · ✅ 盈利 · 本单盈亏 +1.2500 pUSD"
+    assert losing["title"] == "🏁 Polymarket 交易已结算 · ❌ 亏损"
+    assert winning["fields"][0]["name"] == "市场"
+    assert winning["fields"][1]["name"] == "买入方向"
+    assert all(field["name"] != "结果" for field in winning["fields"])
+    assert all(field["name"] != "本单毛盈亏" for field in winning["fields"])
     assert winning["footer"]["text"] == "Polymarket BTC 5m • 自动通知"
 
 
@@ -204,8 +217,27 @@ def test_fill_message_uses_actual_matched_amounts_and_probability() -> None:
     message = format_fill_message(order)
     assert "成交均价: 0.6200" in message
     assert "数量: 5.0000 份" in message
-    assert "获胜时毛收益: 1.9000 pUSD" in message
-    assert "模型期望收益: -2.1000 pUSD" in message
+    assert "Taker 手续费估算: 0.0825 pUSD" in message
+    assert "获胜时净收益估算: 1.8175 pUSD" in message
+    assert "模型期望收益: -2.1825 pUSD" in message
+
+
+def test_fee_and_account_equity_use_actual_fills_and_position_values() -> None:
+    order = matched_order(cost="3.1", shares="5")
+    assert estimated_crypto_taker_fee(order).quantize(Decimal("0.0001")) == Decimal("0.0825")
+
+    active, redeemable = position_value_breakdown(
+        [
+            {"currentValue": "1.25", "redeemable": False},
+            {"currentValue": "2.50", "redeemable": True},
+            {"currentValue": "-1", "redeemable": True},
+        ]
+    )
+    snapshot = AccountSnapshot(Decimal("20"), active, redeemable, 3)
+
+    assert active == Decimal("1.25")
+    assert redeemable == Decimal("2.50")
+    assert snapshot.estimated_equity == Decimal("23.75")
 
 
 def test_settlement_message_reports_realized_values_and_cumulative_stats() -> None:
@@ -215,17 +247,40 @@ def test_settlement_message_reports_realized_values_and_cumulative_stats() -> No
     assert winning["payout"] == "5"
     assert winning["gross_pnl"] == "1.85"
     assert winning["return_rate"] == str(Decimal("1.85") / Decimal("3.15"))
+    assert Decimal(winning["estimated_fee"]).quantize(Decimal("0.0001")) == Decimal("0.0816")
     assert losing["payout"] == "0"
     assert losing["gross_pnl"] == "-2.50"
 
-    message = format_settlement_message(winning, Decimal("21.85"), [winning, losing])
+    account = AccountSnapshot(Decimal("21.85"), Decimal("1.25"), Decimal("0.50"), 2)
+    message = format_settlement_message(winning, account, [winning, losing])
     assert "结算方向: UP" in message
     assert "结果: ✅ 盈利" in message
     assert "结算返还: 5.0000 pUSD" in message
     assert "本单毛盈亏: +1.8500 pUSD" in message
+    assert "本单净盈亏估算: +1.7684 pUSD" in message
+    assert "可用 pUSD: 21.8500 pUSD" in message
+    assert "估算总权益: 23.6000 pUSD" in message
     assert "累计结算: 2 单（1 胜 / 1 负）" in message
     assert "累计胜率: 50.00%" in message
     assert "累计毛盈亏: -0.6500 pUSD" in message
+    assert "累计净盈亏估算: -0.8191 pUSD" in message
+
+
+def test_window_settlement_message_combines_two_orders() -> None:
+    first = settlement_values(matched_order(side="UP", cost="3.15", shares="5"), "UP")
+    second_order = matched_order(side="DOWN", cost="2.50", shares="5")
+    second_order["response"]["orderID"] = "0x22222222222222222222"
+    second = settlement_values(second_order, "UP")
+    account = AccountSnapshot(Decimal("21.85"), Decimal("0"), Decimal("0"), 0)
+
+    message = format_window_settlement_message([first, second], account, [first, second])
+
+    assert "本窗口成交: 2 单" in message
+    assert "买入方向: UP × 1 / DOWN × 1" in message
+    assert "窗口胜负: 1 胜 / 1 负" in message
+    assert "订单 1: UP" in message
+    assert "订单 2: DOWN" in message
+    assert "本窗口净盈亏估算: -0.8191 pUSD" in message
 
 
 def test_settlement_service_persists_and_deduplicates_notifications(tmp_path) -> None:
@@ -257,6 +312,78 @@ def test_settlement_service_persists_and_deduplicates_notifications(tmp_path) ->
     assert "交易已结算" in session.calls[0][1]["text"]
     saved = json.loads(state.read_text())
     assert settlement_key(order) in saved["settlements"]
+
+
+def test_settlement_service_sends_one_notification_per_window(tmp_path) -> None:
+    session = FakeSession()
+    notifier = TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session)
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    first = matched_order(side="UP", cost="3.15", shares="5")
+    second = matched_order(side="UP", cost="3.50", shares="5")
+    second["response"]["orderID"] = "0x22222222222222222222"
+    first["matched_at"] = "2026-07-16T20:44:16+00:00"
+    second["matched_at"] = "2026-07-16T20:44:20+00:00"
+    ledger.write_text("\n".join(json.dumps(order) for order in (first, second)) + "\n")
+    service = TradingNotificationService(
+        notifier=notifier,
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+        settlement_interval=5,
+    )
+
+    service.maybe_send_settlements(lambda slug: "UP")
+    service._next_settlement_attempt = 0
+    service.maybe_send_settlements(lambda slug: "UP")
+
+    assert len(session.calls) == 1
+    assert "本窗口成交: 2 单" in session.calls[0][1]["text"]
+    saved = json.loads(state.read_text())
+    assert saved["settlement_windows"][first["slug"]]["notified_channels"] == ["telegram"]
+    assert len(saved["settlements"]) == 2
+
+
+def test_settlement_window_migration_does_not_repeat_legacy_notifications(tmp_path) -> None:
+    session = FakeSession()
+    notifier = TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session)
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    first = matched_order(side="UP", cost="3.15", shares="5")
+    second = matched_order(side="UP", cost="3.50", shares="5")
+    second["response"]["orderID"] = "0x22222222222222222222"
+    ledger.write_text("\n".join(json.dumps(order) for order in (first, second)) + "\n")
+    records = {}
+    for order in (first, second):
+        record = settlement_values(order, "UP")
+        record["notified_channels"] = ["telegram"]
+        records[settlement_key(order)] = record
+    state.write_text(json.dumps({"days": {}, "settlements": records}))
+    service = TradingNotificationService(
+        notifier=notifier,
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+        settlement_interval=5,
+    )
+
+    service.maybe_send_settlements(lambda slug: None)
+
+    assert session.calls == []
+    saved = json.loads(state.read_text())
+    window = saved["settlement_windows"][first["slug"]]
+    assert window["notified_channels"] == ["telegram"]
+    assert window["migrated_from_individual"] is True
 
 
 def test_start_notification_is_sent_to_telegram_and_discord(tmp_path) -> None:
@@ -365,6 +492,64 @@ def test_record_fill_is_silent_until_settlement_by_default(tmp_path) -> None:
     assert service.ledger_path.read_text().strip()
 
 
+def test_discord_ignores_matched_exceptions_and_daily_reports(tmp_path) -> None:
+    telegram_session = FakeSession()
+    discord_session = FakeSession()
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    report_day = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    order = matched_order()
+    order["matched_at"] = datetime.combine(report_day, datetime.min.time(), ZoneInfo("Asia/Shanghai")).isoformat()
+    ledger.write_text(json.dumps(order) + "\n")
+    state.write_text(
+        json.dumps(
+            {
+                "days": {
+                    report_day.isoformat(): {
+                        "reported": False,
+                        "start_balance": "20",
+                        "end_balance": "21",
+                    }
+                },
+                "settlements": {},
+            }
+        )
+    )
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(
+            "123456:telegram-token-value_1234567890",
+            "42",
+            session=telegram_session,
+        ),
+        discord_notifier=DiscordNotifier(
+            "https://discord.com/api/webhooks/123456/secret_webhook_token",
+            session=discord_session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+        notify_on_matched=True,
+    )
+    service.current_account_snapshot = lambda: AccountSnapshot(
+        Decimal("22"), Decimal("0"), Decimal("0")
+    )
+
+    service.record_fill(matched_order())
+    service.notify_exception("RPC", RuntimeError("timeout"), cooldown=0)
+    service.maybe_send_daily(lambda slug: "UP")
+
+    telegram_messages = [call[1]["text"] for call in telegram_session.calls]
+    assert any("实际成交" in message for message in telegram_messages)
+    assert any("机器人异常" in message for message in telegram_messages)
+    assert any("日报" in message for message in telegram_messages)
+    assert discord_session.calls == []
+
+
 def test_daily_stats_count_only_resolved_orders_in_win_rate() -> None:
     orders = [
         matched_order("one", "UP", "3", "5"),
@@ -380,11 +565,16 @@ def test_daily_stats_count_only_resolved_orders_in_win_rate() -> None:
     assert stats.unresolved == 1
     assert stats.win_rate == Decimal("0.5")
     assert stats.gross_pnl == Decimal("0")
+    assert stats.settled_estimated_fees == Decimal("0.154")
+    assert stats.estimated_fees == Decimal("0.189")
+    assert stats.net_pnl == Decimal("-0.154")
 
     message = format_daily_message(date(2026, 7, 16), stats, Decimal("20"), Decimal("20"))
     assert "实际成交: 3 单（已结算 2，待结算 1）" in message
     assert "胜率: 50.00%" in message
-    assert "手续费/余额差额估算: N/A" in message
+    assert "已结算手续费估算: 0.1540 pUSD" in message
+    assert "已结算净盈亏估算: -0.1540 pUSD" in message
+    assert "全部成交手续费估算: 0.1890 pUSD" in message
 
 
 def test_sensitive_text_redacts_telegram_tokens() -> None:
@@ -481,7 +671,9 @@ def test_today_pnl_uses_persisted_per_order_settlements(tmp_path) -> None:
     assert "实际成交: 1 单" in message
     assert "胜率: 100.00%" in message
     assert "已结算毛盈亏: +2.0000 pUSD" in message
-    assert "当前钱包余额: 22.0000 pUSD" in message
+    assert "已结算手续费估算: 0.0840 pUSD" in message
+    assert "已结算净盈亏估算: +1.9160 pUSD" in message
+    assert "可用 pUSD: 22.0000 pUSD" in message
 
 
 def test_positions_command_uses_deposit_wallet_data_api(monkeypatch, tmp_path) -> None:

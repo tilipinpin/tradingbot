@@ -7,6 +7,7 @@ import re
 import json
 import threading
 import time
+from collections import deque
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from decimal import Decimal
@@ -26,6 +27,7 @@ class SpotPrice:
     price: Decimal
     source: str
     observed_at: int | None = None
+    observed_at_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,15 @@ class SpotPriceClient:
             except (KeyError, RequestException, RuntimeError, ValueError) as exc:
                 errors.append(f"{source}: {exc}")
         raise RuntimeError(f"All BTC/USD price sources failed: {'; '.join(errors)}")
+
+    def polymarket_chainlink_price_near(
+        self,
+        timestamp_ms: int,
+        max_distance_ms: int,
+    ) -> SpotPrice:
+        if self._polymarket_stream is None:
+            raise RuntimeError("Polymarket Chainlink stream has not started")
+        return self._polymarket_stream.price_near(timestamp_ms, max_distance_ms)
 
     def _btc_usd_from_source(self, source: str) -> SpotPrice:
         if source == "POLYMARKET_CHAINLINK":
@@ -108,7 +119,13 @@ class SpotPriceClient:
         report = response.json()["report"]
         price = decode_chainlink_v3_price(report["fullReport"], feed_id)
         observed_at = int(report["observationsTimestamp"])
-        return SpotPrice(symbol="BTC/USD", price=price, source="CHAINLINK", observed_at=observed_at)
+        return SpotPrice(
+            symbol="BTC/USD",
+            price=price,
+            source="CHAINLINK",
+            observed_at=observed_at,
+            observed_at_ms=observed_at * 1000,
+        )
 
     def _binance_btc_usdt(self) -> SpotPrice:
         response = requests.get(
@@ -194,6 +211,7 @@ class PolymarketChainlinkStream:
         self.proxy_url = proxy_url
         self.max_stale_seconds = max_stale_seconds
         self._latest: SpotPrice | None = None
+        self._history: deque[SpotPrice] = deque(maxlen=4096)
         self._ready = threading.Event()
         self._started = False
         self._lock = threading.Lock()
@@ -213,6 +231,7 @@ class PolymarketChainlinkStream:
             price=Decimal(str(price["value"])),
             source="POLYMARKET_CHAINLINK",
             observed_at=timestamp_ms // 1000,
+            observed_at_ms=timestamp_ms,
         )
 
     def btc_usd(self) -> SpotPrice:
@@ -223,10 +242,30 @@ class PolymarketChainlinkStream:
         if not self._ready.wait(self.timeout):
             detail = f": {self._last_error}" if self._last_error else ""
             raise RuntimeError(f"Timed out waiting for Polymarket Chainlink BTC/USD stream{detail}")
-        assert self._latest is not None
-        if self._latest.observed_at is None or int(time.time()) - self._latest.observed_at > self.max_stale_seconds:
+        with self._lock:
+            latest = self._latest
+        assert latest is not None
+        if latest.observed_at is None or int(time.time()) - latest.observed_at > self.max_stale_seconds:
             raise RuntimeError("Polymarket Chainlink BTC/USD stream is stale")
-        return self._latest
+        return latest
+
+    def price_near(self, timestamp_ms: int, max_distance_ms: int) -> SpotPrice:
+        if max_distance_ms < 0:
+            raise ValueError("max_distance_ms must be non-negative")
+        with self._lock:
+            candidates = [price for price in self._history if price.observed_at_ms is not None]
+        if not candidates:
+            raise RuntimeError("Polymarket Chainlink boundary history is unavailable")
+        nearest = min(
+            candidates,
+            key=lambda price: abs(int(price.observed_at_ms) - timestamp_ms),
+        )
+        distance_ms = abs(int(nearest.observed_at_ms) - timestamp_ms)
+        if distance_ms > max_distance_ms:
+            raise RuntimeError(
+                f"Nearest Polymarket Chainlink sample is {distance_ms}ms from boundary"
+            )
+        return nearest
 
     def _run(self) -> None:
         while True:
@@ -248,10 +287,12 @@ class PolymarketChainlinkStream:
                     try:
                         message = connection.recv()
                     except websocket.WebSocketTimeoutException:
+                        with self._lock:
+                            latest = self._latest
                         if (
-                            self._latest is not None
-                            and self._latest.observed_at is not None
-                            and int(time.time()) - self._latest.observed_at > self.max_stale_seconds
+                            latest is not None
+                            and latest.observed_at is not None
+                            and int(time.time()) - latest.observed_at > self.max_stale_seconds
                         ):
                             raise RuntimeError("Polymarket Chainlink BTC/USD stream stopped updating")
                         connection.send("PING")
@@ -260,7 +301,9 @@ class PolymarketChainlinkStream:
                         continue
                     price = self.parse_message(message)
                     if price is not None:
-                        self._latest = price
+                        with self._lock:
+                            self._latest = price
+                            self._history.append(price)
                         self._ready.set()
             except Exception as exc:
                 self._last_error = str(exc)

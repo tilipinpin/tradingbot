@@ -28,11 +28,15 @@ INTERNAL_CALLBACK_COMMANDS = {
 }
 STRATEGY_LABELS = {
     "fair_value_edge": "公允价值差",
-    "three_phase": "三段趋势",
-    "paired_lock": "配对锁利",
+    "split_maker": "Split 双边做市",
+    "maker_momentum": "Maker 触价动量",
     "late_favorite": "尾盘高置信度",
 }
-PAPER_ONLY_STRATEGIES = {"three_phase", "paired_lock", "late_favorite"}
+PAPER_ONLY_STRATEGIES = {
+    "split_maker",
+    "maker_momentum",
+    "late_favorite",
+}
 LIVE_STRATEGIES = {"fair_value_edge"}
 DEFAULT_STRATEGY = "__default__"
 BUTTON_COMMANDS = {

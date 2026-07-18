@@ -39,6 +39,28 @@ class OrderBookQuote:
     ask: Decimal | None
 
 
+@dataclass(frozen=True)
+class OrderBookLevel:
+    price: Decimal
+    size: Decimal
+
+
+@dataclass(frozen=True)
+class OrderBookSnapshot:
+    token_id: str
+    timestamp: str
+    bids: tuple[OrderBookLevel, ...]
+    asks: tuple[OrderBookLevel, ...]
+    minimum_order_size: Decimal
+
+    @property
+    def quote(self) -> OrderBookQuote:
+        return OrderBookQuote(
+            bid=max((level.price for level in self.bids), default=None),
+            ask=min((level.price for level in self.asks), default=None),
+        )
+
+
 def _parse_token_ids(raw: Any) -> tuple[str, str] | None:
     if isinstance(raw, str):
         try:
@@ -176,22 +198,57 @@ class ClobDataClient:
         self.timeout = timeout
 
     def quote(self, token_id: str) -> OrderBookQuote:
-        bid = self._price(token_id, "BUY")
-        ask = self._price(token_id, "SELL")
-        return OrderBookQuote(bid=bid, ask=ask)
+        return self.quotes((token_id,))[0]
 
-    def _price(self, token_id: str, side: str) -> Decimal | None:
-        response = requests.get(
-            f"{self.host}/price",
-            params={"token_id": token_id, "side": side},
+    def quotes(self, token_ids: tuple[str, ...]) -> tuple[OrderBookQuote, ...]:
+        if not token_ids:
+            return ()
+        response = requests.post(
+            f"{self.host}/prices",
+            json=[
+                {"token_id": token_id, "side": side}
+                for token_id in token_ids
+                for side in ("BUY", "SELL")
+            ],
             timeout=self.timeout,
         )
-        if response.status_code == 404:
-            return None
         response.raise_for_status()
         payload = response.json()
-        price = payload.get("price")
-        return Decimal(str(price)) if price is not None else None
+        quotes: list[OrderBookQuote] = []
+        for token_id in token_ids:
+            prices = payload.get(token_id, {})
+            bid = prices.get("BUY")
+            ask = prices.get("SELL")
+            quotes.append(
+                OrderBookQuote(
+                    bid=Decimal(str(bid)) if bid is not None else None,
+                    ask=Decimal(str(ask)) if ask is not None else None,
+                )
+            )
+        return tuple(quotes)
+
+    def books(self, token_ids: tuple[str, ...]) -> tuple[OrderBookSnapshot, ...]:
+        if not token_ids:
+            return ()
+        response = requests.post(
+            f"{self.host}/books",
+            json=[{"token_id": token_id} for token_id in token_ids],
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise ValueError("CLOB /books response must be a list")
+        books = {
+            book.token_id: book
+            for item in payload
+            if isinstance(item, dict)
+            if (book := _order_book_from_payload(item)) is not None
+        }
+        missing = [token_id for token_id in token_ids if token_id not in books]
+        if missing:
+            raise LookupError(f"CLOB /books response omitted token(s): {', '.join(missing)}")
+        return tuple(books[token_id] for token_id in token_ids)
 
 
 class ClobTradingClient(ClobDataClient):
@@ -333,6 +390,33 @@ def _import_clob_client() -> Any:
 def _book_level_price(level: Any) -> Decimal:
     raw = level["price"] if isinstance(level, dict) else level.price
     return Decimal(str(raw))
+
+
+def _order_book_from_payload(item: dict[str, Any]) -> OrderBookSnapshot | None:
+    token_id = str(item.get("asset_id") or item.get("assetId") or "").strip()
+    if not token_id:
+        return None
+
+    def levels(key: str, *, reverse: bool) -> tuple[OrderBookLevel, ...]:
+        parsed = [
+            OrderBookLevel(
+                price=Decimal(str(level["price"])),
+                size=Decimal(str(level["size"])),
+            )
+            for level in item.get(key, [])
+            if isinstance(level, dict)
+            and level.get("price") not in (None, "")
+            and level.get("size") not in (None, "")
+        ]
+        return tuple(sorted(parsed, key=lambda level: level.price, reverse=reverse))
+
+    return OrderBookSnapshot(
+        token_id=token_id,
+        timestamp=str(item.get("timestamp") or ""),
+        bids=levels("bids", reverse=True),
+        asks=levels("asks", reverse=False),
+        minimum_order_size=_parse_decimal(item.get("min_order_size") or item.get("minOrderSize"), "0"),
+    )
 
 
 def _import_order_types() -> tuple[Any, Any, Any, str]:
