@@ -77,6 +77,15 @@ class BookFill:
 
 
 @dataclass(frozen=True)
+class HedgeRiskEvaluation:
+    reduces_max_loss: bool
+    max_loss_before: Decimal
+    max_loss_after: Decimal
+    pnl_up_after: Decimal
+    pnl_down_after: Decimal
+
+
+@dataclass(frozen=True)
 class SplitMakerQuotePlan:
     up_price: Decimal
     down_price: Decimal
@@ -157,6 +166,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confirmation-min-jump-usd", default="3.00")
     parser.add_argument("--hedge-signal-confirmations", type=int, default=2)
     parser.add_argument("--hedge-min-win-probability", default="0.62")
+    parser.add_argument("--hedge-fee-rate", default="0.07")
     parser.add_argument("--max-spot-age", type=int, default=20, help="Maximum cached spot-price age allowed for entries.")
     parser.add_argument("--max-start-capture-delay", type=int, default=15, help="Skip a window if its start price is captured later than this many seconds.")
     parser.add_argument(
@@ -652,6 +662,64 @@ def choose_protective_hedge_signal(
             f"required_probability={min_win_probability.quantize(Decimal('0.0001'))} "
             f"seconds_left={int(seconds_to_end)}"
         ),
+    )
+
+
+def response_fill_amounts(
+    response: dict[str, Any],
+    fallback_price: Decimal,
+    fallback_shares: Decimal,
+) -> tuple[Decimal, Decimal]:
+    try:
+        cost = Decimal(str(response.get("makingAmount") or "0"))
+        shares = Decimal(str(response.get("takingAmount") or "0"))
+    except (ArithmeticError, ValueError):
+        cost = Decimal("0")
+        shares = Decimal("0")
+    if shares <= 0:
+        shares = fallback_shares
+    if cost <= 0:
+        cost = fallback_price * shares
+    return cost, shares
+
+
+def evaluate_protective_hedge_risk(
+    primary_side: str,
+    primary_cost: Decimal,
+    primary_shares: Decimal,
+    hedge_price: Decimal,
+    hedge_shares: Decimal,
+    fee_rate: Decimal,
+) -> HedgeRiskEvaluation:
+    if (
+        primary_side not in {"UP", "DOWN"}
+        or primary_cost <= 0
+        or primary_shares <= 0
+        or hedge_price <= 0
+        or hedge_price > 1
+        or hedge_shares <= 0
+        or fee_rate < 0
+    ):
+        return HedgeRiskEvaluation(False, Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0"))
+    primary_price = primary_cost / primary_shares
+    primary_fee = primary_shares * fee_rate * primary_price * (Decimal("1") - primary_price)
+    hedge_cost = hedge_price * hedge_shares
+    hedge_fee = hedge_shares * fee_rate * hedge_price * (Decimal("1") - hedge_price)
+    total_cost = primary_cost + primary_fee + hedge_cost + hedge_fee
+    primary_up_shares = primary_shares if primary_side == "UP" else Decimal("0")
+    primary_down_shares = primary_shares if primary_side == "DOWN" else Decimal("0")
+    hedge_up_shares = hedge_shares if primary_side == "DOWN" else Decimal("0")
+    hedge_down_shares = hedge_shares if primary_side == "UP" else Decimal("0")
+    pnl_up_after = primary_up_shares + hedge_up_shares - total_cost
+    pnl_down_after = primary_down_shares + hedge_down_shares - total_cost
+    max_loss_before = primary_cost + primary_fee
+    max_loss_after = max(Decimal("0"), -min(pnl_up_after, pnl_down_after))
+    return HedgeRiskEvaluation(
+        reduces_max_loss=max_loss_after < max_loss_before,
+        max_loss_before=max_loss_before,
+        max_loss_after=max_loss_after,
+        pnl_up_after=pnl_up_after,
+        pnl_down_after=pnl_down_after,
     )
 
 
@@ -1373,11 +1441,14 @@ def watch() -> None:
     candidate_side: str | None = None
     candidate_confirmations = 0
     primary_side_this_window: str | None = None
+    primary_cost_this_window = Decimal("0")
+    primary_shares_this_window = Decimal("0")
     edge_threshold = Decimal(args.edge)
     fallback_sigma = Decimal(args.fallback_sigma)
     confirmation_jump_sigma_multiplier = Decimal(args.confirmation_jump_sigma_multiplier)
     confirmation_min_jump_usd = Decimal(args.confirmation_min_jump_usd)
     hedge_min_win_probability = Decimal(args.hedge_min_win_probability)
+    hedge_fee_rate = Decimal(args.hedge_fee_rate)
     min_entry = Decimal(args.min_entry)
     max_entry = Decimal(args.max_entry)
     max_spread = Decimal(args.max_spread)
@@ -1516,6 +1587,8 @@ def watch() -> None:
             raise ValueError("Hedge signal confirmations must be positive")
         if not Decimal("0") <= hedge_min_win_probability <= Decimal("1"):
             raise ValueError("Hedge minimum win probability must be between zero and one")
+        if hedge_fee_rate < 0:
+            raise ValueError("Hedge fee rate must be non-negative")
         if confirmation_jump_sigma_multiplier < 0 or confirmation_min_jump_usd < 0:
             raise ValueError("Confirmation jump thresholds must be non-negative")
         if args.low_entry_confirmation_samples < 1:
@@ -1657,6 +1730,8 @@ def watch() -> None:
             candidate_side = None
             candidate_confirmations = 0
             primary_side_this_window = None
+            primary_cost_this_window = Decimal("0")
+            primary_shares_this_window = Decimal("0")
             split_maker_state = None
             maker_momentum_state = MakerMomentumProbe()
             if current_market is None:
@@ -2303,8 +2378,10 @@ def watch() -> None:
                     args.low_entry_confirmation_samples,
                     probability_shrinkage,
                 )
-                if signal is None and primary_side_this_window is not None:
-                    signal = choose_protective_hedge_signal(
+                if primary_side_this_window is not None and (
+                    signal is None or signal.side != primary_side_this_window
+                ):
+                    protective_signal = choose_protective_hedge_signal(
                         current_market,
                         primary_side_this_window,
                         fair.probability_up,
@@ -2320,6 +2397,7 @@ def watch() -> None:
                         min_ask_sum,
                         max_ask_sum,
                     )
+                    signal = protective_signal
             if signal is not None:
                 if notifications.trading_paused:
                     logger.warning("AUTO_SIGNAL blocked because Telegram trading pause is active.")
@@ -2393,6 +2471,35 @@ def watch() -> None:
                     continue
                 candidate_side = None
                 candidate_confirmations = 0
+                if is_protective_hedge:
+                    hedge_risk = evaluate_protective_hedge_risk(
+                        primary_side_this_window or "",
+                        primary_cost_this_window,
+                        primary_shares_this_window,
+                        signal.price,
+                        order_size,
+                        hedge_fee_rate,
+                    )
+                    if not hedge_risk.reduces_max_loss:
+                        logger.info(
+                            "HEDGE_REJECTED slug=%s side=%s max_loss_before=%s max_loss_after=%s",
+                            current_market.slug,
+                            signal.side,
+                            hedge_risk.max_loss_before.quantize(Decimal("0.0001")),
+                            hedge_risk.max_loss_after.quantize(Decimal("0.0001")),
+                        )
+                        time.sleep(args.interval)
+                        continue
+                    signal = AutoTradeSignal(
+                        side=signal.side,
+                        token_id=signal.token_id,
+                        price=signal.price,
+                        reason=(
+                            f"{signal.reason} "
+                            f"max_loss_before={hedge_risk.max_loss_before.quantize(Decimal('0.0001'))} "
+                            f"max_loss_after={hedge_risk.max_loss_after.quantize(Decimal('0.0001'))}"
+                        ),
+                    )
                 logger.info(
                     "AUTO_SIGNAL %s side=%s price=%s size=%s reason=%s",
                     current_market.slug,
@@ -2422,6 +2529,12 @@ def watch() -> None:
                         logger.info("DRY RUN: would buy %s at %s x %s", signal.side, signal.price, order_size)
                     if primary_side_this_window is None:
                         primary_side_this_window = signal.side
+                        if args.paper_trading:
+                            primary_cost_this_window = paper_stake
+                            primary_shares_this_window = paper_stake / signal.price
+                        else:
+                            primary_cost_this_window = signal.price * order_size
+                            primary_shares_this_window = order_size
                 else:
                     notional = signal.price * order_size
                     if not live_session_should_continue(live_orders_submitted, args.max_live_orders):
@@ -2523,6 +2636,11 @@ def watch() -> None:
                     live_orders_matched += 1
                     if primary_side_this_window is None:
                         primary_side_this_window = signal.side
+                        primary_cost_this_window, primary_shares_this_window = response_fill_amounts(
+                            response,
+                            signal.price,
+                            order_size,
+                        )
                     live_summary["matched_orders"] = live_orders_matched
                     order_record["matched_at"] = datetime.now(timezone.utc).isoformat()
                     notifications.record_fill(order_record)

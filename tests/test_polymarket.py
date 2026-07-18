@@ -35,6 +35,7 @@ from src.watch_updown import (
     adverse_jump_exceeds_dynamic_threshold,
     apply_split_maker_exit,
     consume_pause_window,
+    evaluate_protective_hedge_risk,
     choose_fair_value_edge_signal,
     choose_protective_hedge_signal,
     choose_late_favorite_signal,
@@ -51,6 +52,7 @@ from src.watch_updown import (
     open_split_maker_cycle,
     plan_split_maker_quotes,
     quotes_pass_sanity_checks,
+    response_fill_amounts,
     recent_spot_samples_support_side,
     record_split_maker_fill,
     settle_all_paper_positions,
@@ -640,6 +642,7 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.trend_confirmation_samples == 3
     assert args.hedge_signal_confirmations == 2
     assert args.hedge_min_win_probability == "0.62"
+    assert args.hedge_fee_rate == "0.07"
     assert args.max_entry == "0.78"
     assert args.max_live_notional == "3.75"
     assert args.low_entry_cutoff == "0.50"
@@ -970,6 +973,41 @@ def test_protective_hedge_allows_opposite_low_price_after_model_flip() -> None:
     assert signal.side == "UP"
     assert signal.price == Decimal("0.48")
     assert signal.reason.startswith("protective_hedge")
+
+
+def test_protective_hedge_must_reduce_portfolio_max_loss() -> None:
+    improves = evaluate_protective_hedge_risk(
+        primary_side="DOWN",
+        primary_cost=Decimal("3.50"),
+        primary_shares=Decimal("5"),
+        hedge_price=Decimal("0.48"),
+        hedge_shares=Decimal("5"),
+        fee_rate=Decimal("0.07"),
+    )
+    worsens = evaluate_protective_hedge_risk(
+        primary_side="UP",
+        primary_cost=Decimal("0.90"),
+        primary_shares=Decimal("1"),
+        hedge_price=Decimal("0.78"),
+        hedge_shares=Decimal("5"),
+        fee_rate=Decimal("0.07"),
+    )
+
+    assert improves.reduces_max_loss is True
+    assert improves.max_loss_after < improves.max_loss_before
+    assert worsens.reduces_max_loss is False
+    assert worsens.max_loss_after > worsens.max_loss_before
+
+
+def test_response_fill_amounts_prefers_actual_match_amounts() -> None:
+    cost, shares = response_fill_amounts(
+        {"makingAmount": "2.499999", "takingAmount": "7.142856"},
+        Decimal("0.50"),
+        Decimal("5"),
+    )
+
+    assert cost == Decimal("2.499999")
+    assert shares == Decimal("7.142856")
 
 
 def test_probability_shrinkage_moves_tail_confidence_toward_even() -> None:

@@ -24,4 +24,6 @@ The live fair-value launcher also requires a selected ask of at least 0.55,
 three non-narrowing same-side spot samples, and a long-run volatility floor of
 0.00005 per square-root second. Adverse jumps reset signal confirmation. After
 the first fill, the second slot may either add with the trend or hedge a
-confirmed model reversal.
+confirmed model reversal. A hedge is submitted only when a conservative
+two-outcome portfolio calculation, including estimated fees, strictly reduces
+the maximum loss relative to leaving the first fill unprotected.

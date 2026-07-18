@@ -130,6 +130,7 @@ python -m src.watch_updown \
   --confirmation-min-jump-usd 3.00 \
   --hedge-signal-confirmations 2 \
   --hedge-min-win-probability 0.62 \
+  --hedge-fee-rate 0.07 \
   --probability-shrinkage 1.00 \
   --market-data-timeout 3 \
   --min-entry 0.55 \
@@ -362,7 +363,7 @@ python -m src.watch_updown \
 快照；内部趋势样本通过后只需一次完整信号，避免重复确认耗尽尾盘窗口。策略不会在同一盘口重复加仓。累计足够纸面
 样本并验证费后盈亏和回撤前，程序拒绝实盘启用；高命中率不等于保证盈利。
 
-`fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在原始模型概率相对盘口 ask 有足够 edge 时入场。实盘使用 `--probability-shrinkage 1.00`，但波动率始终不低于长期基准 `0.00005/√秒`，防止短时安静行情制造虚假的极端概率。正常入场要求所选方向 ask 至少为 0.55、最近三次 Chainlink 采样均在同一结算方向且距开盘价没有收窄，并连续出现两次信号；超过动态波动阈值的单次反向跳动会清空确认。首单成交后，第二单既可在相同条件下顺势加仓，也可在模型连续两次翻向且 edge 达标时作为反向保护。每笔仍需避开最后 25 秒、过期现货价格、宽 spread、交叉报价和异常 ask 总价；高价或临近结算的入场还需要额外 edge。
+`fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在原始模型概率相对盘口 ask 有足够 edge 时入场。实盘使用 `--probability-shrinkage 1.00`，但波动率始终不低于长期基准 `0.00005/√秒`，防止短时安静行情制造虚假的极端概率。正常入场要求所选方向 ask 至少为 0.55、最近三次 Chainlink 采样均在同一结算方向且距开盘价没有收窄，并连续出现两次信号；超过动态波动阈值的单次反向跳动会清空确认。首单成交后，第二单既可在相同条件下顺势加仓，也可在模型连续两次翻向且 edge 达标时作为反向保护。保护单使用首单实际成交成本和份数，按保护限价及手续费分别模拟 UP、DOWN 结算，只有组合最大亏损严格下降才会提交。每笔仍需避开最后 25 秒、过期现货价格、宽 spread、交叉报价和异常 ask 总价；高价或临近结算的入场还需要额外 edge。
 
 生产启动器启用 `--official-price-to-beat`：每个窗口使用 Polymarket 发布的官方
 `openPrice`，并与本地缓存中最接近精确开盘毫秒时间戳的 Chainlink RTDS 样本核对。

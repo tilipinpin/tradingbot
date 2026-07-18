@@ -40,6 +40,7 @@ exec "$PYTHON" -u -m src.watch_updown \
   --confirmation-min-jump-usd 3.00 \
   --hedge-signal-confirmations 2 \
   --hedge-min-win-probability 0.62 \
+  --hedge-fee-rate 0.07 \
   --min-win-probability 0.62 \
   --probability-shrinkage 1.00 \
   --edge 0.06 \
