@@ -9,6 +9,11 @@ python3 -u -m src.watch_updown \
   --interval 2 \
   --price-source POLYMARKET_CHAINLINK \
   --ws-proxy socks5h://127.0.0.1:7898 \
+  --official-price-to-beat \
+  --price-to-beat-proxy socks5h://127.0.0.1:7898 \
+  --price-alignment-jsonl data/maker_momentum_v2_official_alignment.jsonl \
+  --max-price-alignment-difference 0.50 \
+  --max-boundary-sample-offset-ms 1000 \
   --market-data-timeout 3 \
   --auto-trade \
   --strategy maker_momentum \

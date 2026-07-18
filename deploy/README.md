@@ -15,3 +15,7 @@ alignment:
 
 The shell launchers accept an optional first argument for the initial event slug.
 When omitted, they start from the current five-minute epoch.
+
+All current launchers require official Polymarket `openPrice` alignment. A window
+is eligible only when the closest cached Chainlink sample is within 1000 ms of
+the exact boundary and differs from `openPrice` by no more than 0.50 USD.

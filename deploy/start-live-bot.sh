@@ -1,9 +1,23 @@
 #!/bin/zsh
 set -euo pipefail
 
+umask 077
+
+readonly APP_ROOT="/Users/tianliuping/Library/Application Support/PolymarketTradingBot"
+readonly RUNTIME="$APP_ROOT/runtime"
+readonly DATA_DIR="$APP_ROOT/data"
+readonly ENV_FILE="/Users/tianliuping/Documents/tradingbot/.env"
+readonly PYTHON="/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"
+
 now=$(/bin/date +%s)
 slug=${1:-btc-updown-5m-$((now / 300 * 300))}
-python3 -u -m src.watch_updown \
+cd "$RUNTIME"
+
+export PYTHONUNBUFFERED=1
+export TELEGRAM_TRADE_LEDGER="$DATA_DIR/live_trade_events.jsonl"
+export TELEGRAM_DAILY_STATE="$DATA_DIR/telegram_daily_state.json"
+
+exec "$PYTHON" -u -m src.watch_updown \
   --slug "$slug" \
   --duration 0 \
   --interval 5 \
@@ -12,7 +26,12 @@ python3 -u -m src.watch_updown \
   --strategy fair_value_edge \
   --price-source POLYMARKET_CHAINLINK \
   --ws-proxy socks5h://127.0.0.1:7898 \
-  --env-file .env \
+  --official-price-to-beat \
+  --price-to-beat-proxy socks5h://127.0.0.1:7898 \
+  --price-alignment-jsonl "$DATA_DIR/live_price_alignment.jsonl" \
+  --max-price-alignment-difference 0.50 \
+  --max-boundary-sample-offset-ms 1000 \
+  --env-file "$ENV_FILE" \
   --decision-seconds-before-end 90 \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
@@ -32,4 +51,4 @@ python3 -u -m src.watch_updown \
   --max-live-orders 0 \
   --max-live-notional 3.75 \
   --live-order-type FOK \
-  --live-summary-json data/live_trade_summary.json
+  --live-summary-json "$DATA_DIR/live_trade_summary.json"
