@@ -3,6 +3,7 @@ from __future__ import annotations
 from threading import Event
 
 from src.telegram_commands import (
+    DEFAULT_STRATEGY,
     TelegramCommandPoller,
     reply_keyboard_markup,
     strategy_selection_markup,
@@ -135,16 +136,16 @@ def test_poller_maps_large_keyboard_button_to_command() -> None:
     assert [item.command for item in poller.drain()] == ["/positions"]
 
 
-def test_live_strategy_menu_marks_paper_strategies_unavailable() -> None:
+def test_live_strategy_menu_allows_fair_value_and_late_favorite() -> None:
     markup = strategy_selection_markup("live", "fair_value_edge", "late_favorite")
     buttons = [button for row in markup["inline_keyboard"] for button in row]
     by_data = {button["callback_data"]: button["text"] for button in buttons}
 
     assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
-    assert "尾盘高置信度（仅纸面）" in by_data["strategy:unavailable:late_favorite"]
-    assert "Split 双边做市（仅纸面）" in by_data["strategy:unavailable:split_maker"]
-    assert "Maker 触价动量（仅纸面）" in by_data["strategy:unavailable:maker_momentum"]
-    assert len(by_data) == 6
+    assert "⏳ 尾盘高置信度" == by_data["strategy:select:late_favorite"]
+    assert "↩️ 恢复启动策略" == by_data[f"strategy:select:{DEFAULT_STRATEGY}"]
+    assert all("仅纸面" not in button["text"] for button in buttons)
+    assert len(buttons) == 4
 
 
 def test_poller_parses_strategy_callback_from_authorized_chat() -> None:

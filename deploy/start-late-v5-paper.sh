@@ -9,7 +9,6 @@ python3 -u -m src.watch_updown \
   --interval 5 \
   --price-source POLYMARKET_CHAINLINK \
   --ws-proxy socks5h://127.0.0.1:7898 \
-  --official-price-to-beat \
   --price-to-beat-proxy socks5h://127.0.0.1:7898 \
   --price-alignment-jsonl data/late_favorite_v5_official_alignment.jsonl \
   --max-price-alignment-difference 0.50 \
@@ -18,7 +17,6 @@ python3 -u -m src.watch_updown \
   --auto-trade \
   --strategy late_favorite \
   --max-spot-age 5 \
-  --max-start-capture-delay 15 \
   --max-trades 1 \
   --paper-trading \
   --paper-bankroll 20 \

@@ -13,9 +13,7 @@ from src.polymarket import (
     ClobDataClient,
     ClobTradingClient,
     Market,
-    OrderBookLevel,
     OrderBookQuote,
-    OrderBookSnapshot,
     _parse_token_ids,
     choose_btc_markets,
     filter_markets_by_liquidity,
@@ -33,39 +31,31 @@ from src.strategy import build_buy_intent
 from src.watch_updown import (
     account_new_paper_settlements,
     adverse_jump_exceeds_dynamic_threshold,
-    apply_split_maker_exit,
     consume_pause_window,
     evaluate_protective_hedge_risk,
     choose_fair_value_edge_signal,
+    choose_market_reversal_hedge_signal,
     choose_protective_hedge_signal,
     choose_late_favorite_signal,
-    choose_maker_momentum_signal,
-    evaluate_maker_momentum_signal,
     late_spot_buffer_metrics,
     live_order_limit_reached,
     live_response_is_matched,
     live_session_should_continue,
-    maker_quote_crossed,
-    merge_split_maker_inventory,
     window_trade_count_after_attempt,
     open_paper_position,
-    open_split_maker_cycle,
-    plan_split_maker_quotes,
+    official_open_retry_expired,
+    price_alignment_status,
+    polling_interval_for_seconds_left,
     quotes_pass_sanity_checks,
     response_fill_amounts,
     recent_spot_samples_support_side,
-    record_split_maker_fill,
     settle_all_paper_positions,
     settle_paper_positions,
-    settle_split_maker_cycles,
-    split_maker_best_exit,
     shrink_probability_toward_even,
     strategy_trade_limit,
     AutoTradeSignal,
-    SplitMakerCycle,
     next_5m_slug,
     slug_from_value,
-    start_capture_is_too_late,
     parse_args as parse_watch_args,
 )
 
@@ -321,6 +311,28 @@ def test_polymarket_chainlink_stream_rejects_distant_boundary_sample() -> None:
         raise AssertionError("A distant Chainlink sample must not verify the boundary")
 
 
+def test_official_open_price_accepts_missing_boundary_audit_sample() -> None:
+    status, difference = price_alignment_status(
+        Decimal("64000"),
+        None,
+        Decimal("0.50"),
+    )
+
+    assert status == "UNVERIFIED_BOUNDARY_SAMPLE"
+    assert difference is None
+
+
+def test_official_open_price_records_boundary_mismatch_without_rejection() -> None:
+    status, difference = price_alignment_status(
+        Decimal("64000"),
+        Decimal("64004.25"),
+        Decimal("0.50"),
+    )
+
+    assert status == "MISMATCH_WARNING"
+    assert difference == Decimal("4.25")
+
+
 def test_polymarket_chainlink_stream_rejects_stale_cached_price() -> None:
     stream = PolymarketChainlinkStream(timeout=0, max_stale_seconds=15)
     stream._started = True
@@ -338,104 +350,6 @@ def test_polymarket_chainlink_stream_rejects_stale_cached_price() -> None:
         assert "stale" in str(exc)
     else:
         raise AssertionError("Expected stale Chainlink data to be rejected")
-
-
-def test_split_maker_quote_plan_targets_pair_sum_and_requires_resting_time() -> None:
-    up_book = OrderBookSnapshot(
-        "up",
-        "1",
-        (OrderBookLevel(Decimal("0.49"), Decimal("10")),),
-        (OrderBookLevel(Decimal("0.52"), Decimal("10")),),
-        Decimal("5"),
-    )
-    down_book = OrderBookSnapshot(
-        "down",
-        "1",
-        (OrderBookLevel(Decimal("0.49"), Decimal("10")),),
-        (OrderBookLevel(Decimal("0.52"), Decimal("10")),),
-        Decimal("5"),
-    )
-
-    plan = plan_split_maker_quotes(
-        Decimal("0.50"),
-        up_book,
-        down_book,
-        Decimal("1.02"),
-        Decimal("0.01"),
-    )
-
-    assert plan is not None
-    assert plan.up_price == Decimal("0.51")
-    assert plan.down_price == Decimal("0.51")
-    assert maker_quote_crossed(up_book, Decimal("0.49"), 100.0, 103.9, 4) is False
-    assert maker_quote_crossed(up_book, Decimal("0.49"), 100.0, 104.0, 4) is True
-
-
-def test_split_maker_both_fills_lock_pair_sum_profit() -> None:
-    bankroll, cycle = open_split_maker_cycle(Decimal("20"), "btc-updown-5m-100", Decimal("5"))
-    assert cycle is not None
-
-    bankroll += record_split_maker_fill(cycle, "UP", Decimal("0.51"))
-    bankroll += record_split_maker_fill(cycle, "DOWN", Decimal("0.51"))
-
-    assert cycle.closed is True
-    assert cycle.close_reason == "both_maker_quotes_filled"
-    assert cycle.cash_flow == Decimal("0.10")
-    assert bankroll == Decimal("20.10")
-
-
-def test_split_maker_exit_chooses_better_inventory_recovery() -> None:
-    cycle = SplitMakerCycle(
-        slug="btc-updown-5m-100",
-        shares=Decimal("5"),
-        cash_flow=Decimal("-2.35"),
-        inventory_up=Decimal("0"),
-        inventory_down=Decimal("5"),
-        up_sold_price=Decimal("0.53"),
-    )
-    up_book = OrderBookSnapshot(
-        "up",
-        "1",
-        (OrderBookLevel(Decimal("0.52"), Decimal("5")),),
-        (OrderBookLevel(Decimal("0.54"), Decimal("5")),),
-        Decimal("5"),
-    )
-    down_book = OrderBookSnapshot(
-        "down",
-        "1",
-        (OrderBookLevel(Decimal("0.48"), Decimal("5")),),
-        (OrderBookLevel(Decimal("0.50"), Decimal("5")),),
-        Decimal("5"),
-    )
-
-    exit_plan = split_maker_best_exit(cycle, up_book, down_book, Decimal("0.07"))
-    assert exit_plan is not None
-    assert exit_plan.action == "sell_remaining_inventory"
-    cash_delta = apply_split_maker_exit(cycle, exit_plan)
-
-    assert cycle.closed is True
-    assert cash_delta == Decimal("2.312640")
-    assert cycle.cash_flow == Decimal("-0.037360")
-
-
-def test_split_maker_cancel_merges_inventory_and_settlement_closes_orphan(monkeypatch) -> None:
-    bankroll, untouched = open_split_maker_cycle(Decimal("20"), "btc-updown-5m-100", Decimal("5"))
-    assert untouched is not None
-    merged = merge_split_maker_inventory(untouched)
-    bankroll += merged
-    assert bankroll == Decimal("20")
-    assert untouched.cash_flow == 0
-
-    bankroll, orphan = open_split_maker_cycle(Decimal("20"), "btc-updown-5m-100", Decimal("5"))
-    assert orphan is not None
-    bankroll += record_split_maker_fill(orphan, "UP", Decimal("0.53"))
-    monkeypatch.setattr("src.watch_updown.fetch_winner", lambda slug: "DOWN")
-    bankroll = settle_split_maker_cycles([orphan], bankroll, now_ts=500)
-
-    assert orphan.closed is True
-    assert orphan.close_reason == "inventory_settlement"
-    assert orphan.cash_flow == Decimal("2.65")
-    assert bankroll == Decimal("22.65")
 
 
 def test_paper_position_fee_is_deducted_from_bankroll_and_profit(monkeypatch) -> None:
@@ -638,48 +552,18 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.max_live_orders == 0
     assert args.max_trades == 2
     assert args.duration == 0
-    assert args.min_entry == "0.55"
+    assert args.min_entry == "0.50"
     assert args.trend_confirmation_samples == 3
     assert args.hedge_signal_confirmations == 2
     assert args.hedge_min_win_probability == "0.62"
     assert args.hedge_fee_rate == "0.07"
     assert args.max_entry == "0.78"
     assert args.max_live_notional == "3.75"
-    assert args.low_entry_cutoff == "0.50"
+    assert args.late_max_live_notional == "4.70"
+    assert args.low_entry_cutoff == "0.55"
     assert args.low_entry_min_win_probability == "0.68"
     assert args.low_entry_confirmation_samples == 3
     assert args.probability_shrinkage == "1.00"
-    assert args.maker_shares == "5"
-    assert args.maker_target_pair_sum == "1.02"
-    assert args.maker_fee_rate == "0.07"
-    assert args.maker_start_delay_seconds == 10
-    assert args.maker_min_rest_seconds == 4
-    assert args.maker_reprice_ticks == 2
-    assert args.maker_unpaired_timeout_seconds == 10
-    assert args.maker_cancel_seconds == 60
-    assert args.maker_force_exit_seconds == 45
-    assert args.maker_max_inventory_loss_rate == "0.01"
-    assert args.momentum_target_pair_sum == "1.02"
-    assert args.momentum_start_delay_seconds == 10
-    assert args.momentum_min_rest_seconds == 4
-    assert args.momentum_reprice_ticks == 2
-    assert args.momentum_confirmation_samples == 1
-    assert args.momentum_trigger_timeout_seconds == 8
-    assert args.momentum_min_seconds_before_end == 30
-    assert args.momentum_min_entry == "0.60"
-    assert args.momentum_max_entry == "0.88"
-    assert args.momentum_min_probability == "0.55"
-    assert args.momentum_flow_probability_boost == "0.10"
-    assert args.momentum_min_expected_roi == "0.03"
-    assert args.momentum_min_lead_bps == "0.50"
-    assert args.momentum_strong_expected_roi == "0.04"
-    assert args.momentum_strong_lead_bps == "2.00"
-    assert args.momentum_spot_samples == 3
-    assert args.momentum_max_chase == "0.06"
-    assert args.momentum_fee_rate == "0.07"
-    assert args.momentum_max_spread == "0.02"
-    assert args.momentum_min_ask_sum == "0.97"
-    assert args.momentum_max_ask_sum == "1.03"
     assert args.late_entry_start_seconds == 55
     assert args.late_entry_cutoff_seconds == 8
     assert args.late_min_entry == "0.65"
@@ -922,9 +806,19 @@ def test_watch_updown_slug_helpers() -> None:
     assert next_5m_slug("btc-updown-5m-1783685100") == "btc-updown-5m-1783685400"
 
 
-def test_start_capture_rejects_fresh_price_after_deadline() -> None:
-    assert start_capture_is_too_late(Decimal("-16"), Decimal("15")) is True
-    assert start_capture_is_too_late(Decimal("-15"), Decimal("15")) is False
+def test_official_open_retries_until_the_strategy_entry_phase() -> None:
+    assert official_open_retry_expired(
+        Decimal("91"), "fair_value_edge", Decimal("90"), Decimal("55")
+    ) is False
+    assert official_open_retry_expired(
+        Decimal("90"), "fair_value_edge", Decimal("90"), Decimal("55")
+    ) is True
+    assert official_open_retry_expired(
+        Decimal("56"), "late_favorite", Decimal("90"), Decimal("55")
+    ) is False
+    assert official_open_retry_expired(
+        Decimal("55"), "late_favorite", Decimal("90"), Decimal("55")
+    ) is True
 
 
 def test_fair_value_edge_signal_buys_best_edge() -> None:
@@ -973,6 +867,52 @@ def test_protective_hedge_allows_opposite_low_price_after_model_flip() -> None:
     assert signal.side == "UP"
     assert signal.price == Decimal("0.48")
     assert signal.reason.startswith("protective_hedge")
+
+
+def test_market_reversal_hedge_uses_opposite_bid_inside_tail_window() -> None:
+    market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
+    quotes = {
+        "up_quote": OrderBookQuote(bid=Decimal("0.70"), ask=Decimal("0.71")),
+        "down_quote": OrderBookQuote(bid=Decimal("0.29"), ask=Decimal("0.30")),
+    }
+
+    signal = choose_market_reversal_hedge_signal(
+        market=market,
+        primary_side="DOWN",
+        seconds_to_end=Decimal("12"),
+        entry_start_seconds=Decimal("20"),
+        entry_cutoff_seconds=Decimal("1"),
+        reversal_bid_threshold=Decimal("0.65"),
+        max_entry=Decimal("0.99"),
+        max_spread=Decimal("0.04"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+        **quotes,
+    )
+
+    assert signal is not None
+    assert signal.side == "UP"
+    assert signal.price == Decimal("0.71")
+    assert signal.reason.startswith("protective_market_reversal")
+    assert choose_market_reversal_hedge_signal(
+        market=market,
+        primary_side="DOWN",
+        seconds_to_end=Decimal("21"),
+        entry_start_seconds=Decimal("20"),
+        entry_cutoff_seconds=Decimal("1"),
+        reversal_bid_threshold=Decimal("0.65"),
+        max_entry=Decimal("0.99"),
+        max_spread=Decimal("0.04"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+        **quotes,
+    ) is None
+
+
+def test_final_polling_switches_to_one_second_for_last_thirty_seconds() -> None:
+    assert polling_interval_for_seconds_left(Decimal("31"), 5.0, 30, 1.0) == 5.0
+    assert polling_interval_for_seconds_left(Decimal("30"), 5.0, 30, 1.0) == 1.0
+    assert polling_interval_for_seconds_left(Decimal("1"), 5.0, 30, 1.0) == 1.0
 
 
 def test_protective_hedge_must_reduce_portfolio_max_loss() -> None:
@@ -1092,27 +1032,47 @@ def test_fair_value_edge_signal_requires_minimum_win_probability() -> None:
     assert signal is None
 
 
-def test_50_cent_entry_uses_normal_probability_tier_without_spot_samples() -> None:
+def test_50_cent_entry_uses_strict_probability_tier_and_spot_samples() -> None:
     market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
-    signal = choose_fair_value_edge_signal(
+    rejected = choose_fair_value_edge_signal(
         market=market,
         probability_up=Decimal("0.62"),
         up_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
         down_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
         seconds_to_end=Decimal("70"),
         decision_seconds_before_end=Decimal("90"),
-        min_entry=Decimal("0.45"),
-        max_entry=Decimal("0.75"),
+        min_entry=Decimal("0.50"),
+        max_entry=Decimal("0.78"),
         edge_threshold=Decimal("0.06"),
         max_spread=Decimal("0.04"),
         min_ask_sum=Decimal("0.90"),
         max_ask_sum=Decimal("1.10"),
         min_win_probability=Decimal("0.62"),
+        low_entry_cutoff=Decimal("0.55"),
+    )
+    accepted = choose_fair_value_edge_signal(
+        market=market,
+        probability_up=Decimal("0.70"),
+        up_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
+        down_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
+        seconds_to_end=Decimal("70"),
+        decision_seconds_before_end=Decimal("90"),
+        min_entry=Decimal("0.50"),
+        max_entry=Decimal("0.78"),
+        edge_threshold=Decimal("0.06"),
+        max_spread=Decimal("0.04"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+        min_win_probability=Decimal("0.62"),
+        low_entry_cutoff=Decimal("0.55"),
+        recent_spot_prices=[Decimal("100.5"), Decimal("101"), Decimal("102")],
+        start_price=Decimal("100"),
     )
 
-    assert signal is not None
-    assert signal.price == Decimal("0.50")
-    assert "required_probability=0.6200" in signal.reason
+    assert rejected is None
+    assert accepted is not None
+    assert accepted.price == Decimal("0.50")
+    assert "required_probability=0.6800" in accepted.reason
 
 
 def test_recent_spot_samples_require_same_side_and_supporting_net_move() -> None:
@@ -1225,140 +1185,6 @@ def test_late_favorite_accepts_fee_adjusted_high_confidence_signal() -> None:
     assert "required_lead_bps=3.00" in signal.reason
     assert "pullback_ratio=0.000" in signal.reason
     assert "fee_per_share=0.0131" in signal.reason
-
-
-def test_maker_momentum_accepts_aligned_favorite_after_virtual_fill() -> None:
-    market = make_market(
-        "Bitcoin Up or Down?",
-        "btc-updown-5m-1",
-        "c1",
-        ("up", "down"),
-        "0.01",
-        False,
-        Decimal("10"),
-    )
-    signal = choose_maker_momentum_signal(
-        market=market,
-        side="UP",
-        trigger_price=Decimal("0.68"),
-        probability_up=Decimal("0.66"),
-        up_quote=OrderBookQuote(bid=Decimal("0.70"), ask=Decimal("0.71")),
-        down_quote=OrderBookQuote(bid=Decimal("0.29"), ask=Decimal("0.30")),
-        seconds_to_end=Decimal("200"),
-        recent_spot_prices=[Decimal("100.01"), Decimal("100.02"), Decimal("100.03")],
-        start_price=Decimal("100"),
-    )
-
-    assert signal is not None
-    assert signal.side == "UP"
-    assert signal.price == Decimal("0.71")
-    assert "flow_adjusted_probability=0.7600" in signal.reason
-
-
-def test_maker_momentum_rejects_underdog_opposite_spot_and_excessive_chase() -> None:
-    market = make_market(
-        "Bitcoin Up or Down?",
-        "btc-updown-5m-1",
-        "c1",
-        ("up", "down"),
-        "0.01",
-        False,
-        Decimal("10"),
-    )
-    base = {
-        "market": market,
-        "side": "UP",
-        "trigger_price": Decimal("0.68"),
-        "probability_up": Decimal("0.75"),
-        "up_quote": OrderBookQuote(bid=Decimal("0.70"), ask=Decimal("0.71")),
-        "down_quote": OrderBookQuote(bid=Decimal("0.29"), ask=Decimal("0.30")),
-        "seconds_to_end": Decimal("200"),
-        "recent_spot_prices": [Decimal("100.01"), Decimal("100.02"), Decimal("100.03")],
-        "start_price": Decimal("100"),
-    }
-
-    assert choose_maker_momentum_signal(
-        **{
-            **base,
-            "up_quote": OrderBookQuote(bid=Decimal("0.44"), ask=Decimal("0.45")),
-            "down_quote": OrderBookQuote(bid=Decimal("0.55"), ask=Decimal("0.56")),
-        }
-    ) is None
-    assert choose_maker_momentum_signal(
-        **{
-            **base,
-            "recent_spot_prices": [Decimal("99.99"), Decimal("99.98"), Decimal("99.97")],
-        }
-    ) is None
-    assert choose_maker_momentum_signal(
-        **{
-            **base,
-            "up_quote": OrderBookQuote(bid=Decimal("0.79"), ask=Decimal("0.80")),
-            "down_quote": OrderBookQuote(bid=Decimal("0.20"), ask=Decimal("0.21")),
-        }
-    ) is None
-
-
-def test_maker_momentum_v2_rejects_weak_flow_but_accepts_strong_lead() -> None:
-    market = make_market(
-        "Bitcoin Up or Down?",
-        "btc-updown-5m-1",
-        "c1",
-        ("up", "down"),
-        "0.01",
-        False,
-        Decimal("10"),
-    )
-    base = {
-        "market": market,
-        "side": "UP",
-        "trigger_price": Decimal("0.63"),
-        "probability_up": Decimal("0.5875"),
-        "up_quote": OrderBookQuote(bid=Decimal("0.64"), ask=Decimal("0.65")),
-        "down_quote": OrderBookQuote(bid=Decimal("0.35"), ask=Decimal("0.36")),
-        "seconds_to_end": Decimal("230"),
-        "start_price": Decimal("100"),
-    }
-
-    weak = evaluate_maker_momentum_signal(
-        **base,
-        recent_spot_prices=[Decimal("100.005"), Decimal("100.006"), Decimal("100.007")],
-    )
-    strong_lead = evaluate_maker_momentum_signal(
-        **base,
-        recent_spot_prices=[Decimal("100.01"), Decimal("100.02"), Decimal("100.03")],
-    )
-
-    assert weak.signal is None
-    assert weak.rejection_reason == "weak_flow"
-    assert strong_lead.signal is not None
-    assert "maker_momentum_v2" in strong_lead.signal.reason
-
-
-def test_maker_momentum_evaluation_reports_prefilter_reason() -> None:
-    market = make_market(
-        "Bitcoin Up or Down?",
-        "btc-updown-5m-1",
-        "c1",
-        ("up", "down"),
-        "0.01",
-        False,
-        Decimal("10"),
-    )
-    result = evaluate_maker_momentum_signal(
-        market=market,
-        side="UP",
-        trigger_price=Decimal("0.40"),
-        probability_up=Decimal("0.40"),
-        up_quote=OrderBookQuote(bid=Decimal("0.39"), ask=Decimal("0.40")),
-        down_quote=OrderBookQuote(bid=Decimal("0.60"), ask=Decimal("0.61")),
-        seconds_to_end=Decimal("180"),
-        recent_spot_prices=[Decimal("100.01"), Decimal("100.02"), Decimal("100.03")],
-        start_price=Decimal("100"),
-    )
-
-    assert result.signal is None
-    assert result.rejection_reason == "not_favorite"
 
 
 def test_late_favorite_rejects_weak_probability_time_and_reversal() -> None:
@@ -1547,7 +1373,6 @@ def test_late_favorite_requires_fee_adjusted_expected_roi() -> None:
 
 def test_late_favorite_is_limited_to_one_trade_per_window() -> None:
     assert strategy_trade_limit("late_favorite", 5) == 1
-    assert strategy_trade_limit("maker_momentum", 5) == 1
     assert strategy_trade_limit("fair_value_edge", 5) == 5
 
 

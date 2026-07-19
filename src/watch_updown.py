@@ -11,7 +11,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import ROUND_CEILING, Decimal
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +27,7 @@ from src.polymarket import (
     ClobTradingClient,
     GammaClient,
     Market,
-    OrderBookLevel,
     OrderBookQuote,
-    OrderBookSnapshot,
 )
 from src.price_alignment import PolymarketPriceToBeatClient
 from src.price_signal import SpotPriceClient
@@ -68,71 +66,12 @@ class PaperPosition:
 
 
 @dataclass(frozen=True)
-class BookFill:
-    shares: Decimal
-    cost: Decimal
-    fee: Decimal
-    vwap: Decimal
-    worst_price: Decimal
-
-
-@dataclass(frozen=True)
 class HedgeRiskEvaluation:
     reduces_max_loss: bool
     max_loss_before: Decimal
     max_loss_after: Decimal
     pnl_up_after: Decimal
     pnl_down_after: Decimal
-
-
-@dataclass(frozen=True)
-class SplitMakerQuotePlan:
-    up_price: Decimal
-    down_price: Decimal
-
-
-@dataclass
-class SplitMakerCycle:
-    slug: str
-    shares: Decimal
-    cash_flow: Decimal
-    inventory_up: Decimal
-    inventory_down: Decimal
-    up_quote: Decimal | None = None
-    down_quote: Decimal | None = None
-    up_quote_started_at: float | None = None
-    down_quote_started_at: float | None = None
-    up_sold_price: Decimal | None = None
-    down_sold_price: Decimal | None = None
-    unpaired_since: float | None = None
-    closed: bool = False
-    close_reason: str | None = None
-
-
-@dataclass(frozen=True)
-class SplitMakerExit:
-    action: str
-    cash_delta: Decimal
-    price: Decimal
-    fee: Decimal
-
-
-@dataclass
-class MakerMomentumProbe:
-    up_quote: Decimal | None = None
-    down_quote: Decimal | None = None
-    up_quote_started_at: float | None = None
-    down_quote_started_at: float | None = None
-    candidate_side: str | None = None
-    trigger_price: Decimal | None = None
-    candidate_started_at: float | None = None
-    confirmations: int = 0
-
-
-@dataclass(frozen=True)
-class MakerMomentumEvaluation:
-    signal: AutoTradeSignal | None
-    rejection_reason: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,13 +106,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hedge-signal-confirmations", type=int, default=2)
     parser.add_argument("--hedge-min-win-probability", default="0.62")
     parser.add_argument("--hedge-fee-rate", default="0.07")
+    parser.add_argument("--hedge-entry-start-seconds", type=int, default=20)
+    parser.add_argument("--hedge-entry-cutoff-seconds", type=int, default=1)
+    parser.add_argument("--hedge-market-reversal-threshold", default="0.65")
+    parser.add_argument("--hedge-market-reversal-confirmations", type=int, default=2)
+    parser.add_argument("--hedge-max-entry", default="0.99")
+    parser.add_argument("--hedge-max-live-notional", default="5.00")
+    parser.add_argument("--final-poll-seconds", type=int, default=30)
+    parser.add_argument("--final-poll-interval", type=float, default=1.0)
     parser.add_argument("--max-spot-age", type=int, default=20, help="Maximum cached spot-price age allowed for entries.")
-    parser.add_argument("--max-start-capture-delay", type=int, default=15, help="Skip a window if its start price is captured later than this many seconds.")
-    parser.add_argument(
-        "--official-price-to-beat",
-        action="store_true",
-        help="Use Polymarket's published crypto openPrice instead of the first post-open spot sample.",
-    )
     parser.add_argument(
         "--price-to-beat-proxy",
         help="Optional HTTP/SOCKS proxy for the Polymarket crypto-price endpoint; defaults to --ws-proxy.",
@@ -185,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-price-alignment-difference",
         default="0.50",
-        help="Reject a window when official openPrice differs from the boundary Chainlink sample by more than this many USD.",
+        help="Warn when official openPrice differs from the boundary Chainlink sample by more than this many USD.",
     )
     parser.add_argument(
         "--max-boundary-sample-offset-ms",
@@ -199,10 +140,10 @@ def parse_args() -> argparse.Namespace:
         default="1.00",
         help="Shrink fair-value probability toward 0.50 before evaluating edge; 1 disables calibration.",
     )
-    parser.add_argument("--low-entry-cutoff", default="0.50")
+    parser.add_argument("--low-entry-cutoff", default="0.55")
     parser.add_argument("--low-entry-min-win-probability", default="0.68")
     parser.add_argument("--low-entry-confirmation-samples", type=int, default=3)
-    parser.add_argument("--min-entry", default="0.55")
+    parser.add_argument("--min-entry", default="0.50")
     parser.add_argument("--max-entry", default="0.78")
     parser.add_argument("--max-spread", default="0.04", help="Max bid/ask spread allowed for the selected side.")
     parser.add_argument("--min-ask-sum", default="0.90", help="Skip markets where Up ask + Down ask is below this.")
@@ -216,6 +157,11 @@ def parse_args() -> argparse.Namespace:
         help="Hard session cap on live order attempts; 0 means unlimited.",
     )
     parser.add_argument("--max-live-notional", default="3.75", help="Hard principal cap per live order in pUSD.")
+    parser.add_argument(
+        "--late-max-live-notional",
+        default="4.70",
+        help="Hard principal cap per late_favorite live order in pUSD.",
+    )
     parser.add_argument("--live-order-type", choices=["FOK"], default="FOK")
     parser.add_argument(
         "--live-summary-json",
@@ -227,37 +173,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper-trading", action="store_true", help="Track a simulated bankroll and settle windows.")
     parser.add_argument("--paper-bankroll", default="20", help="Starting simulated bankroll in USDC.")
     parser.add_argument("--paper-stake", default="1", help="Simulated USDC stake per signal.")
-    parser.add_argument("--maker-shares", default="5")
-    parser.add_argument("--maker-target-pair-sum", default="1.02")
-    parser.add_argument("--maker-fee-rate", default="0.07")
-    parser.add_argument("--maker-start-delay-seconds", type=int, default=10)
-    parser.add_argument("--maker-min-rest-seconds", type=int, default=4)
-    parser.add_argument("--maker-reprice-ticks", type=int, default=2)
-    parser.add_argument("--maker-unpaired-timeout-seconds", type=int, default=10)
-    parser.add_argument("--maker-cancel-seconds", type=int, default=60)
-    parser.add_argument("--maker-force-exit-seconds", type=int, default=45)
-    parser.add_argument("--maker-max-inventory-loss-rate", default="0.01")
-    parser.add_argument("--momentum-target-pair-sum", default="1.02")
-    parser.add_argument("--momentum-start-delay-seconds", type=int, default=10)
-    parser.add_argument("--momentum-min-rest-seconds", type=int, default=4)
-    parser.add_argument("--momentum-reprice-ticks", type=int, default=2)
-    parser.add_argument("--momentum-confirmation-samples", type=int, default=1)
-    parser.add_argument("--momentum-trigger-timeout-seconds", type=int, default=8)
-    parser.add_argument("--momentum-min-seconds-before-end", type=int, default=30)
-    parser.add_argument("--momentum-min-entry", default="0.60")
-    parser.add_argument("--momentum-max-entry", default="0.88")
-    parser.add_argument("--momentum-min-probability", default="0.55")
-    parser.add_argument("--momentum-flow-probability-boost", default="0.10")
-    parser.add_argument("--momentum-min-expected-roi", default="0.03")
-    parser.add_argument("--momentum-min-lead-bps", default="0.50")
-    parser.add_argument("--momentum-strong-expected-roi", default="0.04")
-    parser.add_argument("--momentum-strong-lead-bps", default="2.00")
-    parser.add_argument("--momentum-spot-samples", type=int, default=3)
-    parser.add_argument("--momentum-max-chase", default="0.06")
-    parser.add_argument("--momentum-fee-rate", default="0.07")
-    parser.add_argument("--momentum-max-spread", default="0.02")
-    parser.add_argument("--momentum-min-ask-sum", default="0.97")
-    parser.add_argument("--momentum-max-ask-sum", default="1.03")
     parser.add_argument("--late-entry-start-seconds", type=int, default=55)
     parser.add_argument("--late-entry-cutoff-seconds", type=int, default=8)
     parser.add_argument("--late-min-entry", default="0.65")
@@ -300,8 +215,18 @@ def next_5m_slug(slug: str) -> str:
     return f"{match.group(1)}{int(match.group(2)) + 300}"
 
 
-def start_capture_is_too_late(seconds_to_start: Decimal, max_delay: Decimal) -> bool:
-    return -seconds_to_start > max_delay
+def official_open_retry_expired(
+    seconds_to_end: Decimal,
+    strategy: str,
+    fair_entry_start_seconds: Decimal,
+    late_entry_start_seconds: Decimal,
+) -> bool:
+    entry_start = (
+        late_entry_start_seconds
+        if strategy == "late_favorite"
+        else fair_entry_start_seconds
+    )
+    return seconds_to_end <= entry_start
 
 
 def load_updown_market(gamma: GammaClient, slug: str) -> Market | None:
@@ -346,18 +271,6 @@ def quote_outcomes(clob: ClobDataClient, market: Market) -> tuple[OrderBookQuote
         logger.warning("Could not fetch outcome quotes for %s: %s", market.slug, exc)
         return None, None
     return up_quote, down_quote
-
-
-def outcome_books(
-    clob: ClobDataClient,
-    market: Market,
-) -> tuple[OrderBookSnapshot | None, OrderBookSnapshot | None]:
-    try:
-        up_book, down_book = clob.books(market.token_ids)
-    except (RequestException, LookupError, ValueError) as exc:
-        logger.warning("Could not fetch outcome books for %s: %s", market.slug, exc)
-        return None, None
-    return up_book, down_book
 
 
 def quote_spread(quote: OrderBookQuote | None) -> Decimal | None:
@@ -504,9 +417,22 @@ def late_spot_safety_metrics(
 
 
 def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
-    if strategy in {"late_favorite", "maker_momentum"}:
+    if strategy == "late_favorite":
         return 1
     return configured_limit
+
+
+def price_alignment_status(
+    official_open_price: Decimal,
+    boundary_price: Decimal | None,
+    max_difference: Decimal,
+) -> tuple[str, Decimal | None]:
+    if boundary_price is None:
+        return "UNVERIFIED_BOUNDARY_SAMPLE", None
+    difference = boundary_price - official_open_price
+    if abs(difference) > max_difference:
+        return "MISMATCH_WARNING", difference
+    return "VERIFIED", difference
 
 
 def window_trade_count_after_attempt(current_count: int, *, live: bool, matched: bool = False) -> int:
@@ -660,6 +586,51 @@ def choose_protective_hedge_signal(
             f"edge={edge.quantize(Decimal('0.0001'))} "
             f"probability={probability.quantize(Decimal('0.0001'))} "
             f"required_probability={min_win_probability.quantize(Decimal('0.0001'))} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def choose_market_reversal_hedge_signal(
+    market: Market,
+    primary_side: str,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    entry_start_seconds: Decimal,
+    entry_cutoff_seconds: Decimal,
+    reversal_bid_threshold: Decimal,
+    max_entry: Decimal,
+    max_spread: Decimal,
+    min_ask_sum: Decimal,
+    max_ask_sum: Decimal,
+) -> AutoTradeSignal | None:
+    if seconds_to_end > entry_start_seconds or seconds_to_end < entry_cutoff_seconds:
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and down_quote is not None
+    side = "DOWN" if primary_side == "UP" else "UP" if primary_side == "DOWN" else ""
+    if not side:
+        return None
+    quote = up_quote if side == "UP" else down_quote
+    if quote.bid < reversal_bid_threshold or quote.ask <= 0 or quote.ask > max_entry:
+        return None
+    token_id = market.token_ids[0] if side == "UP" else market.token_ids[1]
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=quote.ask,
+        reason=(
+            f"protective_market_reversal primary_side={primary_side} entry={quote.ask} "
+            f"opposite_bid={quote.bid} required_bid={reversal_bid_threshold} "
             f"seconds_left={int(seconds_to_end)}"
         ),
     )
@@ -919,414 +890,6 @@ def open_paper_position(
     return bankroll
 
 
-def fill_ask_depth(
-    levels: tuple[OrderBookLevel, ...],
-    shares: Decimal,
-    fee_rate: Decimal,
-) -> BookFill | None:
-    if shares <= 0 or fee_rate < 0:
-        raise ValueError("Ask-depth shares must be positive and fee rate must not be negative")
-    remaining = shares
-    cost = Decimal("0")
-    fee = Decimal("0")
-    worst_price: Decimal | None = None
-    for level in sorted(levels, key=lambda item: item.price):
-        if level.price <= 0 or level.size <= 0:
-            continue
-        filled = min(remaining, level.size)
-        cost += filled * level.price
-        fee += filled * fee_rate * level.price * (Decimal("1") - level.price)
-        remaining -= filled
-        worst_price = level.price
-        if remaining <= 0:
-            break
-    if remaining > 0 or worst_price is None:
-        return None
-    return BookFill(
-        shares=shares,
-        cost=cost,
-        fee=fee,
-        vwap=cost / shares,
-        worst_price=worst_price,
-    )
-
-
-def fill_bid_depth(
-    levels: tuple[OrderBookLevel, ...],
-    shares: Decimal,
-    fee_rate: Decimal,
-) -> BookFill | None:
-    if shares <= 0 or fee_rate < 0:
-        raise ValueError("Maker exit shares must be positive and fee rate must not be negative")
-    remaining = shares
-    proceeds = Decimal("0")
-    fee = Decimal("0")
-    worst_price: Decimal | None = None
-    for level in sorted(levels, key=lambda item: item.price, reverse=True):
-        if level.price <= 0 or level.size <= 0:
-            continue
-        filled = min(remaining, level.size)
-        proceeds += filled * level.price
-        fee += filled * fee_rate * level.price * (Decimal("1") - level.price)
-        remaining -= filled
-        worst_price = level.price
-        if remaining <= 0:
-            break
-    if remaining > 0 or worst_price is None:
-        return None
-    return BookFill(
-        shares=shares,
-        cost=proceeds,
-        fee=fee,
-        vwap=proceeds / shares,
-        worst_price=worst_price,
-    )
-
-
-def round_up_to_tick(value: Decimal, tick_size: Decimal) -> Decimal:
-    if tick_size <= 0:
-        raise ValueError("tick size must be positive")
-    return (value / tick_size).to_integral_value(rounding=ROUND_CEILING) * tick_size
-
-
-def plan_split_maker_quotes(
-    probability_up: Decimal,
-    up_book: OrderBookSnapshot,
-    down_book: OrderBookSnapshot,
-    target_pair_sum: Decimal,
-    tick_size: Decimal,
-) -> SplitMakerQuotePlan | None:
-    if not Decimal("0") <= probability_up <= Decimal("1") or target_pair_sum <= Decimal("1"):
-        return None
-    margin = (target_pair_sum - Decimal("1")) / Decimal("2")
-    up_price = round_up_to_tick(probability_up + margin, tick_size)
-    down_price = round_up_to_tick(Decimal("1") - probability_up + margin, tick_size)
-    up_bid = up_book.quote.bid
-    down_bid = down_book.quote.bid
-    if up_bid is not None:
-        up_price = max(up_price, round_up_to_tick(up_bid + tick_size, tick_size))
-    if down_bid is not None:
-        down_price = max(down_price, round_up_to_tick(down_bid + tick_size, tick_size))
-    if up_price >= Decimal("1") or down_price >= Decimal("1"):
-        return None
-    if up_price + down_price < target_pair_sum:
-        return None
-    return SplitMakerQuotePlan(up_price=up_price, down_price=down_price)
-
-
-def maker_quote_crossed(
-    book: OrderBookSnapshot,
-    quote_price: Decimal | None,
-    quote_started_at: float | None,
-    now_monotonic: float,
-    min_rest_seconds: int,
-) -> bool:
-    if quote_price is None or quote_started_at is None:
-        return False
-    if now_monotonic - quote_started_at < max(0, min_rest_seconds):
-        return False
-    best_bid = book.quote.bid
-    return best_bid is not None and best_bid >= quote_price
-
-
-def evaluate_maker_momentum_signal(
-    market: Market,
-    side: str,
-    trigger_price: Decimal,
-    probability_up: Decimal,
-    up_quote: OrderBookQuote | None,
-    down_quote: OrderBookQuote | None,
-    seconds_to_end: Decimal,
-    recent_spot_prices: list[Decimal],
-    start_price: Decimal,
-    min_seconds_before_end: Decimal = Decimal("30"),
-    min_entry: Decimal = Decimal("0.60"),
-    max_entry: Decimal = Decimal("0.85"),
-    min_probability: Decimal = Decimal("0.55"),
-    flow_probability_boost: Decimal = Decimal("0.10"),
-    min_expected_roi: Decimal = Decimal("0.03"),
-    min_lead_bps: Decimal = Decimal("0.50"),
-    spot_samples: int = 3,
-    max_chase: Decimal = Decimal("0.06"),
-    fee_rate: Decimal = Decimal("0.07"),
-    max_spread: Decimal = Decimal("0.02"),
-    min_ask_sum: Decimal = Decimal("0.97"),
-    max_ask_sum: Decimal = Decimal("1.03"),
-    strong_expected_roi: Decimal = Decimal("0.04"),
-    strong_lead_bps: Decimal = Decimal("2.00"),
-) -> MakerMomentumEvaluation:
-    if side not in {"UP", "DOWN"} or seconds_to_end < min_seconds_before_end:
-        return MakerMomentumEvaluation(None, "time_or_side")
-    ok, quote_reason = quotes_pass_sanity_checks(
-        up_quote,
-        down_quote,
-        max_spread,
-        min_ask_sum,
-        max_ask_sum,
-    )
-    if not ok:
-        return MakerMomentumEvaluation(None, f"quote_sanity:{quote_reason.replace(' ', '_')}")
-    assert up_quote is not None and up_quote.bid is not None and up_quote.ask is not None
-    assert down_quote is not None and down_quote.bid is not None and down_quote.ask is not None
-
-    up_midpoint = (up_quote.bid + up_quote.ask) / Decimal("2")
-    down_midpoint = (down_quote.bid + down_quote.ask) / Decimal("2")
-    favorite = "UP" if up_midpoint > down_midpoint else "DOWN" if down_midpoint > up_midpoint else None
-    if side != favorite:
-        return MakerMomentumEvaluation(None, "not_favorite")
-
-    entry = up_quote.ask if side == "UP" else down_quote.ask
-    probability = probability_up if side == "UP" else Decimal("1") - probability_up
-    token_id = market.token_ids[0] if side == "UP" else market.token_ids[1]
-    if entry < min_entry:
-        return MakerMomentumEvaluation(None, "entry_below_min")
-    if entry > max_entry:
-        return MakerMomentumEvaluation(None, "entry_above_max")
-    if entry - trigger_price > max_chase:
-        return MakerMomentumEvaluation(None, "excessive_chase")
-    if probability < min_probability:
-        return MakerMomentumEvaluation(None, "model_probability")
-    if not recent_spot_samples_support_side(
-        recent_spot_prices,
-        start_price,
-        side,
-        spot_samples,
-    ):
-        return MakerMomentumEvaluation(None, "spot_alignment")
-
-    if side == "UP":
-        lead_bps = (recent_spot_prices[-1] / start_price - Decimal("1")) * Decimal("10000")
-    else:
-        lead_bps = (Decimal("1") - recent_spot_prices[-1] / start_price) * Decimal("10000")
-    if lead_bps < min_lead_bps:
-        return MakerMomentumEvaluation(None, "lead_bps")
-
-    adjusted_probability = min(Decimal("1"), probability + flow_probability_boost)
-    fee_per_stake = fee_rate * (Decimal("1") - entry)
-    expected_roi = adjusted_probability / entry - Decimal("1") - fee_per_stake
-    if expected_roi < min_expected_roi:
-        return MakerMomentumEvaluation(None, "expected_roi")
-    if expected_roi < strong_expected_roi and lead_bps < strong_lead_bps:
-        return MakerMomentumEvaluation(None, "weak_flow")
-
-    return MakerMomentumEvaluation(
-        AutoTradeSignal(
-            side=side,
-            token_id=token_id,
-            price=entry,
-            reason=(
-                f"maker_momentum_v2 trigger={trigger_price} entry={entry} "
-                f"model_probability={probability.quantize(Decimal('0.0001'))} "
-                f"flow_adjusted_probability={adjusted_probability.quantize(Decimal('0.0001'))} "
-                f"expected_roi={expected_roi.quantize(Decimal('0.0001'))} "
-                f"lead_bps={lead_bps.quantize(Decimal('0.01'))} "
-                f"seconds_left={int(seconds_to_end)}"
-            ),
-        ),
-        None,
-    )
-
-
-def choose_maker_momentum_signal(
-    market: Market,
-    side: str,
-    trigger_price: Decimal,
-    probability_up: Decimal,
-    up_quote: OrderBookQuote | None,
-    down_quote: OrderBookQuote | None,
-    seconds_to_end: Decimal,
-    recent_spot_prices: list[Decimal],
-    start_price: Decimal,
-    min_seconds_before_end: Decimal = Decimal("30"),
-    min_entry: Decimal = Decimal("0.60"),
-    max_entry: Decimal = Decimal("0.88"),
-    min_probability: Decimal = Decimal("0.55"),
-    flow_probability_boost: Decimal = Decimal("0.10"),
-    min_expected_roi: Decimal = Decimal("0.03"),
-    min_lead_bps: Decimal = Decimal("0.50"),
-    spot_samples: int = 3,
-    max_chase: Decimal = Decimal("0.06"),
-    fee_rate: Decimal = Decimal("0.07"),
-    max_spread: Decimal = Decimal("0.02"),
-    min_ask_sum: Decimal = Decimal("0.97"),
-    max_ask_sum: Decimal = Decimal("1.03"),
-    strong_expected_roi: Decimal = Decimal("0.04"),
-    strong_lead_bps: Decimal = Decimal("2.00"),
-) -> AutoTradeSignal | None:
-    return evaluate_maker_momentum_signal(
-        market,
-        side,
-        trigger_price,
-        probability_up,
-        up_quote,
-        down_quote,
-        seconds_to_end,
-        recent_spot_prices,
-        start_price,
-        min_seconds_before_end,
-        min_entry,
-        max_entry,
-        min_probability,
-        flow_probability_boost,
-        min_expected_roi,
-        min_lead_bps,
-        spot_samples,
-        max_chase,
-        fee_rate,
-        max_spread,
-        min_ask_sum,
-        max_ask_sum,
-        strong_expected_roi,
-        strong_lead_bps,
-    ).signal
-
-
-def record_split_maker_fill(cycle: SplitMakerCycle, side: str, price: Decimal) -> Decimal:
-    if side == "UP" and cycle.inventory_up > 0:
-        shares = cycle.inventory_up
-        cycle.inventory_up = Decimal("0")
-        cycle.up_sold_price = price
-    elif side == "DOWN" and cycle.inventory_down > 0:
-        shares = cycle.inventory_down
-        cycle.inventory_down = Decimal("0")
-        cycle.down_sold_price = price
-    else:
-        return Decimal("0")
-    proceeds = shares * price
-    cycle.cash_flow += proceeds
-    if cycle.inventory_up == 0 and cycle.inventory_down == 0:
-        cycle.closed = True
-        cycle.close_reason = "both_maker_quotes_filled"
-    return proceeds
-
-
-def split_maker_best_exit(
-    cycle: SplitMakerCycle,
-    up_book: OrderBookSnapshot,
-    down_book: OrderBookSnapshot,
-    fee_rate: Decimal,
-) -> SplitMakerExit | None:
-    if cycle.up_sold_price is not None and cycle.inventory_down > 0:
-        remaining_book = down_book
-        sold_book = up_book
-        remaining_shares = cycle.inventory_down
-    elif cycle.down_sold_price is not None and cycle.inventory_up > 0:
-        remaining_book = up_book
-        sold_book = down_book
-        remaining_shares = cycle.inventory_up
-    else:
-        return None
-
-    options: list[SplitMakerExit] = []
-    direct = fill_bid_depth(remaining_book.bids, remaining_shares, fee_rate)
-    if direct is not None:
-        options.append(
-            SplitMakerExit(
-                action="sell_remaining_inventory",
-                cash_delta=direct.cost - direct.fee,
-                price=direct.vwap,
-                fee=direct.fee,
-            )
-        )
-    buyback = fill_ask_depth(sold_book.asks, remaining_shares, fee_rate)
-    if buyback is not None:
-        options.append(
-            SplitMakerExit(
-                action="buy_back_and_merge",
-                cash_delta=remaining_shares - buyback.cost - buyback.fee,
-                price=buyback.vwap,
-                fee=buyback.fee,
-            )
-        )
-    return max(options, key=lambda option: option.cash_delta, default=None)
-
-
-def apply_split_maker_exit(cycle: SplitMakerCycle, exit_plan: SplitMakerExit) -> Decimal:
-    cycle.cash_flow += exit_plan.cash_delta
-    cycle.inventory_up = Decimal("0")
-    cycle.inventory_down = Decimal("0")
-    cycle.closed = True
-    cycle.close_reason = exit_plan.action
-    return exit_plan.cash_delta
-
-
-def merge_split_maker_inventory(cycle: SplitMakerCycle) -> Decimal:
-    mergeable = min(cycle.inventory_up, cycle.inventory_down)
-    if mergeable <= 0:
-        return Decimal("0")
-    cycle.inventory_up -= mergeable
-    cycle.inventory_down -= mergeable
-    cycle.cash_flow += mergeable
-    if cycle.inventory_up == 0 and cycle.inventory_down == 0:
-        cycle.closed = True
-        cycle.close_reason = "cancel_and_merge"
-    return mergeable
-
-
-def open_split_maker_cycle(
-    bankroll: Decimal,
-    slug: str,
-    shares: Decimal,
-) -> tuple[Decimal, SplitMakerCycle | None]:
-    if shares <= 0:
-        raise ValueError("Split maker shares must be positive")
-    if bankroll < shares:
-        logger.info("SPLIT_MAKER_SKIP insufficient bankroll=%s split_cost=%s", bankroll, shares)
-        return bankroll, None
-    cycle = SplitMakerCycle(
-        slug=slug,
-        shares=shares,
-        cash_flow=-shares,
-        inventory_up=shares,
-        inventory_down=shares,
-    )
-    bankroll -= shares
-    logger.info(
-        "SPLIT_MAKER_SPLIT slug=%s shares=%s bankroll=%s",
-        slug,
-        shares,
-        bankroll.quantize(Decimal("0.0001")),
-    )
-    return bankroll, cycle
-
-
-def settle_split_maker_cycles(
-    cycles: list[SplitMakerCycle],
-    bankroll: Decimal,
-    now_ts: int | None = None,
-) -> Decimal:
-    current_ts = int(time.time()) if now_ts is None else now_ts
-    for cycle in cycles:
-        if cycle.closed:
-            continue
-        match = SLUG_PATTERN.match(cycle.slug)
-        if match is None or current_ts < int(match.group(2)) + 300:
-            continue
-        try:
-            winner = fetch_winner(cycle.slug)
-        except RequestException as exc:
-            logger.warning("SPLIT_MAKER_SETTLE_WAIT slug=%s fetch failed: %s", cycle.slug, exc)
-            continue
-        if winner not in {"UP", "DOWN"}:
-            continue
-        payout = cycle.inventory_up if winner == "UP" else cycle.inventory_down
-        bankroll += payout
-        cycle.cash_flow += payout
-        cycle.inventory_up = Decimal("0")
-        cycle.inventory_down = Decimal("0")
-        cycle.closed = True
-        cycle.close_reason = "inventory_settlement"
-        logger.info(
-            "SPLIT_MAKER_SETTLE slug=%s winner=%s payout=%s profit=%s bankroll=%s",
-            cycle.slug,
-            winner,
-            payout.quantize(Decimal("0.0001")),
-            cycle.cash_flow.quantize(Decimal("0.0001")),
-            bankroll.quantize(Decimal("0.0001")),
-        )
-    return bankroll
-
-
 def settle_paper_positions(positions: list[PaperPosition], slug: str, bankroll: Decimal) -> Decimal:
     unsettled = [position for position in positions if position.slug == slug and not position.settled]
     if not unsettled:
@@ -1407,6 +970,22 @@ def _seconds_to_end(market: Market, now: datetime) -> Decimal:
     return Decimal(str((market.end_time - now).total_seconds()))
 
 
+def polling_interval_for_seconds_left(
+    seconds_to_end: Decimal,
+    normal_interval: float,
+    final_poll_seconds: int,
+    final_poll_interval: float,
+) -> float:
+    if final_poll_seconds > 0 and Decimal("0") < seconds_to_end <= Decimal(final_poll_seconds):
+        return min(normal_interval, final_poll_interval)
+    return normal_interval
+
+
+def sleep_until_next_poll(interval: float, iteration_started_at: float) -> None:
+    remaining = interval - (time.monotonic() - iteration_started_at)
+    time.sleep(max(0.05, remaining))
+
+
 def watch() -> None:
     global _ACTIVE_NOTIFICATIONS
 
@@ -1421,13 +1000,9 @@ def watch() -> None:
     clob = ClobDataClient(args.clob_host, timeout=args.market_data_timeout)
     trader: ClobTradingClient | None = None
     price_client = SpotPriceClient(args.price_source, timeout=args.market_data_timeout, ws_proxy=args.ws_proxy)
-    price_to_beat_client = (
-        PolymarketPriceToBeatClient(
-            timeout=args.market_data_timeout,
-            proxy_url=args.price_to_beat_proxy or args.ws_proxy,
-        )
-        if args.official_price_to_beat
-        else None
+    price_to_beat_client = PolymarketPriceToBeatClient(
+        timeout=args.market_data_timeout,
+        proxy_url=args.price_to_beat_proxy or args.ws_proxy,
     )
     snapshot_writer = JsonlSnapshotWriter(Path(args.record_jsonl)) if args.record_jsonl else None
     slug = slug_from_value(args.slug)
@@ -1440,6 +1015,8 @@ def watch() -> None:
     signals_this_window = 0
     candidate_side: str | None = None
     candidate_confirmations = 0
+    market_reversal_candidate_side: str | None = None
+    market_reversal_confirmations = 0
     primary_side_this_window: str | None = None
     primary_cost_this_window = Decimal("0")
     primary_shares_this_window = Decimal("0")
@@ -1449,6 +1026,11 @@ def watch() -> None:
     confirmation_min_jump_usd = Decimal(args.confirmation_min_jump_usd)
     hedge_min_win_probability = Decimal(args.hedge_min_win_probability)
     hedge_fee_rate = Decimal(args.hedge_fee_rate)
+    hedge_entry_start_seconds = Decimal(str(args.hedge_entry_start_seconds))
+    hedge_entry_cutoff_seconds = Decimal(str(args.hedge_entry_cutoff_seconds))
+    hedge_market_reversal_threshold = Decimal(args.hedge_market_reversal_threshold)
+    hedge_max_entry = Decimal(args.hedge_max_entry)
+    hedge_max_live_notional = Decimal(args.hedge_max_live_notional)
     min_entry = Decimal(args.min_entry)
     max_entry = Decimal(args.max_entry)
     max_spread = Decimal(args.max_spread)
@@ -1474,37 +1056,12 @@ def watch() -> None:
     late_volatility_buffer_multiplier = Decimal(args.late_volatility_buffer_multiplier)
     order_size = Decimal(args.order_size)
     max_live_notional = Decimal(args.max_live_notional)
+    late_max_live_notional = Decimal(args.late_max_live_notional)
     decision_seconds_before_end = Decimal(str(args.decision_seconds_before_end))
     min_seconds_before_end = Decimal(str(args.min_seconds_before_end))
     paper_bankroll = Decimal(args.paper_bankroll)
     paper_stake = Decimal(args.paper_stake)
-    maker_shares = Decimal(args.maker_shares)
-    maker_target_pair_sum = Decimal(args.maker_target_pair_sum)
-    maker_fee_rate = Decimal(args.maker_fee_rate)
-    maker_max_inventory_loss_rate = Decimal(args.maker_max_inventory_loss_rate)
-    momentum_target_pair_sum = Decimal(args.momentum_target_pair_sum)
-    momentum_min_entry = Decimal(args.momentum_min_entry)
-    momentum_max_entry = Decimal(args.momentum_max_entry)
-    momentum_min_probability = Decimal(args.momentum_min_probability)
-    momentum_flow_probability_boost = Decimal(args.momentum_flow_probability_boost)
-    momentum_min_expected_roi = Decimal(args.momentum_min_expected_roi)
-    momentum_min_lead_bps = Decimal(args.momentum_min_lead_bps)
-    momentum_strong_expected_roi = Decimal(args.momentum_strong_expected_roi)
-    momentum_strong_lead_bps = Decimal(args.momentum_strong_lead_bps)
-    momentum_max_chase = Decimal(args.momentum_max_chase)
-    momentum_fee_rate = Decimal(args.momentum_fee_rate)
-    momentum_max_spread = Decimal(args.momentum_max_spread)
-    momentum_min_ask_sum = Decimal(args.momentum_min_ask_sum)
-    momentum_max_ask_sum = Decimal(args.momentum_max_ask_sum)
     paper_positions: list[PaperPosition] = []
-    split_maker_cycles: list[SplitMakerCycle] = []
-    split_maker_state: SplitMakerCycle | None = None
-    split_maker_groups_started = 0
-    maker_momentum_state = MakerMomentumProbe()
-    maker_momentum_triggers = 0
-    maker_momentum_prefilter_rejects = 0
-    maker_momentum_candidate_rejects = 0
-    maker_momentum_signals = 0
     consecutive_losses = 0
     pause_windows_remaining = 0
     risk_pause_active_for_window = False
@@ -1518,6 +1075,9 @@ def watch() -> None:
         "strategy": args.strategy,
         "max_live_orders": args.max_live_orders,
         "max_trades_per_window": args.max_trades,
+        "max_live_notional": str(max_live_notional),
+        "hedge_max_live_notional": str(hedge_max_live_notional),
+        "late_max_live_notional": str(late_max_live_notional),
         "probability_shrinkage": str(probability_shrinkage),
         "order_attempts": 0,
         "matched_orders": 0,
@@ -1569,6 +1129,7 @@ def watch() -> None:
             or args.max_trades < 1
             or order_size <= 0
             or max_live_notional <= 0
+            or late_max_live_notional <= 0
         ):
             raise ValueError(
                 "Live order size, per-window limit, and notional must be positive; session limit may be zero"
@@ -1585,6 +1146,18 @@ def watch() -> None:
             raise ValueError("Trend confirmation samples must be positive")
         if args.hedge_signal_confirmations < 1:
             raise ValueError("Hedge signal confirmations must be positive")
+        if args.hedge_market_reversal_confirmations < 1:
+            raise ValueError("Hedge market-reversal confirmations must be positive")
+        if hedge_entry_cutoff_seconds < 0 or hedge_entry_cutoff_seconds >= hedge_entry_start_seconds:
+            raise ValueError("Hedge entry cutoff must be non-negative and lower than its start")
+        if not Decimal("0.5") < hedge_market_reversal_threshold < Decimal("1"):
+            raise ValueError("Hedge market-reversal threshold must be between 0.5 and 1")
+        if not Decimal("0") < hedge_max_entry < Decimal("1"):
+            raise ValueError("Hedge maximum entry must be between zero and one")
+        if hedge_max_live_notional <= 0:
+            raise ValueError("Hedge maximum live notional must be positive")
+        if args.final_poll_seconds < 0 or args.final_poll_interval <= 0:
+            raise ValueError("Final polling window must be non-negative and interval positive")
         if not Decimal("0") <= hedge_min_win_probability <= Decimal("1"):
             raise ValueError("Hedge minimum win probability must be between zero and one")
         if hedge_fee_rate < 0:
@@ -1597,42 +1170,6 @@ def watch() -> None:
             raise ValueError("Maximum price-alignment difference must be non-negative")
         if args.max_boundary_sample_offset_ms < 0:
             raise ValueError("Maximum boundary-sample offset must be non-negative")
-        if (
-            maker_shares <= 0
-            or maker_target_pair_sum <= Decimal("1")
-            or maker_target_pair_sum >= Decimal("2")
-            or maker_fee_rate < 0
-            or maker_max_inventory_loss_rate < 0
-            or args.maker_start_delay_seconds < 0
-            or args.maker_min_rest_seconds < 0
-            or args.maker_reprice_ticks < 1
-            or args.maker_unpaired_timeout_seconds < 1
-            or not 0 < args.maker_force_exit_seconds < args.maker_cancel_seconds < 300
-        ):
-            raise ValueError("split_maker parameters are outside their allowed ranges")
-        if (
-            momentum_target_pair_sum <= Decimal("1")
-            or momentum_target_pair_sum >= Decimal("2")
-            or args.momentum_start_delay_seconds < 0
-            or args.momentum_min_rest_seconds < 0
-            or args.momentum_reprice_ticks < 1
-            or args.momentum_confirmation_samples < 1
-            or args.momentum_trigger_timeout_seconds < 1
-            or not 0 < args.momentum_min_seconds_before_end < 300
-            or not Decimal("0") < momentum_min_entry <= momentum_max_entry < Decimal("1")
-            or not Decimal("0") <= momentum_min_probability <= Decimal("1")
-            or not Decimal("0") <= momentum_flow_probability_boost <= Decimal("1")
-            or momentum_min_expected_roi < 0
-            or momentum_min_lead_bps < 0
-            or momentum_strong_expected_roi < momentum_min_expected_roi
-            or momentum_strong_lead_bps < momentum_min_lead_bps
-            or args.momentum_spot_samples < 1
-            or momentum_max_chase < 0
-            or momentum_fee_rate < 0
-            or momentum_max_spread < 0
-            or momentum_min_ask_sum > momentum_max_ask_sum
-        ):
-            raise ValueError("maker_momentum parameters are outside their allowed ranges")
         if args.late_entry_cutoff_seconds >= args.late_entry_start_seconds:
             raise ValueError("late_favorite entry cutoff must be lower than entry start")
         if not Decimal("0") < late_min_entry <= late_max_entry < Decimal("1"):
@@ -1679,6 +1216,8 @@ def watch() -> None:
         logger.info("DRY RUN mode. No orders will be submitted.")
 
     while time.time() < stop_at:
+        iteration_started_at = time.monotonic()
+        poll_interval = float(args.interval)
         now = datetime.now(timezone.utc)
         notifications.update_runtime()
         if notifications.process_commands():
@@ -1692,14 +1231,10 @@ def watch() -> None:
         notifications.maybe_send_settlements(fetch_winner)
         notifications.maybe_send_daily(fetch_winner)
         if args.paper_trading:
-            paper_bankroll = settle_split_maker_cycles(split_maker_cycles, paper_bankroll)
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
             if args.strategy == "late_favorite":
                 loss_pause = args.late_pause_windows_after_loss
                 loss_limit = 1 if loss_pause > 0 else 0
-            elif args.strategy in {"split_maker", "maker_momentum"}:
-                loss_pause = 0
-                loss_limit = 0
             else:
                 loss_pause = args.pause_windows_after_losses
                 loss_limit = args.max_consecutive_losses
@@ -1714,7 +1249,6 @@ def watch() -> None:
                 args.stop_when_bust
                 and paper_bankroll <= 0
                 and all(position.settled for position in paper_positions)
-                and all(cycle.closed for cycle in split_maker_cycles)
             ):
                 logger.info("PAPER_BUST bankroll=%s. Exiting.", paper_bankroll)
                 return
@@ -1729,31 +1263,21 @@ def watch() -> None:
             signals_this_window = 0
             candidate_side = None
             candidate_confirmations = 0
+            market_reversal_candidate_side = None
+            market_reversal_confirmations = 0
             primary_side_this_window = None
             primary_cost_this_window = Decimal("0")
             primary_shares_this_window = Decimal("0")
-            split_maker_state = None
-            maker_momentum_state = MakerMomentumProbe()
             if current_market is None:
                 notifications.notify_exception(
                     "读取 Polymarket 市场",
                     RuntimeError(f"暂时无法读取市场 {slug}"),
                     key=f"market:{slug}",
                 )
-                time.sleep(args.interval)
+                sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
             if _seconds_to_end(current_market, datetime.now(timezone.utc)) <= 0:
                 logger.info("Skipping expired window: %s", current_market.slug)
-                slug = next_5m_slug(current_market.slug)
-                current_market = None
-                continue
-            elapsed_since_start = -_seconds_to_start(current_market, datetime.now(timezone.utc))
-            if elapsed_since_start > Decimal(str(args.max_start_capture_delay)):
-                logger.info(
-                    "Skipping partial window %s: already started %ss ago",
-                    current_market.slug,
-                    int(elapsed_since_start),
-                )
                 slug = next_5m_slug(current_market.slug)
                 current_market = None
                 continue
@@ -1780,6 +1304,12 @@ def watch() -> None:
 
         seconds_to_start = _seconds_to_start(current_market, now)
         seconds_to_end = _seconds_to_end(current_market, now)
+        poll_interval = polling_interval_for_seconds_left(
+            seconds_to_end,
+            float(args.interval),
+            args.final_poll_seconds,
+            args.final_poll_interval,
+        )
         try:
             spot = price_client.btc_usd()
             if spot.observed_at is not None:
@@ -1792,7 +1322,7 @@ def watch() -> None:
             notifications.notify_exception("Chainlink BTC 行情", exc, key="spot-price")
             if last_spot_price is None:
                 logger.warning("Spot price unavailable and no cached price exists: %s", exc)
-                time.sleep(args.interval)
+                sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
             logger.warning("Spot price unavailable; reusing cached BTC/USD=%s: %s", last_spot_price, exc)
             spot = type("CachedSpotPrice", (), {"price": last_spot_price, "source": "CACHE"})()
@@ -1817,88 +1347,100 @@ def watch() -> None:
 
         if start_price is None:
             elapsed_since_start = -seconds_to_start
-            if start_capture_is_too_late(seconds_to_start, Decimal(str(args.max_start_capture_delay))):
-                logger.info(
-                    "Skipping %s: start-price capture is %ss late",
-                    current_market.slug,
-                    int(elapsed_since_start),
+            try:
+                price_to_beat = price_to_beat_client.fetch(
+                    current_market.event_start_time,
+                    current_market.end_time,
                 )
-                slug = next_5m_slug(current_market.slug)
-                current_market = None
-                time.sleep(args.interval)
-                continue
-            if spot.source == "CACHE":
-                logger.info("Waiting for fresh start price for %s", current_market.slug)
-                time.sleep(args.interval)
-                continue
-            if price_to_beat_client is not None:
-                try:
-                    price_to_beat = price_to_beat_client.fetch(
-                        current_market.event_start_time,
-                        current_market.end_time,
-                    )
-                except Exception as exc:
+            except Exception as exc:
+                logger.warning(
+                    "PRICE_ALIGNMENT_PENDING slug=%s error=%s",
+                    current_market.slug,
+                    exc,
+                )
+                if official_open_retry_expired(
+                    seconds_to_end,
+                    args.strategy,
+                    decision_seconds_before_end,
+                    Decimal(str(args.late_entry_start_seconds)),
+                ):
                     logger.warning(
-                        "PRICE_ALIGNMENT_PENDING slug=%s error=%s",
+                        "PRICE_ALIGNMENT_UNAVAILABLE slug=%s seconds_left=%s "
+                        "entry_phase_started=true; skipping window",
                         current_market.slug,
-                        exc,
+                        int(seconds_to_end),
                     )
-                    time.sleep(args.interval)
-                    continue
+                    slug = next_5m_slug(current_market.slug)
+                    current_market = None
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            else:
                 boundary_timestamp_ms = int(current_market.event_start_time.timestamp() * 1000)
+                boundary_spot = None
+                boundary_error: str | None = None
                 try:
                     boundary_spot = price_client.polymarket_chainlink_price_near(
                         boundary_timestamp_ms,
                         args.max_boundary_sample_offset_ms,
                     )
                 except Exception as exc:
-                    logger.error(
-                        "PRICE_ALIGNMENT_REJECTED slug=%s reason=boundary_sample error=%s",
+                    boundary_error = str(exc)
+                    logger.warning(
+                        "PRICE_ALIGNMENT_UNVERIFIED slug=%s reason=boundary_sample error=%s; "
+                        "using official openPrice",
                         current_market.slug,
                         exc,
                     )
-                    slug = next_5m_slug(current_market.slug)
-                    current_market = None
-                    time.sleep(args.interval)
-                    continue
-                assert boundary_spot.observed_at_ms is not None
-                boundary_offset_ms = boundary_spot.observed_at_ms - boundary_timestamp_ms
-                alignment_difference = boundary_spot.price - price_to_beat.open_price
-                if abs(alignment_difference) > max_price_alignment_difference:
-                    logger.error(
-                        "PRICE_ALIGNMENT_REJECTED slug=%s official=%s boundary_spot=%s "
-                        "difference=%s max_difference=%s boundary_offset_ms=%s",
+                alignment_status, alignment_difference = price_alignment_status(
+                    price_to_beat.open_price,
+                    boundary_spot.price if boundary_spot is not None else None,
+                    max_price_alignment_difference,
+                )
+                boundary_offset_ms = (
+                    boundary_spot.observed_at_ms - boundary_timestamp_ms
+                    if boundary_spot is not None and boundary_spot.observed_at_ms is not None
+                    else None
+                )
+                if alignment_status == "MISMATCH_WARNING":
+                    logger.warning(
+                        "PRICE_ALIGNMENT_MISMATCH slug=%s official=%s boundary_spot=%s "
+                        "difference=%s max_difference=%s boundary_offset_ms=%s; "
+                        "using official openPrice",
                         current_market.slug,
                         price_to_beat.open_price,
-                        boundary_spot.price,
+                        boundary_spot.price if boundary_spot is not None else None,
                         alignment_difference,
                         max_price_alignment_difference,
                         boundary_offset_ms,
                     )
-                    slug = next_5m_slug(current_market.slug)
-                    current_market = None
-                    time.sleep(args.interval)
-                    continue
                 start_price = price_to_beat.open_price
                 alignment_record = {
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                     "slug": current_market.slug,
-                    "status": "VERIFIED",
+                    "status": alignment_status,
                     "official_price_to_beat": str(start_price),
-                    "boundary_chainlink_price": str(boundary_spot.price),
-                    "boundary_chainlink_timestamp_ms": boundary_spot.observed_at_ms,
+                    "boundary_chainlink_price": (
+                        str(boundary_spot.price) if boundary_spot is not None else None
+                    ),
+                    "boundary_chainlink_timestamp_ms": (
+                        boundary_spot.observed_at_ms if boundary_spot is not None else None
+                    ),
                     "boundary_offset_ms": boundary_offset_ms,
-                    "alignment_difference": str(alignment_difference),
+                    "alignment_difference": (
+                        str(alignment_difference) if alignment_difference is not None else None
+                    ),
+                    "boundary_error": boundary_error,
                     "capture_delay_seconds": str(elapsed_since_start),
                     "endpoint_timestamp_ms": price_to_beat.timestamp_ms,
                     "endpoint_incomplete": price_to_beat.incomplete,
                 }
                 logger.info(
-                    "PRICE_ALIGNMENT VERIFIED slug=%s official=%s boundary_spot=%s "
+                    "PRICE_ALIGNMENT %s slug=%s official=%s boundary_spot=%s "
                     "difference=%s boundary_offset_ms=%s capture_delay=%ss",
+                    alignment_status,
                     current_market.slug,
                     start_price,
-                    boundary_spot.price,
+                    boundary_spot.price if boundary_spot is not None else None,
                     alignment_difference,
                     boundary_offset_ms,
                     elapsed_since_start,
@@ -1908,23 +1450,14 @@ def watch() -> None:
                     alignment_path.parent.mkdir(parents=True, exist_ok=True)
                     with alignment_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(alignment_record, ensure_ascii=True) + "\n")
-            else:
-                start_price = spot.price
             prices = [spot.price]
             logger.info("Captured start_price=%s for %s", start_price, current_market.slug)
         else:
             prices.append(spot.price)
 
-        sigma = estimate_sigma_per_sqrt_second(prices, Decimal(args.interval), fallback_sigma)
+        sigma = estimate_sigma_per_sqrt_second(prices, Decimal(str(poll_interval)), fallback_sigma)
         fair = btc_up_probability(start_price, spot.price, max(Decimal("0"), seconds_to_end), sigma)
-        up_book: OrderBookSnapshot | None = None
-        down_book: OrderBookSnapshot | None = None
-        if args.strategy in {"split_maker", "maker_momentum"}:
-            up_book, down_book = outcome_books(clob, current_market)
-            up_quote = up_book.quote if up_book is not None else None
-            down_quote = down_book.quote if down_book is not None else None
-        else:
-            up_quote, down_quote = quote_outcomes(clob, current_market)
+        up_quote, down_quote = quote_outcomes(clob, current_market)
         up_ask = up_quote.ask if up_quote else None
         down_ask = down_quote.ask if down_quote else None
         action = choose_theoretical_action(fair.probability_up, up_ask, down_ask, edge_threshold)
@@ -1961,368 +1494,6 @@ def watch() -> None:
 
         if (
             args.auto_trade
-            and args.strategy == "split_maker"
-            and not risk_pause_active_for_window
-            and not notifications.trading_paused
-            and args.paper_trading
-            and up_book is not None
-            and down_book is not None
-        ):
-            now_monotonic = time.monotonic()
-            elapsed_seconds = Decimal("300") - seconds_to_end
-            if (
-                split_maker_state is None
-                and signals_this_window == 0
-                and elapsed_seconds >= Decimal(str(args.maker_start_delay_seconds))
-                and seconds_to_end > Decimal(str(args.maker_cancel_seconds))
-            ):
-                paper_bankroll, split_maker_state = open_split_maker_cycle(
-                    paper_bankroll,
-                    current_market.slug,
-                    maker_shares,
-                )
-                if split_maker_state is not None:
-                    split_maker_cycles.append(split_maker_state)
-                    split_maker_groups_started += 1
-                    signals_this_window += 1
-
-            state = split_maker_state
-            if state is not None and not state.closed:
-                tick_size = Decimal(current_market.minimum_tick_size)
-                no_side_filled = state.up_sold_price is None and state.down_sold_price is None
-                if seconds_to_end <= Decimal(str(args.maker_cancel_seconds)) and no_side_filled:
-                    merged = merge_split_maker_inventory(state)
-                    paper_bankroll += merged
-                    logger.info(
-                        "SPLIT_MAKER_CANCEL_MERGE slug=%s merged=%s profit=%s bankroll=%s",
-                        state.slug,
-                        merged,
-                        state.cash_flow.quantize(Decimal("0.0001")),
-                        paper_bankroll.quantize(Decimal("0.0001")),
-                    )
-                else:
-                    plan = plan_split_maker_quotes(
-                        fair.probability_up,
-                        up_book,
-                        down_book,
-                        maker_target_pair_sum,
-                        tick_size,
-                    )
-                    if plan is not None:
-                        desired_up = plan.up_price
-                        desired_down = plan.down_price
-                        if state.down_sold_price is not None:
-                            desired_up = max(
-                                desired_up,
-                                round_up_to_tick(
-                                    maker_target_pair_sum - state.down_sold_price,
-                                    tick_size,
-                                ),
-                            )
-                        if state.up_sold_price is not None:
-                            desired_down = max(
-                                desired_down,
-                                round_up_to_tick(
-                                    maker_target_pair_sum - state.up_sold_price,
-                                    tick_size,
-                                ),
-                            )
-                        reprice_distance = tick_size * Decimal(args.maker_reprice_ticks)
-                        if state.inventory_up > 0 and (
-                            state.up_quote is None or abs(desired_up - state.up_quote) >= reprice_distance
-                        ):
-                            state.up_quote = desired_up
-                            state.up_quote_started_at = now_monotonic
-                            logger.info("SPLIT_MAKER_QUOTE slug=%s side=UP price=%s", state.slug, desired_up)
-                        if state.inventory_down > 0 and (
-                            state.down_quote is None or abs(desired_down - state.down_quote) >= reprice_distance
-                        ):
-                            state.down_quote = desired_down
-                            state.down_quote_started_at = now_monotonic
-                            logger.info("SPLIT_MAKER_QUOTE slug=%s side=DOWN price=%s", state.slug, desired_down)
-
-                    if state.inventory_up > 0 and maker_quote_crossed(
-                        up_book,
-                        state.up_quote,
-                        state.up_quote_started_at,
-                        now_monotonic,
-                        args.maker_min_rest_seconds,
-                    ):
-                        proceeds = record_split_maker_fill(state, "UP", state.up_quote)
-                        paper_bankroll += proceeds
-                        logger.info(
-                            "SPLIT_MAKER_FILL slug=%s side=UP price=%s proceeds=%s bankroll=%s",
-                            state.slug,
-                            state.up_quote,
-                            proceeds.quantize(Decimal("0.0001")),
-                            paper_bankroll.quantize(Decimal("0.0001")),
-                        )
-                    if state.inventory_down > 0 and maker_quote_crossed(
-                        down_book,
-                        state.down_quote,
-                        state.down_quote_started_at,
-                        now_monotonic,
-                        args.maker_min_rest_seconds,
-                    ):
-                        proceeds = record_split_maker_fill(state, "DOWN", state.down_quote)
-                        paper_bankroll += proceeds
-                        logger.info(
-                            "SPLIT_MAKER_FILL slug=%s side=DOWN price=%s proceeds=%s bankroll=%s",
-                            state.slug,
-                            state.down_quote,
-                            proceeds.quantize(Decimal("0.0001")),
-                            paper_bankroll.quantize(Decimal("0.0001")),
-                        )
-
-                    if state.closed:
-                        logger.info(
-                            "SPLIT_MAKER_LOCKED slug=%s profit=%s bankroll=%s",
-                            state.slug,
-                            state.cash_flow.quantize(Decimal("0.0001")),
-                            paper_bankroll.quantize(Decimal("0.0001")),
-                        )
-                    else:
-                        one_side_filled = (state.up_sold_price is None) != (state.down_sold_price is None)
-                        if one_side_filled:
-                            if state.unpaired_since is None:
-                                state.unpaired_since = now_monotonic
-                            exit_plan = split_maker_best_exit(
-                                state,
-                                up_book,
-                                down_book,
-                                maker_fee_rate,
-                            )
-                            if exit_plan is not None:
-                                projected_profit = state.cash_flow + exit_plan.cash_delta
-                                projected_loss_rate = max(
-                                    Decimal("0"),
-                                    -projected_profit / state.shares,
-                                )
-                                timed_out = (
-                                    now_monotonic - state.unpaired_since
-                                    >= args.maker_unpaired_timeout_seconds
-                                )
-                                force_exit = seconds_to_end <= Decimal(str(args.maker_force_exit_seconds))
-                                loss_limit_hit = projected_loss_rate >= maker_max_inventory_loss_rate
-                                if timed_out or force_exit or loss_limit_hit:
-                                    cash_delta = apply_split_maker_exit(state, exit_plan)
-                                    paper_bankroll += cash_delta
-                                    logger.info(
-                                        "SPLIT_MAKER_EXIT slug=%s action=%s price=%s fee=%s "
-                                        "profit=%s bankroll=%s trigger=%s",
-                                        state.slug,
-                                        exit_plan.action,
-                                        exit_plan.price.quantize(Decimal("0.0001")),
-                                        exit_plan.fee.quantize(Decimal("0.0001")),
-                                        state.cash_flow.quantize(Decimal("0.0001")),
-                                        paper_bankroll.quantize(Decimal("0.0001")),
-                                        (
-                                            "loss_limit"
-                                            if loss_limit_hit
-                                            else "timeout"
-                                            if timed_out
-                                            else "time_cutoff"
-                                        ),
-                                    )
-
-        if (
-            args.auto_trade
-            and args.strategy == "maker_momentum"
-            and signals_this_window == 0
-            and not risk_pause_active_for_window
-            and not notifications.trading_paused
-            and args.paper_trading
-            and up_book is not None
-            and down_book is not None
-        ):
-            now_monotonic = time.monotonic()
-            elapsed_seconds = Decimal("300") - seconds_to_end
-            state = maker_momentum_state
-            if (
-                elapsed_seconds >= Decimal(str(args.momentum_start_delay_seconds))
-                and seconds_to_end >= Decimal(str(args.momentum_min_seconds_before_end))
-            ):
-                tick_size = Decimal(current_market.minimum_tick_size)
-                if state.candidate_side is None:
-                    plan = plan_split_maker_quotes(
-                        fair.probability_up,
-                        up_book,
-                        down_book,
-                        momentum_target_pair_sum,
-                        tick_size,
-                    )
-                    if plan is not None:
-                        reprice_distance = tick_size * Decimal(args.momentum_reprice_ticks)
-                        if state.up_quote is None or abs(plan.up_price - state.up_quote) >= reprice_distance:
-                            state.up_quote = plan.up_price
-                            state.up_quote_started_at = now_monotonic
-                        if state.down_quote is None or abs(plan.down_price - state.down_quote) >= reprice_distance:
-                            state.down_quote = plan.down_price
-                            state.down_quote_started_at = now_monotonic
-
-                    up_crossed = maker_quote_crossed(
-                        up_book,
-                        state.up_quote,
-                        state.up_quote_started_at,
-                        now_monotonic,
-                        args.momentum_min_rest_seconds,
-                    )
-                    down_crossed = maker_quote_crossed(
-                        down_book,
-                        state.down_quote,
-                        state.down_quote_started_at,
-                        now_monotonic,
-                        args.momentum_min_rest_seconds,
-                    )
-                    if up_crossed != down_crossed:
-                        trigger_side = "UP" if up_crossed else "DOWN"
-                        trigger_price = state.up_quote if up_crossed else state.down_quote
-                        assert trigger_price is not None
-                        maker_momentum_triggers += 1
-                        prefilter = evaluate_maker_momentum_signal(
-                            market=current_market,
-                            side=trigger_side,
-                            trigger_price=trigger_price,
-                            probability_up=fair.probability_up,
-                            up_quote=up_quote,
-                            down_quote=down_quote,
-                            seconds_to_end=seconds_to_end,
-                            recent_spot_prices=prices,
-                            start_price=start_price,
-                            min_seconds_before_end=Decimal(
-                                str(args.momentum_min_seconds_before_end)
-                            ),
-                            min_entry=momentum_min_entry,
-                            max_entry=momentum_max_entry,
-                            min_probability=momentum_min_probability,
-                            flow_probability_boost=momentum_flow_probability_boost,
-                            min_expected_roi=momentum_min_expected_roi,
-                            min_lead_bps=momentum_min_lead_bps,
-                            spot_samples=args.momentum_spot_samples,
-                            max_chase=momentum_max_chase,
-                            fee_rate=momentum_fee_rate,
-                            max_spread=momentum_max_spread,
-                            min_ask_sum=momentum_min_ask_sum,
-                            max_ask_sum=momentum_max_ask_sum,
-                            strong_expected_roi=momentum_strong_expected_roi,
-                            strong_lead_bps=momentum_strong_lead_bps,
-                        )
-                        if prefilter.signal is None:
-                            maker_momentum_prefilter_rejects += 1
-                            logger.info(
-                                "MAKER_MOMENTUM_PREFILTER_REJECT slug=%s side=%s "
-                                "trigger=%s reason=%s",
-                                current_market.slug,
-                                trigger_side,
-                                trigger_price,
-                                prefilter.rejection_reason,
-                            )
-                            maker_momentum_state = MakerMomentumProbe()
-                            state = maker_momentum_state
-                        else:
-                            state.candidate_side = trigger_side
-                            state.trigger_price = trigger_price
-                            state.candidate_started_at = now_monotonic
-                            state.confirmations = 0
-                            logger.info(
-                                "MAKER_MOMENTUM_TRIGGER slug=%s side=%s trigger=%s "
-                                "seconds_left=%s prefilter=passed",
-                                current_market.slug,
-                                state.candidate_side,
-                                state.trigger_price,
-                                int(seconds_to_end),
-                            )
-
-                if (
-                    state.candidate_side is not None
-                    and state.trigger_price is not None
-                    and state.candidate_started_at is not None
-                ):
-                    candidate_book = up_book if state.candidate_side == "UP" else down_book
-                    candidate_bid = candidate_book.quote.bid
-                    if candidate_bid is not None and candidate_bid >= state.trigger_price:
-                        state.confirmations += 1
-                    else:
-                        state.confirmations = 0
-
-                    evaluation = None
-                    if state.confirmations >= args.momentum_confirmation_samples:
-                        evaluation = evaluate_maker_momentum_signal(
-                            market=current_market,
-                            side=state.candidate_side,
-                            trigger_price=state.trigger_price,
-                            probability_up=fair.probability_up,
-                            up_quote=up_quote,
-                            down_quote=down_quote,
-                            seconds_to_end=seconds_to_end,
-                            recent_spot_prices=prices,
-                            start_price=start_price,
-                            min_seconds_before_end=Decimal(
-                                str(args.momentum_min_seconds_before_end)
-                            ),
-                            min_entry=momentum_min_entry,
-                            max_entry=momentum_max_entry,
-                            min_probability=momentum_min_probability,
-                            flow_probability_boost=momentum_flow_probability_boost,
-                            min_expected_roi=momentum_min_expected_roi,
-                            min_lead_bps=momentum_min_lead_bps,
-                            spot_samples=args.momentum_spot_samples,
-                            max_chase=momentum_max_chase,
-                            fee_rate=momentum_fee_rate,
-                            max_spread=momentum_max_spread,
-                            min_ask_sum=momentum_min_ask_sum,
-                            max_ask_sum=momentum_max_ask_sum,
-                            strong_expected_roi=momentum_strong_expected_roi,
-                            strong_lead_bps=momentum_strong_lead_bps,
-                        )
-                    signal = evaluation.signal if evaluation is not None else None
-                    if signal is not None:
-                        signals_this_window = window_trade_count_after_attempt(
-                            signals_this_window,
-                            live=False,
-                        )
-                        maker_momentum_signals += 1
-                        logger.info(
-                            "MAKER_MOMENTUM_SIGNAL slug=%s confirmations=%s reason=%s",
-                            current_market.slug,
-                            state.confirmations,
-                            signal.reason,
-                        )
-                        paper_bankroll = open_paper_position(
-                            paper_positions,
-                            paper_bankroll,
-                            current_market.slug,
-                            signal,
-                            paper_stake,
-                            momentum_fee_rate,
-                        )
-                    elif evaluation is not None:
-                        maker_momentum_candidate_rejects += 1
-                        logger.info(
-                            "MAKER_MOMENTUM_REJECT slug=%s side=%s confirmations=%s reason=%s",
-                            current_market.slug,
-                            state.candidate_side,
-                            state.confirmations,
-                            evaluation.rejection_reason,
-                        )
-                        maker_momentum_state = MakerMomentumProbe()
-                    elif (
-                        now_monotonic - state.candidate_started_at
-                        >= args.momentum_trigger_timeout_seconds
-                    ):
-                        maker_momentum_candidate_rejects += 1
-                        logger.info(
-                            "MAKER_MOMENTUM_REJECT slug=%s side=%s confirmations=%s "
-                            "reason=confirmation_timeout",
-                            current_market.slug,
-                            state.candidate_side,
-                            state.confirmations,
-                        )
-                        maker_momentum_state = MakerMomentumProbe()
-
-        if (
-            args.auto_trade
-            and args.strategy not in {"split_maker", "maker_momentum"}
             and signals_this_window < strategy_trade_limit(args.strategy, args.max_trades)
             and not risk_pause_active_for_window
             and not notifications.trading_paused
@@ -2381,37 +1552,74 @@ def watch() -> None:
                 if primary_side_this_window is not None and (
                     signal is None or signal.side != primary_side_this_window
                 ):
-                    protective_signal = choose_protective_hedge_signal(
+                    model_protective_signal = choose_protective_hedge_signal(
                         current_market,
                         primary_side_this_window,
                         fair.probability_up,
                         up_quote,
                         down_quote,
                         seconds_to_end,
-                        decision_seconds_before_end,
-                        min_seconds_before_end,
-                        max_entry,
+                        hedge_entry_start_seconds,
+                        hedge_entry_cutoff_seconds,
+                        hedge_max_entry,
                         edge_threshold,
                         hedge_min_win_probability,
                         max_spread,
                         min_ask_sum,
                         max_ask_sum,
                     )
-                    signal = protective_signal
+                    market_protective_signal = choose_market_reversal_hedge_signal(
+                        current_market,
+                        primary_side_this_window,
+                        up_quote,
+                        down_quote,
+                        seconds_to_end,
+                        hedge_entry_start_seconds,
+                        hedge_entry_cutoff_seconds,
+                        hedge_market_reversal_threshold,
+                        hedge_max_entry,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                    )
+                    if market_protective_signal is None:
+                        market_reversal_candidate_side = None
+                        market_reversal_confirmations = 0
+                    elif market_protective_signal.side == market_reversal_candidate_side:
+                        market_reversal_confirmations += 1
+                    else:
+                        market_reversal_candidate_side = market_protective_signal.side
+                        market_reversal_confirmations = 1
+                    if market_protective_signal is not None and (
+                        market_reversal_confirmations
+                        < args.hedge_market_reversal_confirmations
+                    ):
+                        logger.info(
+                            "MARKET_REVERSAL_PENDING side=%s confirmations=%s/%s bid_threshold=%s",
+                            market_protective_signal.side,
+                            market_reversal_confirmations,
+                            args.hedge_market_reversal_confirmations,
+                            hedge_market_reversal_threshold,
+                        )
+                        market_protective_signal = None
+                    elif market_protective_signal is not None:
+                        market_reversal_candidate_side = None
+                        market_reversal_confirmations = 0
+                    signal = market_protective_signal or model_protective_signal
             if signal is not None:
                 if notifications.trading_paused:
                     logger.warning("AUTO_SIGNAL blocked because Telegram trading pause is active.")
                     candidate_side = None
                     candidate_confirmations = 0
-                    time.sleep(args.interval)
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 if spot_age > Decimal(str(args.max_spot_age)):
                     logger.info("SIGNAL_REJECTED stale_spot_age=%.1fs", float(spot_age))
                     candidate_side = None
                     candidate_confirmations = 0
-                    time.sleep(args.interval)
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
-                is_protective_hedge = signal.reason.startswith("protective_hedge")
+                is_protective_hedge = signal.reason.startswith("protective_")
                 if (
                     args.strategy == "fair_value_edge"
                     and not is_protective_hedge
@@ -2429,13 +1637,13 @@ def watch() -> None:
                     )
                     candidate_side = None
                     candidate_confirmations = 0
-                    time.sleep(args.interval)
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 jump_reset, adverse_jump, jump_threshold = adverse_jump_exceeds_dynamic_threshold(
                     prices,
                     signal.side,
                     fair.sigma_per_sqrt_second,
-                    Decimal(str(args.interval)),
+                    Decimal(str(poll_interval)),
                     confirmation_jump_sigma_multiplier,
                     confirmation_min_jump_usd,
                 )
@@ -2449,7 +1657,9 @@ def watch() -> None:
                     candidate_side = None
                     candidate_confirmations = 0
                 required_confirmations = (
-                    args.hedge_signal_confirmations
+                    1
+                    if signal.reason.startswith("protective_market_reversal")
+                    else args.hedge_signal_confirmations
                     if is_protective_hedge
                     else args.late_signal_confirmations
                     if args.strategy == "late_favorite"
@@ -2467,7 +1677,7 @@ def watch() -> None:
                         candidate_confirmations,
                         max(1, required_confirmations),
                     )
-                    time.sleep(args.interval)
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 candidate_side = None
                 candidate_confirmations = 0
@@ -2488,7 +1698,7 @@ def watch() -> None:
                             hedge_risk.max_loss_before.quantize(Decimal("0.0001")),
                             hedge_risk.max_loss_after.quantize(Decimal("0.0001")),
                         )
-                        time.sleep(args.interval)
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     signal = AutoTradeSignal(
                         side=signal.side,
@@ -2514,13 +1724,14 @@ def watch() -> None:
                         live=False,
                     )
                     if args.paper_trading:
+                        paper_fee_rate = late_fee_rate if args.strategy == "late_favorite" else Decimal("0")
                         paper_bankroll = open_paper_position(
                             paper_positions,
                             paper_bankroll,
                             current_market.slug,
                             signal,
                             paper_stake,
-                            late_fee_rate if args.strategy == "late_favorite" else Decimal("0"),
+                            paper_fee_rate,
                         )
                         if args.stop_when_bust and paper_bankroll <= 0:
                             logger.info("PAPER_BUST bankroll=%s. Exiting after open position.", paper_bankroll)
@@ -2537,20 +1748,27 @@ def watch() -> None:
                             primary_shares_this_window = order_size
                 else:
                     notional = signal.price * order_size
+                    live_notional_cap = (
+                        hedge_max_live_notional
+                        if is_protective_hedge
+                        else late_max_live_notional
+                        if args.strategy == "late_favorite"
+                        else max_live_notional
+                    )
                     if not live_session_should_continue(live_orders_submitted, args.max_live_orders):
                         logger.warning("LIVE ORDER LIMIT reached=%s. Exiting.", live_orders_submitted)
                         return
-                    if notional > max_live_notional:
+                    if notional > live_notional_cap:
                         logger.warning(
                             "LIVE SIGNAL SKIPPED notional=%s exceeds hard cap=%s; continuing.",
                             notional,
-                            max_live_notional,
+                            live_notional_cap,
                         )
-                        time.sleep(args.interval)
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     if notifications.trading_paused:
                         logger.warning("LIVE ORDER blocked by Telegram trading pause before submission.")
-                        time.sleep(args.interval)
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     order_record = {
                         "attempted_at": datetime.now(timezone.utc).isoformat(),
@@ -2601,7 +1819,7 @@ def watch() -> None:
                             live_summary["status"] = "completed"
                             write_live_summary()
                             return
-                        time.sleep(args.interval)
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     live_summary["response"] = response
                     order_record["response"] = response
@@ -2631,7 +1849,7 @@ def watch() -> None:
                             live_summary["status"] = "completed"
                             write_live_summary()
                             return
-                        time.sleep(args.interval)
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     live_orders_matched += 1
                     if primary_side_this_window is None:
@@ -2665,32 +1883,11 @@ def watch() -> None:
                 candidate_side = None
                 candidate_confirmations = 0
 
-        time.sleep(args.interval)
+        sleep_until_next_poll(poll_interval, iteration_started_at)
 
     if args.paper_trading:
-        paper_bankroll = settle_split_maker_cycles(split_maker_cycles, paper_bankroll)
         paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
         open_positions = sum(1 for position in paper_positions if not position.settled)
-        if args.strategy == "split_maker":
-            closed_cycles = [cycle for cycle in split_maker_cycles if cycle.closed]
-            logger.info(
-                "SPLIT_MAKER_SUMMARY started=%s completed=%s open=%s realized_profit=%s",
-                split_maker_groups_started,
-                len(closed_cycles),
-                len(split_maker_cycles) - len(closed_cycles),
-                sum((cycle.cash_flow for cycle in closed_cycles), Decimal("0")).quantize(
-                    Decimal("0.0001")
-                ),
-            )
-        if args.strategy == "maker_momentum":
-            logger.info(
-                "MAKER_MOMENTUM_SUMMARY triggers=%s prefilter_rejects=%s "
-                "candidate_rejects=%s signals=%s",
-                maker_momentum_triggers,
-                maker_momentum_prefilter_rejects,
-                maker_momentum_candidate_rejects,
-                maker_momentum_signals,
-            )
         logger.info(
             "PAPER_SUMMARY bankroll=%s positions=%s open_positions=%s",
             paper_bankroll.quantize(Decimal("0.0001")),

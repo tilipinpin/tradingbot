@@ -26,7 +26,6 @@ exec "$PYTHON" -u -m src.watch_updown \
   --strategy fair_value_edge \
   --price-source POLYMARKET_CHAINLINK \
   --ws-proxy socks5h://127.0.0.1:7898 \
-  --official-price-to-beat \
   --price-to-beat-proxy socks5h://127.0.0.1:7898 \
   --price-alignment-jsonl "$DATA_DIR/live_price_alignment.jsonl" \
   --max-price-alignment-difference 0.50 \
@@ -41,11 +40,19 @@ exec "$PYTHON" -u -m src.watch_updown \
   --hedge-signal-confirmations 2 \
   --hedge-min-win-probability 0.62 \
   --hedge-fee-rate 0.07 \
+  --hedge-entry-start-seconds 20 \
+  --hedge-entry-cutoff-seconds 1 \
+  --hedge-market-reversal-threshold 0.65 \
+  --hedge-market-reversal-confirmations 2 \
+  --hedge-max-entry 0.99 \
+  --hedge-max-live-notional 5.00 \
+  --final-poll-seconds 30 \
+  --final-poll-interval 1 \
   --min-win-probability 0.62 \
   --probability-shrinkage 1.00 \
   --edge 0.06 \
-  --min-entry 0.55 \
-  --low-entry-cutoff 0.50 \
+  --min-entry 0.50 \
+  --low-entry-cutoff 0.55 \
   --low-entry-min-win-probability 0.68 \
   --low-entry-confirmation-samples 3 \
   --max-entry 0.78 \
@@ -56,5 +63,6 @@ exec "$PYTHON" -u -m src.watch_updown \
   --max-trades 2 \
   --max-live-orders 0 \
   --max-live-notional 3.75 \
+  --late-max-live-notional 4.70 \
   --live-order-type FOK \
   --live-summary-json "$DATA_DIR/live_trade_summary.json"

@@ -21,6 +21,7 @@ from src.telegram_notify import (
     format_window_settlement_message,
     model_probability,
     position_value_breakdown,
+    positions_for_market,
     sanitize_sensitive_text,
     settlement_key,
     settlement_values,
@@ -676,7 +677,7 @@ def test_today_pnl_uses_persisted_per_order_settlements(tmp_path) -> None:
     assert "可用 pUSD: 22.0000 pUSD" in message
 
 
-def test_positions_command_uses_deposit_wallet_data_api(monkeypatch, tmp_path) -> None:
+def test_positions_command_shows_only_current_market(monkeypatch, tmp_path) -> None:
     class PositionResponse:
         def raise_for_status(self) -> None:
             return None
@@ -684,8 +685,20 @@ def test_positions_command_uses_deposit_wallet_data_api(monkeypatch, tmp_path) -
         def json(self) -> list[dict]:
             return [
                 {
-                    "title": "Bitcoin Up or Down - test",
+                    "title": "Bitcoin Up or Down - current",
+                    "eventSlug": "btc-updown-5m-current",
                     "outcome": "Up",
+                    "size": 5,
+                    "avgPrice": 0.6,
+                    "curPrice": 0.7,
+                    "currentValue": 3.5,
+                    "cashPnl": 0.5,
+                    "redeemable": False,
+                },
+                {
+                    "title": "Bitcoin Up or Down - historical",
+                    "eventSlug": "btc-updown-5m-old",
+                    "outcome": "Down",
                     "size": 5,
                     "avgPrice": 0.6,
                     "curPrice": 1,
@@ -714,15 +727,29 @@ def test_positions_command_uses_deposit_wallet_data_api(monkeypatch, tmp_path) -
         state_path=tmp_path / "state.json",
         wallet_address="0xdeposit",
     )
+    service.update_runtime(slug="btc-updown-5m-current")
     service._command_poller = StubCommandPoller([TelegramCommand(1, "/positions")], offset=2)
 
     service.process_commands()
 
     assert captured["params"]["user"] == "0xdeposit"
     message = session.calls[0][1]["text"]
-    assert "当前持仓（1 项）" in message
+    assert "当前窗口持仓（1 项）" in message
+    assert "市场: btc-updown-5m-current" in message
     assert "UP | 5.0000 份" in message
-    assert "盈亏 +2.0000 pUSD | 可赎回" in message
+    assert "盈亏 +0.5000 pUSD" in message
+    assert "historical" not in message
+    assert "可赎回" not in message
+
+
+def test_positions_for_market_rejects_history_and_unknown_runtime_market() -> None:
+    positions = [
+        {"eventSlug": "current", "outcome": "Up"},
+        {"slug": "old", "outcome": "Down", "redeemable": True},
+    ]
+
+    assert positions_for_market(positions, "current") == [positions[0]]
+    assert positions_for_market(positions, None) == []
 
 
 def test_status_command_reports_health_and_trading_pause(tmp_path) -> None:
@@ -782,7 +809,7 @@ def test_paper_strategy_switch_is_queued_and_activated_next_window(tmp_path) -> 
     assert "生效市场: btc-updown-5m-2" in session.calls[-1][1]["text"]
 
 
-def test_live_strategy_switch_rejects_paper_only_strategy(tmp_path) -> None:
+def test_live_strategy_switch_allows_late_favorite(tmp_path) -> None:
     session = FakeSession()
     service = TradingNotificationService(
         notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
@@ -797,11 +824,11 @@ def test_live_strategy_switch_rejects_paper_only_strategy(tmp_path) -> None:
 
     service._queue_strategy("late_favorite")
 
-    assert service.pending_strategy is None
-    assert "仅允许纸面或 dry-run" in session.calls[-1][1]["text"]
+    assert service.pending_strategy == "late_favorite"
+    assert "尾盘高置信度" in session.calls[-1][1]["text"]
 
 
-def test_strategy_override_persists_for_paper_and_is_ignored_for_live(tmp_path) -> None:
+def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
     state = tmp_path / "state.json"
     paper = TradingNotificationService(
         notifier=TelegramNotifier(None, None),
@@ -838,7 +865,7 @@ def test_strategy_override_persists_for_paper_and_is_ignored_for_live(tmp_path) 
     )
 
     assert restarted_paper.resolve_effective_strategy() == "late_favorite"
-    assert restarted_live.resolve_effective_strategy() == "fair_value_edge"
+    assert restarted_live.resolve_effective_strategy() == "late_favorite"
 
 
 def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path) -> None:

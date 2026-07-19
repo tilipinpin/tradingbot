@@ -256,6 +256,24 @@ def position_value_breakdown(positions: list[dict[str, Any]]) -> tuple[Decimal, 
     return active_value, redeemable_value
 
 
+def positions_for_market(
+    positions: list[dict[str, Any]],
+    market_slug: str | None,
+) -> list[dict[str, Any]]:
+    if not market_slug:
+        return []
+    return [
+        item
+        for item in positions
+        if market_slug
+        in {
+            str(item.get("eventSlug") or ""),
+            str(item.get("marketSlug") or ""),
+            str(item.get("slug") or ""),
+        }
+    ]
+
+
 def model_probability(order: dict[str, Any]) -> Decimal | None:
     match = PROBABILITY_PATTERN.search(str(order.get("reason") or ""))
     if match is None:
@@ -1418,8 +1436,15 @@ class TradingNotificationService:
         if positions is None:
             self._send_command_reply("📋 持仓查询失败\n请检查 Data API、代理和网络连接。")
             return
+        market_slug = str(self._runtime.get("slug") or "")
+        if not market_slug:
+            self._send_command_reply("📋 当前窗口持仓\n机器人尚未识别当前 5 分钟市场。")
+            return
+        positions = positions_for_market(positions, market_slug)
         if not positions:
-            self._send_command_reply("📋 当前持仓\n暂无大于 0.01 份的持仓。")
+            self._send_command_reply(
+                f"📋 当前窗口持仓\n市场: {market_slug}\n暂无大于 0.01 份的持仓。"
+            )
             return
 
         total_value = sum(
@@ -1431,7 +1456,8 @@ class TradingNotificationService:
             Decimal("0"),
         )
         lines = [
-            f"📋 当前持仓（{len(positions)} 项）",
+            f"📋 当前窗口持仓（{len(positions)} 项）",
+            f"市场: {market_slug}",
             f"当前总价值: {_money(total_value)}",
             f"持仓现金盈亏: {total_pnl:+.4f} pUSD",
         ]

@@ -28,16 +28,10 @@ INTERNAL_CALLBACK_COMMANDS = {
 }
 STRATEGY_LABELS = {
     "fair_value_edge": "公允价值差",
-    "split_maker": "Split 双边做市",
-    "maker_momentum": "Maker 触价动量",
     "late_favorite": "尾盘高置信度",
 }
-PAPER_ONLY_STRATEGIES = {
-    "split_maker",
-    "maker_momentum",
-    "late_favorite",
-}
-LIVE_STRATEGIES = {"fair_value_edge"}
+PAPER_ONLY_STRATEGIES: set[str] = set()
+LIVE_STRATEGIES = {"fair_value_edge", "late_favorite"}
 DEFAULT_STRATEGY = "__default__"
 BUTTON_COMMANDS = {
     "📈 查看余额": "/balance",
@@ -92,7 +86,7 @@ def strategy_selection_markup(
     rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
     rows.extend(
         [
-            [{"text": "↩️ 跟随启动参数", "callback_data": f"strategy:select:{DEFAULT_STRATEGY}"}],
+            [{"text": "↩️ 恢复启动策略", "callback_data": f"strategy:select:{DEFAULT_STRATEGY}"}],
             [{"text": "取消", "callback_data": "strategy:cancel"}],
         ]
     )

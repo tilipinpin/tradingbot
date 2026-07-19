@@ -133,9 +133,9 @@ python -m src.watch_updown \
   --hedge-fee-rate 0.07 \
   --probability-shrinkage 1.00 \
   --market-data-timeout 3 \
-  --min-entry 0.55 \
+  --min-entry 0.50 \
   --max-entry 0.78 \
-  --low-entry-cutoff 0.50 \
+  --low-entry-cutoff 0.55 \
   --low-entry-min-win-probability 0.68 \
   --low-entry-confirmation-samples 3 \
   --max-trades 2 \
@@ -146,8 +146,9 @@ python -m src.watch_updown \
 默认不限制会话累计订单数，每个 5 分钟窗口最多成交 2 单；每单仍受 5 份和
 3.75 pUSD 本金上限约束。订单被拒、请求异常或返回非 `matched` 状态时会写入摘要并继续，
 失败尝试不占用当前窗口的成交额度。
-`fair_value_edge` 的正常入场只接受 `0.55–0.78` 的盘口价格并要求至少 62% 模型胜率；
-其中 `0.65` 以上继续按价格提高所需 edge。
+`fair_value_edge` 在 `0.55–0.78` 的盘口价格要求至少 62% 模型胜率，其中 `0.65`
+以上继续按价格提高所需 edge。`0.50–0.55` 使用严格档，要求至少 68% 模型胜率，且最近
+3 次 Chainlink 采样持续支持所选方向、相对开盘价距离没有收窄。
 默认 `--duration 0` 持续运行，直到手动停止；可传正秒数设置时限，也可传
 `--max-live-orders N` 临时恢复累计订单上限。
 实盘进程结束后会写入 `data/live_trade_summary.json`，可运行
@@ -189,7 +190,7 @@ Telegram 会发送以下全部通知；Discord 只发送其中的启动、结算
 
 - `/balance`：读取可用 pUSD、活跃持仓价值、待赎回价值和估算总权益。
 - `/pnl`：读取本地成交账本和逐单结算记录，汇总今日胜率、毛盈亏、手续费估算和净盈亏。
-- `/positions`：用 `DEPOSIT_WALLET`/`FUNDER_ADDRESS` 查询 Polymarket Data API 当前持仓。
+- `/positions`：用 `DEPOSIT_WALLET`/`FUNDER_ADDRESS` 查询 Polymarket Data API，只显示机器人当前 5 分钟窗口的持仓，不混入历史待赎回仓位。
 - `/status`：查看进程心跳、运行时间、策略、窗口和累计尝试/成交。
 - `/strategy`：查看当前策略并通过内联按钮选择下个窗口使用的策略。
 - `/stop`：立即阻止提交新订单并持久化暂停状态；不会撤销已经提交或成交的订单。
@@ -202,10 +203,8 @@ Telegram 会发送以下全部通知；Discord 只发送其中的启动、结算
 `setChatMenuButton` 保留输入框旁的 `/` 命令菜单作为备用。Reply Keyboard 不用于频道。
 
 策略选择需要二次确认，并持久化到 `data/telegram_daily_state.json`，只在下一个完整
-5 分钟窗口生效。纸面和 dry-run 模式可选择全部策略；实盘 Telegram 选择器目前只开放
-`fair_value_edge`；`split_maker`、`maker_momentum` 和 `late_favorite`
-标记为仅纸面。选择
-“跟随启动参数”可清除 Telegram 策略覆盖。
+5 分钟窗口生效。纸面、dry-run 和实盘 Telegram 选择器均提供 `fair_value_edge` 与
+`late_favorite`。选择“恢复启动策略”可清除 Telegram 策略覆盖，回到启动命令指定的策略。
 
 首次启用命令轮询时会丢弃启动前积压的旧消息，避免历史 `/stop` 或 `/restart` 被误执行。
 控制状态和 Telegram offset 也保存在 `data/telegram_daily_state.json`，所以进程重启后不会重复执行指令。
@@ -248,76 +247,7 @@ python -m src.watch_updown \
   --pause-windows-after-losses 2
 ```
 
-`split_maker` 是库存型纸面做市策略。每个完整窗口开盘10秒后模拟将 5 pUSD Split 为
-5 UP + 5 DOWN，再按模型概率和 1.02 的双边目标收入挂出两笔 maker 卖单。模拟挂单至少
-静置4秒，且订单簿 best bid 必须实际推进到报价才视为成交，不会因为报价等于 best ask
-就假定成交：
-
-```bash
-python -m src.watch_updown \
-  --slug btc-updown-5m-<timestamp> \
-  --duration 28800 \
-  --interval 2 \
-  --auto-trade \
-  --strategy split_maker \
-  --price-source POLYMARKET_CHAINLINK \
-  --ws-proxy socks5h://127.0.0.1:7898 \
-  --paper-trading \
-  --paper-bankroll 20 \
-  --maker-shares 5 \
-  --maker-target-pair-sum 1.02 \
-  --maker-min-rest-seconds 4 \
-  --maker-unpaired-timeout-seconds 10 \
-  --maker-cancel-seconds 60 \
-  --maker-force-exit-seconds 45 \
-  --maker-max-inventory-loss-rate 0.01
-```
-
-两边成交后，锁定利润为 `shares × (UP成交价 + DOWN成交价 - 1)`。如果只成交一边，
-程序使用完整深度和 taker fee 比较“卖出剩余库存”与“买回已卖方向后 Merge”，在单边
-等待10秒、预计库存损失达到1%或进入最后45秒时采用现金回收更高的方案。最后60秒若
-尚未成交任何一边，则取消模拟挂单并 Merge 全部库存。窗口结束仍有库存时按正式赢家
-结算。该实现只用于保守纸面建模；真实 Relayer Split/Merge、post-only 下单、撤单和 User
-WebSocket 成交跟踪完成前，实盘会拒绝选择此策略。
-
-`maker_momentum` v2 是从 Split 做市测试中拆出的实验性纸面策略。它不实际 Split，也不承担
-双边库存；程序只维护虚拟 maker 卖价，当 best bid 在挂单静置后真正触达该价格时，将触价
-方向视为一次订单流确认。触发会先经过完整预筛，无效触发立即释放候选槽并重新报价，不再
-占用10秒等待。候选方向还必须是盘口 favorite、Chainlink 最近3次采样同向、相对开盘价领先
-至少0.5 bps，并且追价不超过0.06：
-
-```bash
-python -m src.watch_updown \
-  --slug btc-updown-5m-<timestamp> \
-  --duration 28800 \
-  --interval 2 \
-  --auto-trade \
-  --strategy maker_momentum \
-  --price-source POLYMARKET_CHAINLINK \
-  --ws-proxy socks5h://127.0.0.1:7898 \
-  --paper-trading \
-  --paper-bankroll 20 \
-  --paper-stake 1 \
-  --stop-when-bust \
-  --momentum-min-entry 0.60 \
-  --momentum-max-entry 0.88 \
-  --momentum-confirmation-samples 1 \
-  --momentum-trigger-timeout-seconds 8 \
-  --momentum-min-probability 0.55 \
-  --momentum-flow-probability-boost 0.10 \
-  --momentum-min-expected-roi 0.03 \
-  --momentum-min-lead-bps 0.50 \
-  --momentum-strong-expected-roi 0.04 \
-  --momentum-strong-lead-bps 2.00 \
-  --momentum-max-chase 0.06
-```
-
-订单流触发暂按最多0.10的概率增益做纸面假设，调整后仍需达到3%费后预期 ROI。为避免用
-一次确认换取低质量频率，每笔还必须满足“费后预期 ROI 至少4%”或“BTC 领先至少2 bps”
-其中一项；每个窗口最多一笔。该增益必须通过更长时间的独立样本重新校准，不能从短期回放
-直接推断为真实胜率。正式接入 Market/User WebSocket 和验证滑点前，实盘会拒绝此策略。
-
-`late_favorite` v5 是仅纸面的尾盘高置信度策略。它在剩余 55–8 秒观察市场 favorite，
+`late_favorite` v5 是可用于纸面或实盘的尾盘高置信度策略。它在剩余 55–8 秒观察市场 favorite，
 只在市场与 Chainlink 模型同向时考虑入场，并要求 BTC 相对开盘价保留动态价格安全距离。
 同一窗口最多一单；亏损结算后下一个窗口继续评估，不启用连败暂停。纸面余额和盈亏会按
 Polymarket 加密市场公式扣除 taker fee：
@@ -361,14 +291,17 @@ python -m src.watch_updown \
 1.0 bps，也要覆盖剩余时间波动率的 0.5 倍。相对近期极值的回撤不得超过 1.50 bps 和领先幅度
 的 50%。两个 outcome 的 bid/ask 通过一次批量请求读取，避免快速行情中多次请求产生交叉
 快照；内部趋势样本通过后只需一次完整信号，避免重复确认耗尽尾盘窗口。策略不会在同一盘口重复加仓。累计足够纸面
-样本并验证费后盈亏和回撤前，程序拒绝实盘启用；高命中率不等于保证盈利。
+样本并验证费后盈亏和回撤仍然必要；高命中率不等于保证盈利。实盘每个窗口最多一单，
+5 份订单的独立本金硬上限为 4.70 pUSD。
 
-`fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在原始模型概率相对盘口 ask 有足够 edge 时入场。实盘使用 `--probability-shrinkage 1.00`，但波动率始终不低于长期基准 `0.00005/√秒`，防止短时安静行情制造虚假的极端概率。正常入场要求所选方向 ask 至少为 0.55、最近三次 Chainlink 采样均在同一结算方向且距开盘价没有收窄，并连续出现两次信号；超过动态波动阈值的单次反向跳动会清空确认。首单成交后，第二单既可在相同条件下顺势加仓，也可在模型连续两次翻向且 edge 达标时作为反向保护。保护单使用首单实际成交成本和份数，按保护限价及手续费分别模拟 UP、DOWN 结算，只有组合最大亏损严格下降才会提交。每笔仍需避开最后 25 秒、过期现货价格、宽 spread、交叉报价和异常 ask 总价；高价或临近结算的入场还需要额外 edge。
+`fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在原始模型概率相对盘口 ask 有足够 edge 时入场。实盘使用 `--probability-shrinkage 1.00`，但波动率始终不低于长期基准 `0.00005/√秒`，防止短时安静行情制造虚假的极端概率。正常入场要求所选方向 ask 至少为 0.55、最近三次 Chainlink 采样均在同一结算方向且距开盘价没有收窄，并连续出现两次信号；超过动态波动阈值的单次反向跳动会清空确认。首单成交后，第二单既可在相同条件下顺势加仓，也可在剩余 20–1 秒作为反向保护。保护由模型连续两次翻向，或反方向盘口 bid 连续两次达到 0.65 触发；最终仍使用首单实际成交成本和份数，按保护限价及手续费分别模拟 UP、DOWN 结算，只有组合最大亏损严格下降才会提交。正常首单继续避开最后 25 秒；最后 30 秒的行情和盘口轮询加快至每秒一次。
 
-生产启动器启用 `--official-price-to-beat`：每个窗口使用 Polymarket 发布的官方
-`openPrice`，并与本地缓存中最接近精确开盘毫秒时间戳的 Chainlink RTDS 样本核对。
-默认要求时间偏移不超过 1000 ms、价格差不超过 0.50 USD；官方值尚未发布、接口限流、
-边界样本缺失或校验不一致时不会退回到开盘后的实时价，而是等待或跳过整个窗口。
+每个窗口强制使用 Polymarket 发布的官方 `openPrice`，并与本地缓存中最接近精确开盘
+毫秒时间戳的 Chainlink RTDS 样本核对。本地现货价格不能替代官方开盘价。
+默认用 1000 ms 和 0.50 USD 作为边界审计阈值。边界 Chainlink 样本缺失或价差超限时
+记录告警但仍使用官方 `openPrice`。官方值会持续重试到策略入场阶段开始，
+`fair_value_edge` 为剩余 90 秒，尾盘策略为其配置的入场起点，届时仍未取得才跳过窗口。
+真正入场前仍要求实时 Chainlink 报价不超过 20 秒，旧缓存不会用于下单。
 
 实盘的每窗口交易上限只统计确认 `matched` 的订单。FOK 拒绝、提交异常、余额或名义金额检查失败都不会占用成交名额，后续有效信号仍会继续尝试。`--duration 0` 表示无限运行。
 
