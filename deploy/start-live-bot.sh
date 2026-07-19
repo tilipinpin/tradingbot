@@ -38,13 +38,15 @@ exec "$PYTHON" -u -m src.watch_updown \
   --confirmation-jump-sigma-multiplier 1.25 \
   --confirmation-min-jump-usd 3.00 \
   --hedge-signal-confirmations 2 \
+  --hedge-confirmation-min-seconds 5 \
+  --hedge-max-price-worsening 0.05 \
   --hedge-min-win-probability 0.62 \
   --hedge-fee-rate 0.07 \
   --hedge-entry-start-seconds 20 \
   --hedge-entry-cutoff-seconds 1 \
   --hedge-market-reversal-threshold 0.65 \
-  --hedge-market-reversal-confirmations 2 \
   --hedge-max-entry 0.99 \
+  --hedge-max-spread 0.10 \
   --hedge-max-live-notional 5.00 \
   --final-poll-seconds 30 \
   --final-poll-interval 1 \
@@ -56,7 +58,7 @@ exec "$PYTHON" -u -m src.watch_updown \
   --low-entry-min-win-probability 0.68 \
   --low-entry-confirmation-samples 3 \
   --max-entry 0.78 \
-  --max-spread 0.04 \
+  --max-spread 0.05 \
   --min-ask-sum 0.90 \
   --max-ask-sum 1.10 \
   --order-size 5 \
@@ -64,5 +66,5 @@ exec "$PYTHON" -u -m src.watch_updown \
   --max-live-orders 0 \
   --max-live-notional 3.75 \
   --late-max-live-notional 4.70 \
-  --live-order-type FOK \
+  --live-order-type FAK \
   --live-summary-json "$DATA_DIR/live_trade_summary.json"

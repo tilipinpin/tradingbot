@@ -21,25 +21,51 @@ def estimate_sigma_per_sqrt_second(
     prices: list[Decimal],
     interval_seconds: Decimal,
     fallback_sigma: Decimal,
+    sample_times: list[float] | None = None,
 ) -> Decimal:
     if len(prices) < 3:
         return fallback_sigma
 
-    returns: list[float] = []
-    for previous, current in zip(prices, prices[1:]):
+    if sample_times is not None and len(sample_times) != len(prices):
+        raise ValueError("sample_times must match prices")
+
+    timed_returns: list[tuple[float, float]] = []
+    for index, (previous, current) in enumerate(zip(prices, prices[1:])):
         if previous <= 0 or current <= 0:
             continue
-        returns.append(math.log(float(current / previous)))
+        elapsed = (
+            sample_times[index + 1] - sample_times[index]
+            if sample_times is not None
+            else float(interval_seconds)
+        )
+        if elapsed <= 0:
+            continue
+        timed_returns.append((math.log(float(current / previous)), elapsed))
 
-    if len(returns) < 2:
+    if len(timed_returns) < 2:
         return fallback_sigma
 
-    mean = sum(returns) / len(returns)
-    variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
-    sigma_per_interval = Decimal(str(math.sqrt(variance)))
-    if interval_seconds <= 0:
+    if sample_times is None:
+        returns = [value for value, _ in timed_returns]
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+        sigma_per_interval = Decimal(str(math.sqrt(variance)))
+        if interval_seconds <= 0:
+            return fallback_sigma
+        sigma = sigma_per_interval / Decimal(str(math.sqrt(float(interval_seconds))))
+    else:
+        total_seconds = sum(elapsed for _, elapsed in timed_returns)
+        if total_seconds <= 0:
+            return fallback_sigma
+        drift_per_second = sum(value for value, _ in timed_returns) / total_seconds
+        variance_rate = sum(
+            (value - drift_per_second * elapsed) ** 2
+            for value, elapsed in timed_returns
+        ) / total_seconds
+        sigma = Decimal(str(math.sqrt(max(0.0, variance_rate))))
+
+    if sigma <= 0:
         return fallback_sigma
-    sigma = sigma_per_interval / Decimal(str(math.sqrt(float(interval_seconds))))
     # Treat the fallback as a long-run volatility floor. A quiet handful of
     # samples must not collapse the denominator and create false 0%/100% odds.
     return max(sigma, fallback_sigma)

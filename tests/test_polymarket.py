@@ -2,6 +2,7 @@ from decimal import Decimal
 import json
 import time
 
+import pytest
 from requests import HTTPError
 
 from src.config import _slug
@@ -29,7 +30,9 @@ from src.price_signal import (
 )
 from src.strategy import build_buy_intent
 from src.watch_updown import (
+    SignalConfirmationState,
     account_new_paper_settlements,
+    advance_signal_confirmation,
     adverse_jump_exceeds_dynamic_threshold,
     consume_pause_window,
     evaluate_protective_hedge_risk,
@@ -487,6 +490,53 @@ def test_live_fok_order_uses_v2_order_type(monkeypatch) -> None:
     assert calls[-1][2] == "FOK"
 
 
+def test_live_fak_order_uses_v2_order_type(monkeypatch) -> None:
+    calls = []
+
+    class OrderArgs:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class OrderType:
+        GTC = "GTC"
+        FAK = "FAK"
+
+    class Options:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class Client:
+        def create_and_post_order(self, order_args, options=None, order_type=None):
+            calls.append((order_args.kwargs, options.kwargs, order_type))
+            return {
+                "success": True,
+                "status": "matched",
+                "orderID": "0x1",
+                "makingAmount": "1.25",
+                "takingAmount": "2.5",
+            }
+
+    monkeypatch.setattr(
+        "src.polymarket._import_order_types",
+        lambda: (OrderArgs, OrderType, Options, "BUY"),
+    )
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+    trader._client_v2 = True
+
+    response = trader.buy_limit(
+        token_id="up",
+        price=Decimal("0.50"),
+        size=Decimal("5"),
+        tick_size="0.01",
+        neg_risk=False,
+        order_type="FAK",
+    )
+
+    assert response["takingAmount"] == "2.5"
+    assert calls[-1][2] == "FAK"
+
+
 def test_live_fok_sell_uses_sell_side(monkeypatch) -> None:
     calls = []
 
@@ -555,6 +605,9 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.min_entry == "0.50"
     assert args.trend_confirmation_samples == 3
     assert args.hedge_signal_confirmations == 2
+    assert args.hedge_confirmation_min_seconds == 5.0
+    assert args.hedge_max_price_worsening == "0.05"
+    assert args.hedge_max_spread == "0.10"
     assert args.hedge_min_win_probability == "0.62"
     assert args.hedge_fee_rate == "0.07"
     assert args.max_entry == "0.78"
@@ -564,6 +617,8 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.low_entry_min_win_probability == "0.68"
     assert args.low_entry_confirmation_samples == 3
     assert args.probability_shrinkage == "1.00"
+    assert args.max_spread == "0.05"
+    assert args.live_order_type == "FAK"
     assert args.late_entry_start_seconds == 55
     assert args.late_entry_cutoff_seconds == 8
     assert args.late_min_entry == "0.65"
@@ -589,6 +644,53 @@ def test_live_response_requires_conclusive_match() -> None:
     assert live_response_is_matched({"success": True, "status": "matched", "orderID": "0x1"}) is True
     assert live_response_is_matched({"success": True, "status": "live", "orderID": "0x1"}) is False
     assert live_response_is_matched({"success": False, "status": "matched", "orderID": "0x1"}) is False
+    assert live_response_is_matched(
+        {
+            "success": True,
+            "status": "matched",
+            "orderID": "0x1",
+            "makingAmount": "1.25",
+            "takingAmount": "2.5",
+        },
+        require_fill_amounts=True,
+    ) is True
+    assert live_response_is_matched(
+        {"success": True, "status": "matched", "orderID": "0x1"},
+        require_fill_amounts=True,
+    ) is False
+
+
+def test_protective_confirmation_requires_count_duration_direction_and_price() -> None:
+    state = SignalConfirmationState()
+    first = AutoTradeSignal("DOWN", "down", Decimal("0.40"), "protective_hedge edge=0.10")
+    improved = AutoTradeSignal("DOWN", "down", Decimal("0.38"), "protective_hedge edge=0.12")
+
+    ready, _ = advance_signal_confirmation(state, first, 100.0, 2, 5.0, Decimal("0.05"))
+    assert ready is False
+    ready, _ = advance_signal_confirmation(state, improved, 101.0, 2, 5.0, Decimal("0.05"))
+    assert ready is False
+    ready, _ = advance_signal_confirmation(state, improved, 105.0, 2, 5.0, Decimal("0.05"))
+    assert ready is True
+
+    opposite = AutoTradeSignal("UP", "up", Decimal("0.40"), "protective_hedge edge=0.10")
+    ready, _ = advance_signal_confirmation(state, opposite, 106.0, 2, 5.0, Decimal("0.05"))
+    assert ready is False
+    assert state.side == "UP"
+    assert state.confirmations == 1
+
+
+def test_protective_confirmation_restarts_after_price_worsens() -> None:
+    state = SignalConfirmationState()
+    first = AutoTradeSignal("DOWN", "down", Decimal("0.40"), "protective_hedge edge=0.10")
+    worse = AutoTradeSignal("DOWN", "down", Decimal("0.46"), "protective_hedge edge=0.08")
+
+    advance_signal_confirmation(state, first, 100.0, 2, 5.0, Decimal("0.05"))
+    ready, _ = advance_signal_confirmation(state, worse, 106.0, 2, 5.0, Decimal("0.05"))
+
+    assert ready is False
+    assert state.confirmations == 1
+    assert state.started_at == 106.0
+    assert state.initial_price == Decimal("0.46")
 
 
 def test_only_matched_live_orders_consume_window_trade_slots() -> None:
@@ -770,6 +872,36 @@ def test_sigma_estimate_never_falls_below_long_run_floor() -> None:
     )
 
     assert sigma == floor
+
+
+def test_sigma_estimate_uses_actual_sample_timing() -> None:
+    prices = [Decimal("100"), Decimal("101"), Decimal("100")]
+    floor = Decimal("0.000001")
+
+    fixed_interval = estimate_sigma_per_sqrt_second(
+        prices,
+        Decimal("1"),
+        floor,
+    )
+    actual_timing = estimate_sigma_per_sqrt_second(
+        prices,
+        Decimal("1"),
+        floor,
+        [100.0, 104.0, 108.0],
+    )
+
+    assert actual_timing < fixed_interval
+    assert actual_timing > floor
+
+
+def test_sigma_estimate_rejects_mismatched_sample_times() -> None:
+    with pytest.raises(ValueError, match="sample_times"):
+        estimate_sigma_per_sqrt_second(
+            [Decimal("100"), Decimal("101"), Decimal("102")],
+            Decimal("1"),
+            Decimal("0.000001"),
+            [100.0, 101.0],
+        )
 
 
 def test_adverse_jump_uses_dynamic_volatility_threshold() -> None:

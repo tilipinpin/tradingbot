@@ -21,13 +21,15 @@ Chainlink boundary sample is audited against 1000 ms and 0.50 USD thresholds;
 missing or mismatched audit samples emit warnings but no longer reject a window.
 Fresh realtime Chainlink data is still required before any order signal.
 
-The live fair-value launcher also requires a selected ask of at least 0.55,
-three non-narrowing same-side spot samples, and a long-run volatility floor of
-0.00005 per square-root second. Adverse jumps reset signal confirmation. After
-the first fill, the second slot may either add with the trend or hedge a
-confirmed reversal. Protective entries use a separate 20-to-1-second window;
-they can be triggered by two model confirmations or by two consecutive
-opposite-side market bids of at least 0.65. A hedge is submitted only when a
+The live fair-value launcher uses actual sample timing for volatility and a
+long-run floor of 0.00005 per square-root second. Primary entries allow a 0.05
+maximum spread. After the first FAK fill, the second slot may add in the same
+direction during the normal entry window or protect a reversal in the separate
+20-to-1-second window. Protection allows a
+0.10 spread and requires at least two valid confirmations spanning five
+seconds, an unchanged direction, qualifying edge at every confirmation, and no
+more than 0.05 ask-price worsening from the first confirmation. A hedge is
+submitted only when a
 conservative two-outcome portfolio calculation, including estimated fees,
 strictly reduces the maximum loss relative to leaving the first fill
 unprotected. Polling accelerates to a one-second cadence for the final 30
