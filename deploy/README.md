@@ -28,7 +28,11 @@ direction during the normal entry window or protect a reversal in the separate
 20-to-1-second window. Protection allows a
 0.10 spread and requires at least two valid confirmations spanning five
 seconds, an unchanged direction, qualifying edge at every confirmation, and no
-more than 0.05 ask-price worsening from the first confirmation. A hedge is
+more than 0.05 ask-price worsening from the first confirmation. Protection starts
+immediately after the first matched fill and stops with three seconds remaining.
+BTC must cross the official openPrice by the larger of $2 or a five-second
+volatility buffer, and the confirming samples must not narrow back toward the
+open. A hedge is
 submitted only when a
 conservative two-outcome portfolio calculation, including estimated fees,
 strictly reduces the maximum loss relative to leaving the first fill

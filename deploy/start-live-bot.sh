@@ -42,8 +42,10 @@ exec "$PYTHON" -u -m src.watch_updown \
   --hedge-max-price-worsening 0.05 \
   --hedge-min-win-probability 0.62 \
   --hedge-fee-rate 0.07 \
-  --hedge-entry-start-seconds 20 \
-  --hedge-entry-cutoff-seconds 1 \
+  --hedge-entry-start-seconds 300 \
+  --hedge-entry-cutoff-seconds 3 \
+  --hedge-open-cross-min-usd 2.00 \
+  --hedge-open-cross-sigma-multiplier 1.00 \
   --hedge-market-reversal-threshold 0.65 \
   --hedge-max-entry 0.99 \
   --hedge-max-spread 0.10 \

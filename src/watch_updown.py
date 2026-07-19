@@ -122,8 +122,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hedge-max-price-worsening", default="0.05")
     parser.add_argument("--hedge-min-win-probability", default="0.62")
     parser.add_argument("--hedge-fee-rate", default="0.07")
-    parser.add_argument("--hedge-entry-start-seconds", type=int, default=20)
-    parser.add_argument("--hedge-entry-cutoff-seconds", type=int, default=1)
+    parser.add_argument("--hedge-entry-start-seconds", type=int, default=300)
+    parser.add_argument("--hedge-entry-cutoff-seconds", type=int, default=3)
+    parser.add_argument("--hedge-open-cross-min-usd", default="2.00")
+    parser.add_argument("--hedge-open-cross-sigma-multiplier", default="1.00")
     parser.add_argument("--hedge-market-reversal-threshold", default="0.65")
     parser.add_argument("--hedge-max-entry", default="0.99")
     parser.add_argument("--hedge-max-spread", default="0.10")
@@ -333,6 +335,53 @@ def recent_spot_samples_support_side(
         return all(price > start_price for price in recent) and recent[-1] >= recent[0]
     if side == "DOWN":
         return all(price < start_price for price in recent) and recent[-1] <= recent[0]
+    return False
+
+
+def protective_open_cross_buffer(
+    start_price: Decimal,
+    sigma_per_sqrt_second: Decimal,
+    confirmation_seconds: Decimal,
+    minimum_buffer_usd: Decimal,
+    sigma_multiplier: Decimal,
+) -> Decimal:
+    if (
+        start_price <= 0
+        or sigma_per_sqrt_second < 0
+        or confirmation_seconds < 0
+        or minimum_buffer_usd < 0
+        or sigma_multiplier < 0
+    ):
+        raise ValueError("Protective open-cross inputs must be non-negative and start price positive")
+    volatility_buffer = (
+        start_price
+        * sigma_per_sqrt_second
+        * Decimal(str(math.sqrt(float(confirmation_seconds))))
+        * sigma_multiplier
+    )
+    return max(minimum_buffer_usd, volatility_buffer)
+
+
+def protective_spot_confirms_open_cross(
+    prices: list[Decimal],
+    start_price: Decimal,
+    side: str,
+    buffer_usd: Decimal,
+) -> bool:
+    if not prices or buffer_usd < 0:
+        return False
+    current = prices[-1]
+    previous = prices[-2] if len(prices) >= 2 else None
+    if side == "UP":
+        threshold = start_price + buffer_usd
+        if current < threshold:
+            return False
+        return previous is None or previous < threshold or current >= previous
+    if side == "DOWN":
+        threshold = start_price - buffer_usd
+        if current > threshold:
+            return False
+        return previous is None or previous > threshold or current <= previous
     return False
 
 
@@ -1097,6 +1146,8 @@ def watch() -> None:
     hedge_fee_rate = Decimal(args.hedge_fee_rate)
     hedge_entry_start_seconds = Decimal(str(args.hedge_entry_start_seconds))
     hedge_entry_cutoff_seconds = Decimal(str(args.hedge_entry_cutoff_seconds))
+    hedge_open_cross_min_usd = Decimal(args.hedge_open_cross_min_usd)
+    hedge_open_cross_sigma_multiplier = Decimal(args.hedge_open_cross_sigma_multiplier)
     hedge_market_reversal_threshold = Decimal(args.hedge_market_reversal_threshold)
     hedge_max_entry = Decimal(args.hedge_max_entry)
     hedge_max_spread = Decimal(args.hedge_max_spread)
@@ -1155,6 +1206,10 @@ def watch() -> None:
         "hedge_signal_confirmations": args.hedge_signal_confirmations,
         "hedge_confirmation_min_seconds": hedge_confirmation_min_seconds,
         "hedge_max_price_worsening": str(hedge_max_price_worsening),
+        "hedge_entry_start_seconds": str(hedge_entry_start_seconds),
+        "hedge_entry_cutoff_seconds": str(hedge_entry_cutoff_seconds),
+        "hedge_open_cross_min_usd": str(hedge_open_cross_min_usd),
+        "hedge_open_cross_sigma_multiplier": str(hedge_open_cross_sigma_multiplier),
         "order_attempts": 0,
         "matched_orders": 0,
         "order": None,
@@ -1224,6 +1279,8 @@ def watch() -> None:
             raise ValueError("Hedge signal confirmations must be at least two")
         if hedge_confirmation_min_seconds < 0 or hedge_max_price_worsening < 0:
             raise ValueError("Hedge confirmation duration and price worsening must not be negative")
+        if hedge_open_cross_min_usd < 0 or hedge_open_cross_sigma_multiplier < 0:
+            raise ValueError("Hedge open-cross thresholds must not be negative")
         if hedge_entry_cutoff_seconds < 0 or hedge_entry_cutoff_seconds >= hedge_entry_start_seconds:
             raise ValueError("Hedge entry cutoff must be non-negative and lower than its start")
         if not Decimal("0.5") < hedge_market_reversal_threshold < Decimal("1"):
@@ -1611,7 +1668,7 @@ def watch() -> None:
                     late_volatility_buffer_multiplier,
                 )
             else:
-                signal = choose_fair_value_edge_signal(
+                normal_signal = choose_fair_value_edge_signal(
                     current_market,
                     fair.probability_up,
                     up_quote,
@@ -1633,9 +1690,8 @@ def watch() -> None:
                     args.low_entry_confirmation_samples,
                     probability_shrinkage,
                 )
-                if primary_side_this_window is not None and (
-                    signal is None or signal.side != primary_side_this_window
-                ):
+                signal = normal_signal
+                if primary_side_this_window is not None:
                     model_protective_signal = choose_protective_hedge_signal(
                         current_market,
                         primary_side_this_window,
@@ -1689,7 +1745,44 @@ def watch() -> None:
                                     f"required_edge={edge_threshold.quantize(Decimal('0.0001'))}"
                                 ),
                             )
-                    signal = market_protective_signal or model_protective_signal
+                    protective_signal = market_protective_signal or model_protective_signal
+                    if protective_signal is not None:
+                        open_cross_buffer = protective_open_cross_buffer(
+                            start_price,
+                            fair.sigma_per_sqrt_second,
+                            Decimal(str(hedge_confirmation_min_seconds)),
+                            hedge_open_cross_min_usd,
+                            hedge_open_cross_sigma_multiplier,
+                        )
+                        if not protective_spot_confirms_open_cross(
+                            prices,
+                            start_price,
+                            protective_signal.side,
+                            open_cross_buffer,
+                        ):
+                            logger.info(
+                                "HEDGE_PENDING_OPEN_CROSS side=%s spot=%s open=%s buffer=%s",
+                                protective_signal.side,
+                                spot.price,
+                                start_price,
+                                open_cross_buffer.quantize(Decimal("0.01")),
+                            )
+                            protective_signal = None
+                        else:
+                            protective_signal = AutoTradeSignal(
+                                side=protective_signal.side,
+                                token_id=protective_signal.token_id,
+                                price=protective_signal.price,
+                                reason=(
+                                    f"{protective_signal.reason} "
+                                    f"open_cross_buffer={open_cross_buffer.quantize(Decimal('0.01'))} "
+                                    f"spot={spot.price} official_open={start_price}"
+                                ),
+                            )
+                    if protective_signal is not None:
+                        signal = protective_signal
+                    elif normal_signal is None or normal_signal.side != primary_side_this_window:
+                        signal = None
             if signal is not None:
                 if notifications.trading_paused:
                     logger.warning("AUTO_SIGNAL blocked because Telegram trading pause is active.")

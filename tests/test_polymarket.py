@@ -49,6 +49,8 @@ from src.watch_updown import (
     official_open_retry_expired,
     price_alignment_status,
     polling_interval_for_seconds_left,
+    protective_open_cross_buffer,
+    protective_spot_confirms_open_cross,
     quotes_pass_sanity_checks,
     response_fill_amounts,
     recent_spot_samples_support_side,
@@ -607,6 +609,10 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.hedge_signal_confirmations == 2
     assert args.hedge_confirmation_min_seconds == 5.0
     assert args.hedge_max_price_worsening == "0.05"
+    assert args.hedge_entry_start_seconds == 300
+    assert args.hedge_entry_cutoff_seconds == 3
+    assert args.hedge_open_cross_min_usd == "2.00"
+    assert args.hedge_open_cross_sigma_multiplier == "1.00"
     assert args.hedge_max_spread == "0.10"
     assert args.hedge_min_win_probability == "0.62"
     assert args.hedge_fee_rate == "0.07"
@@ -691,6 +697,44 @@ def test_protective_confirmation_restarts_after_price_worsens() -> None:
     assert state.confirmations == 1
     assert state.started_at == 106.0
     assert state.initial_price == Decimal("0.46")
+
+
+def test_protective_open_cross_buffer_uses_larger_dynamic_value() -> None:
+    assert protective_open_cross_buffer(
+        Decimal("100"),
+        Decimal("0.01"),
+        Decimal("4"),
+        Decimal("2"),
+        Decimal("1"),
+    ) == Decimal("2")
+    assert protective_open_cross_buffer(
+        Decimal("100"),
+        Decimal("0.02"),
+        Decimal("4"),
+        Decimal("2"),
+        Decimal("1"),
+    ) == Decimal("4.00")
+
+
+def test_protective_spot_confirmation_starts_on_cross_and_rejects_narrowing() -> None:
+    start = Decimal("100")
+    buffer = Decimal("2")
+
+    assert protective_spot_confirms_open_cross(
+        [Decimal("99"), Decimal("98")], start, "DOWN", buffer
+    ) is True
+    assert protective_spot_confirms_open_cross(
+        [Decimal("97"), Decimal("98")], start, "DOWN", buffer
+    ) is False
+    assert protective_spot_confirms_open_cross(
+        [Decimal("101"), Decimal("102")], start, "UP", buffer
+    ) is True
+    assert protective_spot_confirms_open_cross(
+        [Decimal("103"), Decimal("102")], start, "UP", buffer
+    ) is False
+    assert protective_spot_confirms_open_cross(
+        [Decimal("101.99")], start, "UP", buffer
+    ) is False
 
 
 def test_only_matched_live_orders_consume_window_trade_slots() -> None:
