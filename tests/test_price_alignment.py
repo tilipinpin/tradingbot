@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from src.price_alignment import PolymarketPriceToBeatClient
+from src.price_alignment import PolymarketPriceToBeatClient, StableOpenPriceTracker
 
 
 def test_fetch_price_to_beat_uses_five_minute_window(monkeypatch) -> None:
@@ -33,6 +33,7 @@ def test_fetch_price_to_beat_uses_five_minute_window(monkeypatch) -> None:
     )
 
     assert result.open_price == Decimal("63967.95")
+    assert result.price_to_beat == Decimal("63967.95")
     assert result.incomplete is True
     assert captured["params"] == {
         "symbol": "BTC",
@@ -63,3 +64,21 @@ def test_fetch_price_to_beat_requires_open_price(monkeypatch) -> None:
         assert "openPrice" in str(exc)
     else:
         raise AssertionError("missing openPrice must fail closed")
+
+
+def test_stable_open_price_requires_matching_reads_across_minimum_duration() -> None:
+    tracker = StableOpenPriceTracker(required_confirmations=2, minimum_stable_seconds=5.0)
+
+    assert tracker.observe(Decimal("65851.00696"), 100.0) is None
+    assert tracker.observe(Decimal("65861.35686"), 105.0) is None
+    assert tracker.observe(Decimal("65861.35686"), 109.9) is None
+    assert tracker.observe(Decimal("65861.35686"), 110.0) == Decimal("65861.35686")
+
+
+def test_stable_open_price_reset_discards_preliminary_value() -> None:
+    tracker = StableOpenPriceTracker(required_confirmations=2, minimum_stable_seconds=5.0)
+
+    assert tracker.observe(Decimal("65851.00696"), 100.0) is None
+    tracker.reset()
+    assert tracker.observe(Decimal("65851.00696"), 106.0) is None
+    assert tracker.observe(Decimal("65851.00696"), 111.0) == Decimal("65851.00696")

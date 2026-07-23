@@ -136,16 +136,17 @@ def test_poller_maps_large_keyboard_button_to_command() -> None:
     assert [item.command for item in poller.drain()] == ["/positions"]
 
 
-def test_live_strategy_menu_allows_fair_value_and_late_favorite() -> None:
+def test_live_strategy_menu_allows_all_three_strategies() -> None:
     markup = strategy_selection_markup("live", "fair_value_edge", "late_favorite")
     buttons = [button for row in markup["inline_keyboard"] for button in row]
     by_data = {button["callback_data"]: button["text"] for button in buttons}
 
     assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
     assert "⏳ 尾盘高置信度" == by_data["strategy:select:late_favorite"]
+    assert "尾盘单边趋势" == by_data["strategy:select:late_one_way"]
     assert "↩️ 恢复启动策略" == by_data[f"strategy:select:{DEFAULT_STRATEGY}"]
     assert all("仅纸面" not in button["text"] for button in buttons)
-    assert len(buttons) == 4
+    assert len(buttons) == 5
 
 
 def test_poller_parses_strategy_callback_from_authorized_chat() -> None:

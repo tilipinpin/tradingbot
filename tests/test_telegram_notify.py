@@ -5,6 +5,8 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from src.telegram_commands import TelegramCommand
 from src.telegram_notify import (
     AccountSnapshot,
@@ -32,16 +34,21 @@ class FakeResponse:
     def raise_for_status(self) -> None:
         return None
 
-    def json(self) -> dict[str, bool]:
-        return {"ok": True}
+    def json(self) -> dict[str, bool | str]:
+        return {"ok": True, "id": "discord-message-1"}
 
 
 class FakeSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict, float]] = []
+        self.delete_calls: list[tuple[str, float]] = []
 
     def post(self, url: str, json: dict, timeout: float) -> FakeResponse:
         self.calls.append((url, json, timeout))
+        return FakeResponse()
+
+    def delete(self, url: str, timeout: float) -> FakeResponse:
+        self.delete_calls.append((url, timeout))
         return FakeResponse()
 
 
@@ -107,7 +114,7 @@ def test_discord_notifier_sanitizes_embed_and_allows_user_role_mentions() -> Non
     assert notifier.send(f"failed with {private_key} via {webhook}") is True
 
     url, payload, timeout = session.calls[0]
-    assert url == webhook
+    assert url == f"{webhook}?wait=true"
     serialized = json.dumps(payload, ensure_ascii=False)
     assert private_key not in serialized
     assert webhook not in serialized
@@ -134,6 +141,15 @@ def test_discord_notifier_sends_configured_mention() -> None:
     payload = session.calls[0][1]
     assert payload["content"] == "<@&987654321>"
     assert payload["allowed_mentions"] == {"parse": ["users", "roles"]}
+
+
+def test_discord_notifier_deletes_own_webhook_message() -> None:
+    session = FakeSession()
+    webhook = "https://discord.com/api/webhooks/123456/secret_webhook_token"
+    notifier = DiscordNotifier(webhook, session=session)
+
+    assert notifier.delete_message("987654321") is True
+    assert session.delete_calls == [(f"{webhook}/messages/987654321", 10)]
 
 
 def test_discord_embed_truncates_long_messages_and_posts_once() -> None:
@@ -271,16 +287,19 @@ def test_window_settlement_message_combines_two_orders() -> None:
     first = settlement_values(matched_order(side="UP", cost="3.15", shares="5"), "UP")
     second_order = matched_order(side="DOWN", cost="2.50", shares="5")
     second_order["response"]["orderID"] = "0x22222222222222222222"
+    second_order["order_role"] = "reverse_protection"
+    second_order["reason"] = "protective_hedge primary_side=UP"
     second = settlement_values(second_order, "UP")
     account = AccountSnapshot(Decimal("21.85"), Decimal("0"), Decimal("0"), 0)
 
     message = format_window_settlement_message([first, second], account, [first, second])
 
     assert "本窗口成交: 2 单" in message
+    assert "反向保护单: 1 单" in message
     assert "买入方向: UP × 1 / DOWN × 1" in message
     assert "窗口胜负: 1 胜 / 1 负" in message
-    assert "订单 1: UP" in message
-    assert "订单 2: DOWN" in message
+    assert "订单 1 [首单]: UP" in message
+    assert "订单 2 [反向保护单]: DOWN" in message
     assert "本窗口净盈亏估算: -0.8191 pUSD" in message
 
 
@@ -411,6 +430,58 @@ def test_start_notification_is_sent_to_telegram_and_discord(tmp_path) -> None:
     assert "机器人启动成功" in discord_session.calls[0][1]["embeds"][0]["title"]
     assert "reply_markup" in telegram_session.calls[0][1]
     assert "reply_markup" not in discord_session.calls[0][1]
+    saved = json.loads((tmp_path / "state.json").read_text())
+    queued = saved["discord_message_deletions"]
+    assert len(queued) == 1
+    assert queued[0]["message_id"] == "discord-message-1"
+    assert queued[0]["kind"] == "start"
+
+
+def test_discord_deletion_waits_until_deadline_and_survives_restart(tmp_path, monkeypatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr("src.telegram_notify.time.time", lambda: now[0])
+    state = tmp_path / "state.json"
+    first_session = FakeSession()
+    first = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        discord_notifier=DiscordNotifier(
+            "https://discord.com/api/webhooks/123456/secret_webhook_token",
+            session=first_session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=state,
+        discord_start_stop_retention_seconds=300,
+    )
+    first.start()
+
+    restarted_session = FakeSession()
+    restarted = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        discord_notifier=DiscordNotifier(
+            "https://discord.com/api/webhooks/123456/secret_webhook_token",
+            session=restarted_session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="fair_value_edge",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=state,
+    )
+    now[0] = 1299.0
+    restarted.maybe_delete_expired_discord_messages()
+    assert restarted_session.delete_calls == []
+
+    now[0] = 1300.0
+    restarted.maybe_delete_expired_discord_messages()
+    assert len(restarted_session.delete_calls) == 1
+    assert json.loads(state.read_text())["discord_message_deletions"] == []
 
 
 def test_settlement_retries_only_missing_discord_delivery(tmp_path) -> None:
@@ -469,6 +540,11 @@ def test_settlement_retries_only_missing_discord_delivery(tmp_path) -> None:
 
     saved = json.loads(state.read_text())
     assert saved["settlements"][key]["notified_channels"] == ["discord", "telegram"]
+    assert saved["discord_message_deletions"][0]["kind"] == "settlement"
+    assert (
+        saved["discord_message_deletions"][0]["delete_at"]
+        - datetime.fromisoformat(saved["discord_message_deletions"][0]["created_at"]).timestamp()
+    ) == pytest.approx(259200, abs=2)
     assert len(telegram_session.calls) == 1
     assert len(discord_session.calls) == 2
 
@@ -493,7 +569,7 @@ def test_record_fill_is_silent_until_settlement_by_default(tmp_path) -> None:
     assert service.ledger_path.read_text().strip()
 
 
-def test_discord_ignores_matched_exceptions_and_daily_reports(tmp_path) -> None:
+def test_discord_ignores_matched_and_exceptions_but_keeps_daily_report(tmp_path) -> None:
     telegram_session = FakeSession()
     discord_session = FakeSession()
     ledger = tmp_path / "trades.jsonl"
@@ -548,7 +624,10 @@ def test_discord_ignores_matched_exceptions_and_daily_reports(tmp_path) -> None:
     assert any("实际成交" in message for message in telegram_messages)
     assert any("机器人异常" in message for message in telegram_messages)
     assert any("日报" in message for message in telegram_messages)
-    assert discord_session.calls == []
+    assert len(discord_session.calls) == 1
+    assert "日报" in discord_session.calls[0][1]["embeds"][0]["title"]
+    saved = json.loads(state.read_text())
+    assert saved["discord_message_deletions"] == []
 
 
 def test_daily_stats_count_only_resolved_orders_in_win_rate() -> None:

@@ -122,28 +122,34 @@ python -m src.watch_updown \
   --duration 3600 \
   --interval 10 \
   --auto-trade \
-  --decision-seconds-before-end 90 \
+  --decision-seconds-before-end 120 \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
   --trend-confirmation-samples 3 \
+  --trend-pullback-tolerance-usd 1.00 \
+  --trend-pullback-tolerance-percent 25 \
   --confirmation-jump-sigma-multiplier 1.25 \
   --confirmation-min-jump-usd 3.00 \
   --hedge-signal-confirmations 2 \
-  --hedge-confirmation-min-seconds 5 \
+  --hedge-confirmation-min-seconds 2 \
   --hedge-max-price-worsening 0.05 \
   --hedge-entry-start-seconds 300 \
-  --hedge-entry-cutoff-seconds 3 \
-  --hedge-open-cross-min-usd 2.00 \
+  --hedge-entry-cutoff-seconds 1 \
+  --hedge-open-cross-min-usd 1.00 \
   --hedge-open-cross-sigma-multiplier 1.00 \
-  --hedge-min-win-probability 0.62 \
+  --hedge-market-reversal-threshold 0.55 \
+  --hedge-min-win-probability 0.53 \
+  --hedge-min-edge 0.01 \
   --hedge-max-spread 0.10 \
   --hedge-fee-rate 0.07 \
+  --post-fill-poll-interval 1 \
+  --pre-submit-max-adverse-ask-drop 0.02 \
   --probability-shrinkage 1.00 \
   --market-data-timeout 3 \
   --min-entry 0.50 \
   --max-entry 0.78 \
   --low-entry-cutoff 0.55 \
-  --low-entry-min-win-probability 0.68 \
+  --low-entry-min-win-probability 0.61 \
   --low-entry-confirmation-samples 3 \
   --max-trades 2 \
   --order-size 5
@@ -151,11 +157,12 @@ python -m src.watch_updown \
 
 真实下单必须额外显式加 `--live-trading`，并在环境变量中配置 `PRIVATE_KEY` 和 `FUNDER_ADDRESS`。
 默认不限制会话累计订单数，每个 5 分钟窗口最多成交 2 单；每单仍受 5 份和
-3.75 pUSD 本金上限约束。订单被拒、请求异常或返回非 `matched` 状态时会写入摘要并继续，
+4.05 pUSD 本金上限约束，使 5 份、最高 0.78 的合格信号可以在最多 0.03 滑点下提交。订单被拒、请求异常或返回非 `matched` 状态时会写入摘要并继续，
 失败尝试不占用当前窗口的成交额度。
-`fair_value_edge` 在 `0.55–0.78` 的盘口价格要求至少 62% 模型胜率，其中 `0.65`
-以上继续按价格提高所需 edge。`0.50–0.55` 使用严格档，要求至少 68% 模型胜率，且最近
-3 次 Chainlink 采样持续支持所选方向、相对开盘价距离没有收窄。
+`fair_value_edge` 在 `0.55–0.78` 的盘口价格要求至少 55% 模型胜率和 2% edge，其中 `0.65`
+以上继续按价格提高所需 edge。正常档最近 3 次 Chainlink 采样必须始终位于官方开盘价的
+所选方向一侧，并允许 `max(1 USD, 本段最大领先距离的 25%)` 的小幅回撤。`0.50–0.55` 使用严格档，要求至少 61%
+模型胜率，且最近 3 次采样持续支持所选方向、相对开盘价距离不得收窄。
 默认 `--duration 0` 持续运行，直到手动停止；可传正秒数设置时限，也可传
 `--max-live-orders N` 临时恢复累计订单上限。
 实盘进程结束后会写入 `data/live_trade_summary.json`，可运行
@@ -177,14 +184,17 @@ DISCORD_WEBHOOK_URL=<discord-webhook-url>
 DISCORD_USERNAME=Polymarket Trading Bot
 DISCORD_MENTION=
 DISCORD_ALLOWED_MENTIONS=users,roles
+DISCORD_START_STOP_RETENTION_SECONDS=300
+DISCORD_SETTLEMENT_RETENTION_SECONDS=259200
+DISCORD_DELETE_RETRY_SECONDS=900
 ```
 
 先在 Telegram 中主动给机器人发送一条消息，确保 bot 可以向该 chat ID 回复。未配置 token
 或 chat ID 时 Telegram 自动关闭；未配置 Webhook 时 Discord 自动关闭，均不影响交易。Discord
-只接收启动、停止和正式结算三类彩色 Embed，不接收异常、日报或即时成交，也不提供交易控制命令。`DISCORD_MENTION` 可填写 `<@用户ID>` 或
+接收启动、停止、正式结算和每日日报四类彩色 Embed，不接收异常或即时成交，也不提供交易控制命令。启动和停止消息默认保留5分钟，结算消息保留3天，日报由程序永久保留。到期删除采用持久化事件队列，只在消息到期时请求 Discord；断网失败后默认15分钟再试，进程重启后会恢复队列。`DISCORD_MENTION` 可填写 `<@用户ID>` 或
 `<@&角色ID>`，默认允许用户和角色提及；如确需 `@everyone`，将它加入
 `DISCORD_ALLOWED_MENTIONS=users,roles,everyone` 并把 `DISCORD_MENTION` 设为 `@everyone`。配置后
-Telegram 会发送以下全部通知；Discord 只发送其中的启动、结算和停止：
+Telegram 会发送以下全部通知；Discord 只发送其中的启动、结算、日报和停止：
 
 - 启动：版本、服务器、模式、策略、可用 pUSD、活跃持仓、待赎回价值和估算总权益。
 - 成交：实际 `matched` 订单只写入本地成交账本，默认不立即通知；设置 `TELEGRAM_NOTIFY_ON_MATCHED=true` 可恢复即时通知。
@@ -235,15 +245,15 @@ python -m src.watch_updown \
   --paper-bankroll 20 \
   --paper-stake 1 \
   --stop-when-bust \
-  --decision-seconds-before-end 90 \
+  --decision-seconds-before-end 120 \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
   --market-data-timeout 3 \
-  --min-win-probability 0.62 \
+  --min-win-probability 0.55 \
   --low-entry-cutoff 0.50 \
-  --low-entry-min-win-probability 0.68 \
+  --low-entry-min-win-probability 0.61 \
   --low-entry-confirmation-samples 3 \
-  --edge 0.06 \
+  --edge 0.02 \
   --min-entry 0.45 \
   --max-entry 0.75 \
   --max-spread 0.04 \
@@ -301,16 +311,17 @@ python -m src.watch_updown \
 样本并验证费后盈亏和回撤仍然必要；高命中率不等于保证盈利。实盘每个窗口最多一单，
 5 份订单的独立本金硬上限为 4.70 pUSD。
 
-`fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在模型概率相对盘口 ask 有足够 edge 时入场。波动率按每个样本的实际时间间隔计算，并始终不低于长期基准 `0.00005/√秒`。正常入场允许 `0.50–0.78`，其中低于 0.55 使用 68% 胜率及三次趋势确认的严格档；正常单最大 spread 为 0.05。首单成交后，第二个名额既可在正常入场时段同方向加仓，也可立即开始反向保护检测并持续到剩余 3 秒。反向保护要求 BTC 越过官方 `openPrice`，且距离至少为 `$2` 与五秒短期波动缓冲两者中的较大值；最近样本必须持续位于反向一侧且没有向开盘价收窄。保护最大 spread 独立放宽到 0.10，并要求至少两次有效信号、持续至少 5 秒、方向不变、每次 edge 均达标且 ask 相对首次确认恶化不超过 0.05。最终仍使用首单实际成交成本和份数计算组合风险，只有最大亏损严格下降才提交。最后 30 秒的行情和盘口轮询加快至每秒一次。
+`fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在剩余 120–25 秒、模型概率相对盘口 ask 有足够 edge 时入场。波动率按每个样本的实际时间间隔计算，并始终不低于长期基准 `0.00005/√秒`。正常入场允许 `0.50–0.78`，模型概率至少 55%、edge 至少 2%；`0.55–0.78` 的三次趋势确认允许回撤 `max(1 USD, 本段最大领先距离的 25%)`，低于 0.55 的严格档要求至少 61% 胜率且仍禁止收窄。正常单最大 spread 为 0.05。确认完成后会重新读取 Chainlink 与双边盘口；所选 ask 下跌超过 0.02、方向改变或 edge 不再达标都会取消旧信号。首单成交后立即改为每秒轮询，第二个名额既可同方向加仓，也可反向保护并持续到剩余 1 秒。反向保护由两条独立路径触发：模型反向概率至少 53% 且 edge 至少 1%，或者反向盘口 bid 连续达到 0.55；盘口路径不再要求模型同步翻向。两条路径都要求 BTC 越过官方 `openPrice`，且距离至少为 `$1` 与两秒短期波动缓冲两者中的较大值。保护最大 spread 为 0.10，并要求同方向确认至少两次、持续至少 2 秒，ask 相对首次确认恶化不超过 0.05。最终仍使用首单实际成交成本和份数计算组合风险，只有最大亏损严格下降才提交。
 
-每个窗口强制使用 Polymarket 发布的官方 `openPrice`，并与本地缓存中最接近精确开盘
-毫秒时间戳的 Chainlink RTDS 样本核对。本地现货价格不能替代官方开盘价。
+每个窗口强制使用 Polymarket 发布的官方 `openPrice`（即 Price to Beat），并与本地缓存中
+最接近精确开盘毫秒时间戳的 Chainlink RTDS 样本核对。本地现货价格不能替代官方门槛。
 默认用 1000 ms 和 0.50 USD 作为边界审计阈值。边界 Chainlink 样本缺失或价差超限时
-记录告警但仍使用官方 `openPrice`。官方值会持续重试到策略入场阶段开始，
-`fair_value_edge` 为剩余 90 秒，尾盘策略为其配置的入场起点，届时仍未取得才跳过窗口。
+记录告警但仍使用 Price to Beat。程序至少读取两次相同值且保持 5 秒才采用；读取失败时
+会在当前窗口持续重试，不会因进入交易时段而提前跳窗。正式下单前还会再次读取，门槛
+缺失则阻止下单，门槛变化则清空本轮行情样本和信号确认后重新建立基准。
 真正入场前仍要求实时 Chainlink 报价不超过 20 秒，旧缓存不会用于下单。
 
-实盘默认使用 FAK，盘口可用数量不足时允许部分成交并取消剩余部分。每窗口交易上限只统计确认 `matched` 且有实际成交数量的订单；首仓和保护风险均使用响应中的真实成交成本及份数。提交异常、余额或名义金额检查失败不占用成交名额。`--duration 0` 表示无限运行。
+实盘默认使用 FAK，配置的最大买入滑点为 0.03，但普通首单只会逐 tick 使用仍能保留最低 edge 的部分；边缘信号可能完全不使用滑点。`0.78` 仍是信号 ask 上限，普通单绝对限价最高为 `0.81`，5 份订单本金硬上限为 4.05 pUSD。盘口可用数量不足时允许部分成交并取消剩余部分。每窗口交易上限只统计确认 `matched` 且有实际成交数量的订单；首仓和保护风险均使用响应中的真实成交成本及份数。提交异常、余额或名义金额检查失败不占用成交名额。`--duration 0` 表示无限运行。结算通知会区分首单、同向加仓和反向保护单。
 
 ## 数据采集与历史回测
 

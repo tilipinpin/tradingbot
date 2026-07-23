@@ -11,7 +11,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +29,7 @@ from src.polymarket import (
     Market,
     OrderBookQuote,
 )
-from src.price_alignment import PolymarketPriceToBeatClient
+from src.price_alignment import PolymarketPriceToBeatClient, StableOpenPriceTracker
 from src.price_signal import SpotPriceClient
 from src.telegram_commands import LIVE_STRATEGIES, STRATEGY_LABELS
 from src.telegram_notify import TradingNotificationService
@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration", type=int, default=0, help="Total watch duration in seconds; 0 means unlimited.")
     parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds.")
     parser.add_argument("--price-source", default="POLYMARKET_CHAINLINK", help="POLYMARKET_CHAINLINK (strict default), AUTO (Chainlink + free exchanges), CHAINLINK, BINANCE, COINBASE, KRAKEN, or COINGECKO.")
-    parser.add_argument("--edge", default="0.06", help="Minimum theoretical edge for BUY_UP/BUY_DOWN.")
+    parser.add_argument("--edge", default="0.02", help="Minimum theoretical edge for BUY_UP/BUY_DOWN.")
     parser.add_argument(
         "--fallback-sigma",
         default="0.00005",
@@ -111,27 +111,98 @@ def parse_args() -> argparse.Namespace:
         default="fair_value_edge",
         choices=list(STRATEGY_LABELS),
     )
-    parser.add_argument("--decision-seconds-before-end", type=int, default=90)
+    parser.add_argument("--decision-seconds-before-end", type=int, default=120)
     parser.add_argument("--min-seconds-before-end", type=int, default=25)
     parser.add_argument("--signal-confirmations", type=int, default=2)
     parser.add_argument("--trend-confirmation-samples", type=int, default=3)
+    parser.add_argument(
+        "--one-way-entry-seconds",
+        type=int,
+        default=300,
+        help="Start evaluating the one-way live entry when the five-minute event opens.",
+    )
+    parser.add_argument(
+        "--one-way-entry-cutoff-seconds",
+        type=int,
+        default=1,
+        help="Stop opening the primary one-way position this many seconds before settlement.",
+    )
+    parser.add_argument("--one-way-min-entry", default="0.60")
+    parser.add_argument("--one-way-max-entry", default="0.70")
+    parser.add_argument(
+        "--one-way-trend-samples",
+        type=int,
+        default=5,
+        help="Recent pre-entry Chainlink samples that must remain one-sided and never pull back.",
+    )
+    parser.add_argument(
+        "--one-way-reversal-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds BTC must continuously remain beyond the buffered open during the final reversal window.",
+    )
+    parser.add_argument(
+        "--one-way-reversal-early-seconds",
+        type=float,
+        default=10.0,
+        help="Required reversal persistence while more than the final reversal window remains.",
+    )
+    parser.add_argument(
+        "--one-way-reversal-final-window-seconds",
+        type=int,
+        default=30,
+        help="Use --one-way-reversal-seconds at or inside this many seconds before settlement.",
+    )
+    parser.add_argument("--one-way-reversal-min-usd", default="3.00")
+    parser.add_argument("--one-way-reversal-min-bid", default="0.55")
+    parser.add_argument("--one-way-reversal-max-entry", default="0.80")
+    parser.add_argument(
+        "--one-way-reversal-min-loss-reduction-percent",
+        default="0.10",
+        help="Minimum maximum-loss reduction as a fraction of aggregate primary cost.",
+    )
+    parser.add_argument(
+        "--one-way-reversal-min-loss-reduction-notional",
+        default="0.25",
+        help="Absolute minimum maximum-loss reduction in paper/live notional units.",
+    )
+    parser.add_argument(
+        "--trend-pullback-tolerance-usd",
+        default="1.00",
+        help="Normal-entry BTC pullback tolerance across trend samples; low-entry signals remain strict.",
+    )
+    parser.add_argument(
+        "--trend-pullback-tolerance-percent",
+        default="25",
+        help="Normal-entry pullback tolerance as a percent of the largest sampled lead; the larger USD/percent value is used.",
+    )
     parser.add_argument("--confirmation-jump-sigma-multiplier", default="1.25")
     parser.add_argument("--confirmation-min-jump-usd", default="3.00")
     parser.add_argument("--hedge-signal-confirmations", type=int, default=2)
-    parser.add_argument("--hedge-confirmation-min-seconds", type=float, default=5.0)
+    parser.add_argument("--hedge-confirmation-min-seconds", type=float, default=2.0)
     parser.add_argument("--hedge-max-price-worsening", default="0.05")
-    parser.add_argument("--hedge-min-win-probability", default="0.62")
+    parser.add_argument("--hedge-min-win-probability", default="0.53")
+    parser.add_argument("--hedge-min-edge", default="0.01")
     parser.add_argument("--hedge-fee-rate", default="0.07")
     parser.add_argument("--hedge-entry-start-seconds", type=int, default=300)
-    parser.add_argument("--hedge-entry-cutoff-seconds", type=int, default=3)
-    parser.add_argument("--hedge-open-cross-min-usd", default="2.00")
+    parser.add_argument("--hedge-entry-cutoff-seconds", type=int, default=1)
+    parser.add_argument("--hedge-open-cross-min-usd", default="1.00")
     parser.add_argument("--hedge-open-cross-sigma-multiplier", default="1.00")
-    parser.add_argument("--hedge-market-reversal-threshold", default="0.65")
+    parser.add_argument("--hedge-market-reversal-threshold", default="0.55")
     parser.add_argument("--hedge-max-entry", default="0.99")
     parser.add_argument("--hedge-max-spread", default="0.10")
-    parser.add_argument("--hedge-max-live-notional", default="5.00")
+    parser.add_argument(
+        "--hedge-max-live-notional",
+        default="0",
+        help=(
+            "Optional absolute cap for aggregate protection in pUSD; "
+            "0 makes the cap track aggregate primary fill cost 1:1."
+        ),
+    )
     parser.add_argument("--final-poll-seconds", type=int, default=30)
     parser.add_argument("--final-poll-interval", type=float, default=1.0)
+    parser.add_argument("--post-fill-poll-interval", type=float, default=1.0)
+    parser.add_argument("--pre-submit-max-adverse-ask-drop", default="0.02")
     parser.add_argument("--max-spot-age", type=int, default=20, help="Maximum cached spot-price age allowed for entries.")
     parser.add_argument(
         "--price-to-beat-proxy",
@@ -152,14 +223,26 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Maximum timestamp distance between a cached Chainlink sample and the exact market boundary.",
     )
-    parser.add_argument("--min-win-probability", default="0.62")
+    parser.add_argument(
+        "--official-open-confirmations",
+        type=int,
+        default=2,
+        help="Matching Price to Beat reads required before accepting the official threshold.",
+    )
+    parser.add_argument(
+        "--official-open-stable-seconds",
+        type=float,
+        default=5.0,
+        help="Minimum time an unchanged Price to Beat must remain stable before use.",
+    )
+    parser.add_argument("--min-win-probability", default="0.55")
     parser.add_argument(
         "--probability-shrinkage",
         default="1.00",
         help="Shrink fair-value probability toward 0.50 before evaluating edge; 1 disables calibration.",
     )
     parser.add_argument("--low-entry-cutoff", default="0.55")
-    parser.add_argument("--low-entry-min-win-probability", default="0.68")
+    parser.add_argument("--low-entry-min-win-probability", default="0.61")
     parser.add_argument("--low-entry-confirmation-samples", type=int, default=3)
     parser.add_argument("--min-entry", default="0.50")
     parser.add_argument("--max-entry", default="0.78")
@@ -174,13 +257,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Hard session cap on live order attempts; 0 means unlimited.",
     )
-    parser.add_argument("--max-live-notional", default="3.75", help="Hard principal cap per live order in pUSD.")
+    parser.add_argument("--max-live-notional", default="4.05", help="Hard principal cap per live order in pUSD.")
     parser.add_argument(
         "--late-max-live-notional",
         default="4.70",
         help="Hard principal cap per late_favorite live order in pUSD.",
     )
     parser.add_argument("--live-order-type", choices=["FAK", "FOK"], default="FAK")
+    parser.add_argument(
+        "--live-buy-slippage",
+        default="0.03",
+        help="Maximum price improvement above the observed ask for live FAK/FOK buys.",
+    )
     parser.add_argument(
         "--live-summary-json",
         default="data/live_trade_summary.json",
@@ -231,20 +319,6 @@ def next_5m_slug(slug: str) -> str:
     if not match:
         raise ValueError(f"Cannot derive next 5m slug from: {slug}")
     return f"{match.group(1)}{int(match.group(2)) + 300}"
-
-
-def official_open_retry_expired(
-    seconds_to_end: Decimal,
-    strategy: str,
-    fair_entry_start_seconds: Decimal,
-    late_entry_start_seconds: Decimal,
-) -> bool:
-    entry_start = (
-        late_entry_start_seconds
-        if strategy == "late_favorite"
-        else fair_entry_start_seconds
-    )
-    return seconds_to_end <= entry_start
 
 
 def load_updown_market(gamma: GammaClient, slug: str) -> Market | None:
@@ -322,19 +396,51 @@ def quotes_pass_sanity_checks(
     return True, "ok"
 
 
+def effective_pullback_tolerance(
+    fixed_usd: Decimal,
+    reference_move_usd: Decimal,
+    percent: Decimal,
+) -> Decimal:
+    if fixed_usd < 0 or reference_move_usd < 0 or percent < 0:
+        raise ValueError("Pullback tolerance inputs must be valid and non-negative")
+    return max(fixed_usd, reference_move_usd * percent / Decimal("100"))
+
+
 def recent_spot_samples_support_side(
     prices: list[Decimal],
     start_price: Decimal,
     side: str,
     sample_count: int,
+    pullback_tolerance_usd: Decimal = Decimal("0"),
+    pullback_tolerance_percent: Decimal = Decimal("0"),
 ) -> bool:
-    if sample_count < 1 or len(prices) < sample_count:
+    if (
+        sample_count < 1
+        or len(prices) < sample_count
+        or start_price <= 0
+        or pullback_tolerance_usd < 0
+        or pullback_tolerance_percent < 0
+    ):
         return False
     recent = prices[-sample_count:]
     if side == "UP":
-        return all(price > start_price for price in recent) and recent[-1] >= recent[0]
+        distances = [price - start_price for price in recent]
+        peak_distance = max(distances)
+        tolerance = effective_pullback_tolerance(
+            pullback_tolerance_usd,
+            peak_distance,
+            pullback_tolerance_percent,
+        )
+        return all(distance > 0 for distance in distances) and peak_distance - distances[-1] <= tolerance
     if side == "DOWN":
-        return all(price < start_price for price in recent) and recent[-1] <= recent[0]
+        distances = [start_price - price for price in recent]
+        peak_distance = max(distances)
+        tolerance = effective_pullback_tolerance(
+            pullback_tolerance_usd,
+            peak_distance,
+            pullback_tolerance_percent,
+        )
+        return all(distance > 0 for distance in distances) and peak_distance - distances[-1] <= tolerance
     return False
 
 
@@ -484,6 +590,12 @@ def late_spot_safety_metrics(
 def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
     if strategy == "late_favorite":
         return 1
+    if strategy == "late_one_way":
+        return min(2, configured_limit)
+    if strategy == "fair_value_edge":
+        # --max-trades remains the primary-entry allowance. Aggregate protection
+        # gets one additional reserved matched-order slot.
+        return configured_limit + 1
     return configured_limit
 
 
@@ -498,6 +610,60 @@ def price_alignment_status(
     if abs(difference) > max_difference:
         return "MISMATCH_WARNING", difference
     return "VERIFIED", difference
+
+
+def buy_limit_price_with_slippage(
+    ask_price: Decimal,
+    slippage: Decimal,
+    tick_size: str,
+    maximum_price: Decimal,
+) -> Decimal:
+    tick = Decimal(tick_size)
+    if ask_price <= 0 or tick <= 0 or slippage < 0:
+        raise ValueError("Buy price, tick size, and slippage must be valid")
+    capped = min(ask_price + slippage, maximum_price, Decimal("1") - tick)
+    rounded = (capped / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    return max(ask_price, rounded)
+
+
+def required_fair_value_edge(
+    entry_price: Decimal,
+    seconds_to_end: Decimal,
+    base_edge: Decimal,
+) -> Decimal:
+    required = base_edge
+    if seconds_to_end < Decimal("45"):
+        required += Decimal("0.02")
+    if entry_price > Decimal("0.65"):
+        required += (entry_price - Decimal("0.65")) * Decimal("0.25")
+    return required
+
+
+def buy_limit_price_preserving_edge(
+    ask_price: Decimal,
+    slippage: Decimal,
+    tick_size: str,
+    maximum_price: Decimal,
+    probability: Decimal,
+    seconds_to_end: Decimal,
+    base_edge: Decimal,
+) -> Decimal:
+    tick = Decimal(tick_size)
+    candidate = buy_limit_price_with_slippage(
+        ask_price,
+        slippage,
+        tick_size,
+        maximum_price,
+    )
+    while candidate > ask_price:
+        if probability - candidate >= required_fair_value_edge(
+            candidate,
+            seconds_to_end,
+            base_edge,
+        ):
+            return candidate
+        candidate -= tick
+    return ask_price
 
 
 def window_trade_count_after_attempt(current_count: int, *, live: bool, matched: bool = False) -> int:
@@ -530,7 +696,7 @@ def choose_fair_value_edge_signal(
     recent_spot_prices: list[Decimal] | None = None,
     start_price: Decimal | None = None,
     low_entry_cutoff: Decimal = Decimal("0.50"),
-    low_entry_min_win_probability: Decimal = Decimal("0.68"),
+    low_entry_min_win_probability: Decimal = Decimal("0.61"),
     low_entry_confirmation_samples: int = 3,
     probability_shrinkage: Decimal = Decimal("1"),
 ) -> AutoTradeSignal | None:
@@ -580,11 +746,7 @@ def choose_fair_value_edge_signal(
 
     # Late and expensive entries need extra model margin because small price errors
     # have an outsized effect close to settlement.
-    required_edge = edge_threshold
-    if seconds_to_end < Decimal("45"):
-        required_edge += Decimal("0.02")
-    if entry > Decimal("0.65"):
-        required_edge += (entry - Decimal("0.65")) * Decimal("0.25")
+    required_edge = required_fair_value_edge(entry, seconds_to_end, edge_threshold)
     if edge < required_edge:
         return None
 
@@ -602,6 +764,160 @@ def choose_fair_value_edge_signal(
             f"seconds_left={int(seconds_to_end)}"
         ),
     )
+
+
+def one_way_trend_side(
+    up_ask_prices: list[Decimal],
+    down_ask_prices: list[Decimal],
+    sample_count: int,
+) -> str | None:
+    """Return the side whose ask rises while the opposite ask does not rise."""
+    if (
+        sample_count < 2
+        or len(up_ask_prices) < sample_count
+        or len(down_ask_prices) < sample_count
+    ):
+        return None
+    recent_up = up_ask_prices[-sample_count:]
+    recent_down = down_ask_prices[-sample_count:]
+    if all(
+        current >= previous for previous, current in zip(recent_up, recent_up[1:])
+    ) and all(
+        current <= previous for previous, current in zip(recent_down, recent_down[1:])
+    ):
+        return "UP"
+    if all(
+        current >= previous for previous, current in zip(recent_down, recent_down[1:])
+    ) and all(
+        current <= previous for previous, current in zip(recent_up, recent_up[1:])
+    ):
+        return "DOWN"
+    return None
+
+
+def choose_one_way_trend_signal(
+    market: Market,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    spot_price: Decimal,
+    start_price: Decimal,
+    up_ask_prices: list[Decimal],
+    down_ask_prices: list[Decimal],
+    entry_start_seconds: Decimal,
+    entry_cutoff_seconds: Decimal,
+    min_entry: Decimal,
+    max_entry: Decimal,
+    trend_samples: int,
+    max_spread: Decimal,
+    min_ask_sum: Decimal,
+    max_ask_sum: Decimal,
+) -> AutoTradeSignal | None:
+    if not entry_cutoff_seconds <= seconds_to_end <= entry_start_seconds:
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and down_quote is not None
+    side = one_way_trend_side(up_ask_prices, down_ask_prices, trend_samples)
+    if side is None:
+        return None
+    if (side == "UP" and spot_price <= start_price) or (
+        side == "DOWN" and spot_price >= start_price
+    ):
+        return None
+    quote = up_quote if side == "UP" else down_quote
+    if quote.ask is None or quote.ask < min_entry or quote.ask > max_entry:
+        return None
+    token_id = market.token_ids[0] if side == "UP" else market.token_ids[1]
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=quote.ask,
+        reason=(
+            f"one_way_trend entry={quote.ask} samples={trend_samples} "
+            f"spot={spot_price} official_open={start_price} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def choose_open_reversal_stop_signal(
+    market: Market,
+    primary_side: str,
+    spot_price: Decimal,
+    start_price: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    entry_cutoff_seconds: Decimal,
+    minimum_cross_usd: Decimal,
+    minimum_bid: Decimal,
+    max_entry: Decimal,
+    max_spread: Decimal,
+    min_ask_sum: Decimal,
+    max_ask_sum: Decimal,
+) -> AutoTradeSignal | None:
+    if seconds_to_end < entry_cutoff_seconds or primary_side not in {"UP", "DOWN"}:
+        return None
+    side = "DOWN" if primary_side == "UP" else "UP"
+    crossed_open = (
+        spot_price <= start_price - minimum_cross_usd
+        if side == "DOWN"
+        else spot_price >= start_price + minimum_cross_usd
+    )
+    if not crossed_open:
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and down_quote is not None
+    quote = up_quote if side == "UP" else down_quote
+    if (
+        quote.bid is None
+        or quote.bid < minimum_bid
+        or quote.ask is None
+        or quote.ask <= 0
+        or quote.ask > max_entry
+    ):
+        return None
+    token_id = market.token_ids[0] if side == "UP" else market.token_ids[1]
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=quote.ask,
+        reason=(
+            f"protective_open_reversal_stop primary_side={primary_side} entry={quote.ask} "
+            f"bid={quote.bid} spot={spot_price} official_open={start_price} "
+            f"cross_buffer={minimum_cross_usd.quantize(Decimal('0.01'))} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def spot_reversed_across_open(
+    primary_side: str,
+    spot_price: Decimal,
+    start_price: Decimal,
+    buffer_usd: Decimal = Decimal("0"),
+) -> bool:
+    if primary_side == "UP":
+        return spot_price <= start_price - buffer_usd
+    if primary_side == "DOWN":
+        return spot_price >= start_price + buffer_usd
+    return False
 
 
 def choose_protective_hedge_signal(
@@ -1127,22 +1443,52 @@ def watch() -> None:
     stop_at = float("inf") if args.duration == 0 else time.time() + args.duration
     current_market: Market | None = None
     start_price: Decimal | None = None
+    open_price_tracker = StableOpenPriceTracker(
+        required_confirmations=args.official_open_confirmations,
+        minimum_stable_seconds=args.official_open_stable_seconds,
+    )
     last_spot_price: Decimal | None = None
     last_spot_fetched_at: float | None = None
     prices: list[Decimal] = []
     price_sample_times: list[float] = []
+    up_ask_prices: list[Decimal] = []
+    down_ask_prices: list[Decimal] = []
     signals_this_window = 0
     confirmation_state = SignalConfirmationState()
+    one_way_reversal_started_at: float | None = None
     primary_side_this_window: str | None = None
     primary_cost_this_window = Decimal("0")
     primary_shares_this_window = Decimal("0")
+    primary_orders_this_window = 0
+    aggregate_protection_completed = False
     edge_threshold = Decimal(args.edge)
     fallback_sigma = Decimal(args.fallback_sigma)
     confirmation_jump_sigma_multiplier = Decimal(args.confirmation_jump_sigma_multiplier)
     confirmation_min_jump_usd = Decimal(args.confirmation_min_jump_usd)
+    trend_pullback_tolerance_usd = Decimal(args.trend_pullback_tolerance_usd)
+    trend_pullback_tolerance_percent = Decimal(args.trend_pullback_tolerance_percent)
+    one_way_entry_seconds = Decimal(str(args.one_way_entry_seconds))
+    one_way_entry_cutoff_seconds = Decimal(str(args.one_way_entry_cutoff_seconds))
+    one_way_min_entry = Decimal(args.one_way_min_entry)
+    one_way_max_entry = Decimal(args.one_way_max_entry)
+    one_way_reversal_seconds = args.one_way_reversal_seconds
+    one_way_reversal_early_seconds = args.one_way_reversal_early_seconds
+    one_way_reversal_final_window_seconds = Decimal(
+        str(args.one_way_reversal_final_window_seconds)
+    )
+    one_way_reversal_min_usd = Decimal(args.one_way_reversal_min_usd)
+    one_way_reversal_min_bid = Decimal(args.one_way_reversal_min_bid)
+    one_way_reversal_max_entry = Decimal(args.one_way_reversal_max_entry)
+    one_way_reversal_min_loss_reduction_percent = Decimal(
+        args.one_way_reversal_min_loss_reduction_percent
+    )
+    one_way_reversal_min_loss_reduction_notional = Decimal(
+        args.one_way_reversal_min_loss_reduction_notional
+    )
     hedge_confirmation_min_seconds = args.hedge_confirmation_min_seconds
     hedge_max_price_worsening = Decimal(args.hedge_max_price_worsening)
     hedge_min_win_probability = Decimal(args.hedge_min_win_probability)
+    hedge_min_edge = Decimal(args.hedge_min_edge)
     hedge_fee_rate = Decimal(args.hedge_fee_rate)
     hedge_entry_start_seconds = Decimal(str(args.hedge_entry_start_seconds))
     hedge_entry_cutoff_seconds = Decimal(str(args.hedge_entry_cutoff_seconds))
@@ -1176,6 +1522,8 @@ def watch() -> None:
     late_max_pullback_ratio = Decimal(args.late_max_pullback_ratio)
     late_volatility_buffer_multiplier = Decimal(args.late_volatility_buffer_multiplier)
     order_size = Decimal(args.order_size)
+    live_buy_slippage = Decimal(args.live_buy_slippage)
+    pre_submit_max_adverse_ask_drop = Decimal(args.pre_submit_max_adverse_ask_drop)
     max_live_notional = Decimal(args.max_live_notional)
     late_max_live_notional = Decimal(args.late_max_live_notional)
     decision_seconds_before_end = Decimal(str(args.decision_seconds_before_end))
@@ -1195,17 +1543,47 @@ def watch() -> None:
         "status": "running",
         "strategy": args.strategy,
         "max_live_orders": args.max_live_orders,
-        "max_trades_per_window": args.max_trades,
+        "max_trades_per_window": strategy_trade_limit(args.strategy, args.max_trades),
+        "max_primary_trades_per_window": args.max_trades,
+        "max_matched_orders_per_window": strategy_trade_limit(args.strategy, args.max_trades),
         "max_live_notional": str(max_live_notional),
-        "hedge_max_live_notional": str(hedge_max_live_notional),
+        "hedge_max_live_notional": (
+            str(hedge_max_live_notional)
+            if hedge_max_live_notional > 0
+            else "dynamic_primary_cost"
+        ),
         "late_max_live_notional": str(late_max_live_notional),
         "probability_shrinkage": str(probability_shrinkage),
+        "trend_pullback_tolerance_usd": str(trend_pullback_tolerance_usd),
+        "trend_pullback_tolerance_percent": str(trend_pullback_tolerance_percent),
+        "one_way_entry_seconds": str(one_way_entry_seconds),
+        "one_way_entry_cutoff_seconds": str(one_way_entry_cutoff_seconds),
+        "one_way_entry_range": [str(one_way_min_entry), str(one_way_max_entry)],
+        "one_way_trend_samples": args.one_way_trend_samples,
+        "one_way_reversal_seconds": one_way_reversal_seconds,
+        "one_way_reversal_early_seconds": one_way_reversal_early_seconds,
+        "one_way_reversal_final_window_seconds": str(one_way_reversal_final_window_seconds),
+        "one_way_reversal_min_usd": str(one_way_reversal_min_usd),
+        "one_way_reversal_min_bid": str(one_way_reversal_min_bid),
+        "one_way_reversal_max_entry": str(one_way_reversal_max_entry),
+        "one_way_primary_shares": str(order_size),
+        "one_way_protection_shares": str(order_size),
+        "one_way_reversal_min_loss_reduction_percent": str(
+            one_way_reversal_min_loss_reduction_percent
+        ),
+        "one_way_reversal_min_loss_reduction_notional": str(
+            one_way_reversal_min_loss_reduction_notional
+        ),
         "order_type": args.live_order_type,
+        "live_buy_slippage": str(live_buy_slippage),
+        "post_fill_poll_interval": args.post_fill_poll_interval,
+        "pre_submit_max_adverse_ask_drop": str(pre_submit_max_adverse_ask_drop),
         "max_spread": str(max_spread),
         "hedge_max_spread": str(hedge_max_spread),
         "hedge_signal_confirmations": args.hedge_signal_confirmations,
         "hedge_confirmation_min_seconds": hedge_confirmation_min_seconds,
         "hedge_max_price_worsening": str(hedge_max_price_worsening),
+        "hedge_min_edge": str(hedge_min_edge),
         "hedge_entry_start_seconds": str(hedge_entry_start_seconds),
         "hedge_entry_cutoff_seconds": str(hedge_entry_cutoff_seconds),
         "hedge_open_cross_min_usd": str(hedge_open_cross_min_usd),
@@ -1255,6 +1633,8 @@ def watch() -> None:
             raise ValueError("--duration must be zero (unlimited) or positive")
         if args.live_trading and args.strategy not in LIVE_STRATEGIES:
             raise ValueError(f"{args.strategy} is not approved for live strategy selection")
+        if args.strategy == "late_one_way" and args.max_trades < 2:
+            raise ValueError("late_one_way requires two per-window slots for its reversal stop")
         if args.live_trading and (
             args.max_live_orders < 0
             or args.max_trades < 1
@@ -1275,6 +1655,28 @@ def watch() -> None:
             raise ValueError("Fallback sigma must be positive")
         if args.trend_confirmation_samples < 1:
             raise ValueError("Trend confirmation samples must be positive")
+        if (
+            args.one_way_trend_samples < 2
+            or one_way_entry_cutoff_seconds < 0
+            or one_way_entry_cutoff_seconds >= one_way_entry_seconds
+            or one_way_reversal_seconds < 0
+            or one_way_reversal_early_seconds < 0
+            or one_way_reversal_final_window_seconds < 0
+            or one_way_reversal_min_usd < 0
+        ):
+            raise ValueError("One-way sampling, entry timing, and reversal duration must be valid")
+        if not Decimal("0") < one_way_min_entry <= one_way_max_entry < Decimal("1"):
+            raise ValueError("One-way entry range must be within zero and one")
+        if not (
+            Decimal("0") <= one_way_reversal_min_bid <= one_way_reversal_max_entry < Decimal("1")
+        ):
+            raise ValueError("One-way reversal bid and entry limits must be within zero and one")
+        if not Decimal("0") <= one_way_reversal_min_loss_reduction_percent <= Decimal("1"):
+            raise ValueError("One-way reversal loss-reduction percent must be between zero and one")
+        if one_way_reversal_min_loss_reduction_notional < 0:
+            raise ValueError("One-way reversal minimum loss reduction must not be negative")
+        if trend_pullback_tolerance_usd < 0 or trend_pullback_tolerance_percent < 0:
+            raise ValueError("Trend pullback tolerance must not be negative")
         if args.hedge_signal_confirmations < 2:
             raise ValueError("Hedge signal confirmations must be at least two")
         if hedge_confirmation_min_seconds < 0 or hedge_max_price_worsening < 0:
@@ -1289,12 +1691,18 @@ def watch() -> None:
             raise ValueError("Hedge maximum entry must be between zero and one")
         if hedge_max_spread < 0:
             raise ValueError("Hedge maximum spread must not be negative")
-        if hedge_max_live_notional <= 0:
-            raise ValueError("Hedge maximum live notional must be positive")
-        if args.final_poll_seconds < 0 or args.final_poll_interval <= 0:
+        if hedge_max_live_notional < 0:
+            raise ValueError("Hedge maximum live notional must not be negative")
+        if (
+            args.final_poll_seconds < 0
+            or args.final_poll_interval <= 0
+            or args.post_fill_poll_interval <= 0
+        ):
             raise ValueError("Final polling window must be non-negative and interval positive")
         if not Decimal("0") <= hedge_min_win_probability <= Decimal("1"):
             raise ValueError("Hedge minimum win probability must be between zero and one")
+        if not Decimal("0") <= hedge_min_edge <= Decimal("1"):
+            raise ValueError("Hedge minimum edge must be between zero and one")
         if hedge_fee_rate < 0:
             raise ValueError("Hedge fee rate must be non-negative")
         if confirmation_jump_sigma_multiplier < 0 or confirmation_min_jump_usd < 0:
@@ -1303,8 +1711,16 @@ def watch() -> None:
             raise ValueError("Low-entry confirmation samples must be positive")
         if max_price_alignment_difference < 0:
             raise ValueError("Maximum price-alignment difference must be non-negative")
+        if live_buy_slippage < 0:
+            raise ValueError("Live buy slippage must not be negative")
+        if pre_submit_max_adverse_ask_drop < 0:
+            raise ValueError("Pre-submit adverse ask drop must not be negative")
         if args.max_boundary_sample_offset_ms < 0:
             raise ValueError("Maximum boundary-sample offset must be non-negative")
+        if args.official_open_confirmations < 2:
+            raise ValueError("Official open confirmations must be at least two")
+        if args.official_open_stable_seconds < 0:
+            raise ValueError("Official open stable seconds must not be negative")
         if args.late_entry_cutoff_seconds >= args.late_entry_start_seconds:
             raise ValueError("late_favorite entry cutoff must be lower than entry start")
         if not Decimal("0") < late_min_entry <= late_max_entry < Decimal("1"):
@@ -1356,6 +1772,7 @@ def watch() -> None:
         poll_interval = float(args.interval)
         now = datetime.now(timezone.utc)
         notifications.update_runtime()
+        notifications.maybe_delete_expired_discord_messages()
         if notifications.process_commands():
             live_summary["status"] = "restarting"
             write_live_summary()
@@ -1395,13 +1812,19 @@ def watch() -> None:
                 logger.info("Window ended. Looking for next slug: %s", slug)
             current_market = load_updown_market(gamma, slug)
             start_price = None
+            open_price_tracker.reset()
             prices = []
             price_sample_times = []
+            up_ask_prices = []
+            down_ask_prices = []
             signals_this_window = 0
             confirmation_state.reset()
+            one_way_reversal_started_at = None
             primary_side_this_window = None
             primary_cost_this_window = Decimal("0")
             primary_shares_this_window = Decimal("0")
+            primary_orders_this_window = 0
+            aggregate_protection_completed = False
             if current_market is None:
                 notifications.notify_exception(
                     "读取 Polymarket 市场",
@@ -1444,6 +1867,8 @@ def watch() -> None:
             args.final_poll_seconds,
             args.final_poll_interval,
         )
+        if primary_side_this_window is not None:
+            poll_interval = min(poll_interval, args.post_fill_poll_interval)
         try:
             spot = price_client.btc_usd()
             if spot.observed_at is not None:
@@ -1487,28 +1912,38 @@ def watch() -> None:
                     current_market.end_time,
                 )
             except Exception as exc:
+                open_price_tracker.reset()
                 logger.warning(
                     "PRICE_ALIGNMENT_PENDING slug=%s error=%s",
                     current_market.slug,
                     exc,
                 )
-                if official_open_retry_expired(
-                    seconds_to_end,
-                    args.strategy,
-                    decision_seconds_before_end,
-                    Decimal(str(args.late_entry_start_seconds)),
-                ):
-                    logger.warning(
-                        "PRICE_ALIGNMENT_UNAVAILABLE slug=%s seconds_left=%s "
-                        "entry_phase_started=true; skipping window",
-                        current_market.slug,
-                        int(seconds_to_end),
-                    )
-                    slug = next_5m_slug(current_market.slug)
-                    current_market = None
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
             else:
+                confirmed_open_price = open_price_tracker.observe(
+                    price_to_beat.price_to_beat,
+                    time.monotonic(),
+                )
+                if confirmed_open_price is None:
+                    stable_for = (
+                        0.0
+                        if open_price_tracker.candidate_since is None
+                        else max(0.0, time.monotonic() - open_price_tracker.candidate_since)
+                    )
+                    logger.info(
+                        "PRICE_TO_BEAT_PENDING slug=%s candidate=%s confirmations=%s/%s "
+                        "stable=%.1f/%.1fs endpoint_incomplete=%s",
+                        current_market.slug,
+                        open_price_tracker.candidate,
+                        open_price_tracker.confirmations,
+                        open_price_tracker.required_confirmations,
+                        stable_for,
+                        open_price_tracker.minimum_stable_seconds,
+                        price_to_beat.incomplete,
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
                 boundary_timestamp_ms = int(current_market.event_start_time.timestamp() * 1000)
                 boundary_spot = None
                 boundary_error: str | None = None
@@ -1526,7 +1961,7 @@ def watch() -> None:
                         exc,
                     )
                 alignment_status, alignment_difference = price_alignment_status(
-                    price_to_beat.open_price,
+                    price_to_beat.price_to_beat,
                     boundary_spot.price if boundary_spot is not None else None,
                     max_price_alignment_difference,
                 )
@@ -1541,13 +1976,13 @@ def watch() -> None:
                         "difference=%s max_difference=%s boundary_offset_ms=%s; "
                         "using official openPrice",
                         current_market.slug,
-                        price_to_beat.open_price,
+                        price_to_beat.price_to_beat,
                         boundary_spot.price if boundary_spot is not None else None,
                         alignment_difference,
                         max_price_alignment_difference,
                         boundary_offset_ms,
                     )
-                start_price = price_to_beat.open_price
+                start_price = confirmed_open_price
                 alignment_record = {
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                     "slug": current_market.slug,
@@ -1586,7 +2021,7 @@ def watch() -> None:
                         handle.write(json.dumps(alignment_record, ensure_ascii=True) + "\n")
             prices = [spot.price]
             price_sample_times = [time.monotonic()]
-            logger.info("Captured start_price=%s for %s", start_price, current_market.slug)
+            logger.info("Captured price_to_beat=%s for %s", start_price, current_market.slug)
         else:
             prices.append(spot.price)
             price_sample_times.append(time.monotonic())
@@ -1601,6 +2036,9 @@ def watch() -> None:
         up_quote, down_quote = quote_outcomes(clob, current_market)
         up_ask = up_quote.ask if up_quote else None
         down_ask = down_quote.ask if down_quote else None
+        if up_ask is not None and down_ask is not None:
+            up_ask_prices.append(up_ask)
+            down_ask_prices.append(down_ask)
         action = choose_theoretical_action(fair.probability_up, up_ask, down_ask, edge_threshold)
 
         if snapshot_writer is not None:
@@ -1667,31 +2105,113 @@ def watch() -> None:
                     fair.sigma_per_sqrt_second,
                     late_volatility_buffer_multiplier,
                 )
+            elif args.strategy == "late_one_way":
+                if primary_side_this_window is None:
+                    signal = choose_one_way_trend_signal(
+                        current_market,
+                        up_quote,
+                        down_quote,
+                        seconds_to_end,
+                        spot.price,
+                        start_price,
+                        up_ask_prices,
+                        down_ask_prices,
+                        one_way_entry_seconds,
+                        one_way_entry_cutoff_seconds,
+                        one_way_min_entry,
+                        one_way_max_entry,
+                        args.one_way_trend_samples,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                    )
+                else:
+                    one_way_required_reversal_seconds = (
+                        one_way_reversal_seconds
+                        if seconds_to_end <= one_way_reversal_final_window_seconds
+                        else one_way_reversal_early_seconds
+                    )
+                    one_way_reversal_buffer = protective_open_cross_buffer(
+                        start_price,
+                        fair.sigma_per_sqrt_second,
+                        Decimal(str(one_way_required_reversal_seconds)),
+                        one_way_reversal_min_usd,
+                        hedge_open_cross_sigma_multiplier,
+                    )
+                    reversed_now = spot_reversed_across_open(
+                        primary_side_this_window,
+                        spot.price,
+                        start_price,
+                        one_way_reversal_buffer,
+                    )
+                    if not reversed_now:
+                        one_way_reversal_started_at = None
+                        confirmation_state.reset()
+                        signal = None
+                    else:
+                        reversal_observed_at = time.monotonic()
+                        if one_way_reversal_started_at is None:
+                            one_way_reversal_started_at = reversal_observed_at
+                        reversal_elapsed = reversal_observed_at - one_way_reversal_started_at
+                        signal = (
+                            choose_open_reversal_stop_signal(
+                                current_market,
+                                primary_side_this_window,
+                                spot.price,
+                                start_price,
+                                up_quote,
+                                down_quote,
+                                seconds_to_end,
+                                hedge_entry_cutoff_seconds,
+                                one_way_reversal_buffer,
+                                one_way_reversal_min_bid,
+                                one_way_reversal_max_entry,
+                                hedge_max_spread,
+                                min_ask_sum,
+                                max_ask_sum,
+                            )
+                            if reversal_elapsed >= one_way_required_reversal_seconds
+                            else None
+                        )
+                        if signal is None:
+                            confirmation_state.reset()
             else:
-                normal_signal = choose_fair_value_edge_signal(
-                    current_market,
-                    fair.probability_up,
-                    up_quote,
-                    down_quote,
-                    seconds_to_end,
-                    decision_seconds_before_end,
-                    min_entry,
-                    max_entry,
-                    edge_threshold,
-                    max_spread,
-                    min_ask_sum,
-                    max_ask_sum,
-                    min_seconds_before_end,
-                    min_win_probability,
-                    prices,
-                    start_price,
-                    low_entry_cutoff,
-                    low_entry_min_win_probability,
-                    args.low_entry_confirmation_samples,
-                    probability_shrinkage,
+                protection_slot_reserved = (
+                    primary_orders_this_window < args.max_trades
+                    and (
+                        trader is None
+                        or args.max_live_orders == 0
+                        or live_orders_submitted + 2 <= args.max_live_orders
+                    )
+                )
+                normal_signal = (
+                    choose_fair_value_edge_signal(
+                        current_market,
+                        fair.probability_up,
+                        up_quote,
+                        down_quote,
+                        seconds_to_end,
+                        decision_seconds_before_end,
+                        min_entry,
+                        max_entry,
+                        edge_threshold,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                        min_seconds_before_end,
+                        min_win_probability,
+                        prices,
+                        start_price,
+                        low_entry_cutoff,
+                        low_entry_min_win_probability,
+                        args.low_entry_confirmation_samples,
+                        probability_shrinkage,
+                    )
+                    if not aggregate_protection_completed and protection_slot_reserved
+                    else None
                 )
                 signal = normal_signal
-                if primary_side_this_window is not None:
+                if primary_side_this_window is not None and not aggregate_protection_completed:
                     model_protective_signal = choose_protective_hedge_signal(
                         current_market,
                         primary_side_this_window,
@@ -1702,7 +2222,7 @@ def watch() -> None:
                         hedge_entry_start_seconds,
                         hedge_entry_cutoff_seconds,
                         hedge_max_entry,
-                        edge_threshold,
+                        hedge_min_edge,
                         hedge_min_win_probability,
                         hedge_max_spread,
                         min_ask_sum,
@@ -1722,29 +2242,6 @@ def watch() -> None:
                         min_ask_sum,
                         max_ask_sum,
                     )
-                    if market_protective_signal is not None:
-                        market_probability = (
-                            fair.probability_up
-                            if market_protective_signal.side == "UP"
-                            else Decimal("1") - fair.probability_up
-                        )
-                        market_edge = market_probability - market_protective_signal.price
-                        if (
-                            market_probability < hedge_min_win_probability
-                            or market_edge < edge_threshold
-                        ):
-                            market_protective_signal = None
-                        else:
-                            market_protective_signal = AutoTradeSignal(
-                                side=market_protective_signal.side,
-                                token_id=market_protective_signal.token_id,
-                                price=market_protective_signal.price,
-                                reason=(
-                                    f"{market_protective_signal.reason} "
-                                    f"edge={market_edge.quantize(Decimal('0.0001'))} "
-                                    f"required_edge={edge_threshold.quantize(Decimal('0.0001'))}"
-                                ),
-                            )
                     protective_signal = market_protective_signal or model_protective_signal
                     if protective_signal is not None:
                         open_cross_buffer = protective_open_cross_buffer(
@@ -1783,6 +2280,8 @@ def watch() -> None:
                         signal = protective_signal
                     elif normal_signal is None or normal_signal.side != primary_side_this_window:
                         signal = None
+                elif aggregate_protection_completed:
+                    signal = None
             if signal is not None:
                 if notifications.trading_paused:
                     logger.warning("AUTO_SIGNAL blocked because Telegram trading pause is active.")
@@ -1798,29 +2297,62 @@ def watch() -> None:
                 if (
                     args.strategy == "fair_value_edge"
                     and not is_protective_hedge
+                    and signal.reason.startswith("fair_value_edge")
                     and not recent_spot_samples_support_side(
                         prices,
                         start_price,
                         signal.side,
                         args.trend_confirmation_samples,
+                        (
+                            trend_pullback_tolerance_usd
+                            if signal.price >= low_entry_cutoff
+                            else Decimal("0")
+                        ),
+                        (
+                            trend_pullback_tolerance_percent
+                            if signal.price >= low_entry_cutoff
+                            else Decimal("0")
+                        ),
                     )
                 ):
+                    effective_tolerance = effective_pullback_tolerance(
+                        trend_pullback_tolerance_usd,
+                        max(abs(price - start_price) for price in prices[-args.trend_confirmation_samples:]),
+                        trend_pullback_tolerance_percent,
+                    ) if signal.price >= low_entry_cutoff else Decimal("0")
                     logger.info(
-                        "SIGNAL_REJECTED side=%s reason=recent_spot_distance_narrowing samples=%s",
+                        "SIGNAL_REJECTED side=%s reason=recent_spot_distance_narrowing "
+                        "samples=%s tolerance_usd=%s tolerance_percent=%s effective_tolerance_usd=%s",
                         signal.side,
                         args.trend_confirmation_samples,
+                        (
+                            trend_pullback_tolerance_usd
+                            if signal.price >= low_entry_cutoff
+                            else Decimal("0")
+                        ),
+                        (
+                            trend_pullback_tolerance_percent
+                            if signal.price >= low_entry_cutoff
+                            else Decimal("0")
+                        ),
+                        effective_tolerance,
                     )
                     confirmation_state.reset()
                     sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
-                jump_reset, adverse_jump, jump_threshold = adverse_jump_exceeds_dynamic_threshold(
-                    prices,
-                    signal.side,
-                    fair.sigma_per_sqrt_second,
-                    Decimal(str(poll_interval)),
-                    confirmation_jump_sigma_multiplier,
-                    confirmation_min_jump_usd,
-                )
+                if signal.reason.startswith("protective_open_reversal_stop"):
+                    jump_reset = False
+                    adverse_jump = Decimal("0")
+                    jump_threshold = Decimal("0")
+                else:
+                    jump_reset, adverse_jump, jump_threshold = adverse_jump_exceeds_dynamic_threshold(
+                        prices,
+                        signal.side,
+                        fair.sigma_per_sqrt_second,
+                        Decimal(str(poll_interval)),
+                        confirmation_jump_sigma_multiplier,
+                        confirmation_min_jump_usd,
+                    )
                 if jump_reset:
                     logger.info(
                         "SIGNAL_CONFIRMATION_RESET side=%s adverse_jump=%s threshold=%s",
@@ -1830,8 +2362,12 @@ def watch() -> None:
                     )
                     confirmation_state.reset()
                 required_confirmations = (
-                    args.hedge_signal_confirmations
+                    1
+                    if signal.reason.startswith("protective_open_reversal_stop")
+                    else args.hedge_signal_confirmations
                     if is_protective_hedge
+                    else 1
+                    if signal.reason.startswith("one_way_trend")
                     else args.late_signal_confirmations
                     if args.strategy == "late_favorite"
                     else args.signal_confirmations
@@ -1841,7 +2377,13 @@ def watch() -> None:
                     signal,
                     time.monotonic(),
                     max(1, required_confirmations),
-                    hedge_confirmation_min_seconds if is_protective_hedge else 0.0,
+                    (
+                        0.0
+                        if signal.reason.startswith("protective_open_reversal_stop")
+                        else hedge_confirmation_min_seconds
+                        if is_protective_hedge
+                        else 0.0
+                    ),
                     hedge_max_price_worsening if is_protective_hedge else None,
                 )
                 if not confirmed:
@@ -1855,9 +2397,403 @@ def watch() -> None:
                     sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 confirmation_state.reset()
-                trade_size = order_size
+                try:
+                    latest_price_to_beat = price_to_beat_client.fetch(
+                        current_market.event_start_time,
+                        current_market.end_time,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "ORDER_BLOCKED_PRICE_TO_BEAT_UNAVAILABLE slug=%s error=%s",
+                        current_market.slug,
+                        exc,
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                if latest_price_to_beat.price_to_beat != start_price:
+                    logger.warning(
+                        "PRICE_TO_BEAT_CHANGED slug=%s previous=%s latest=%s; "
+                        "resetting samples and confirmations",
+                        current_market.slug,
+                        start_price,
+                        latest_price_to_beat.price_to_beat,
+                    )
+                    start_price = None
+                    open_price_tracker.reset()
+                    open_price_tracker.observe(
+                        latest_price_to_beat.price_to_beat,
+                        time.monotonic(),
+                    )
+                    prices = []
+                    price_sample_times = []
+                    up_ask_prices = []
+                    down_ask_prices = []
+                    confirmation_state.reset()
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+
+                confirmed_signal = signal
+                try:
+                    refreshed_spot = price_client.btc_usd()
+                    if refreshed_spot.observed_at is not None:
+                        refreshed_age = abs(int(time.time()) - refreshed_spot.observed_at)
+                        if refreshed_age > args.max_spot_age:
+                            raise RuntimeError(
+                                f"Pre-submit Chainlink report is stale by {refreshed_age}s"
+                            )
+                    refreshed_up_quote, refreshed_down_quote = quote_outcomes(
+                        clob,
+                        current_market,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "ORDER_BLOCKED_PRE_SUBMIT_REFRESH slug=%s error=%s",
+                        current_market.slug,
+                        exc,
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+
+                refreshed_quote = (
+                    refreshed_up_quote if confirmed_signal.side == "UP" else refreshed_down_quote
+                )
+                if refreshed_quote is None or refreshed_quote.ask is None:
+                    logger.info(
+                        "ORDER_BLOCKED_PRE_SUBMIT_QUOTE slug=%s side=%s reason=missing_ask",
+                        current_market.slug,
+                        confirmed_signal.side,
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                ask_drop = confirmed_signal.price - refreshed_quote.ask
+                if ask_drop > pre_submit_max_adverse_ask_drop:
+                    logger.info(
+                        "ORDER_BLOCKED_ADVERSE_ASK_DROP slug=%s side=%s confirmed_ask=%s "
+                        "latest_ask=%s drop=%s max_drop=%s",
+                        current_market.slug,
+                        confirmed_signal.side,
+                        confirmed_signal.price,
+                        refreshed_quote.ask,
+                        ask_drop,
+                        pre_submit_max_adverse_ask_drop,
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+
+                refreshed_at = time.monotonic()
+                refreshed_prices = [*prices, refreshed_spot.price]
+                refreshed_sample_times = [*price_sample_times, refreshed_at]
+                refreshed_seconds_to_end = max(
+                    Decimal("0"),
+                    _seconds_to_end(current_market, datetime.now(timezone.utc)),
+                )
+                refreshed_sigma = estimate_sigma_per_sqrt_second(
+                    refreshed_prices,
+                    Decimal(str(poll_interval)),
+                    fallback_sigma,
+                    refreshed_sample_times,
+                )
+                refreshed_fair = btc_up_probability(
+                    start_price,
+                    refreshed_spot.price,
+                    refreshed_seconds_to_end,
+                    refreshed_sigma,
+                )
+
+                refreshed_signal: AutoTradeSignal | None
                 if is_protective_hedge:
-                    trade_size = min(order_size, primary_shares_this_window)
+                    if confirmed_signal.reason.startswith("protective_open_reversal_stop"):
+                        refreshed_required_reversal_seconds = (
+                            one_way_reversal_seconds
+                            if refreshed_seconds_to_end <= one_way_reversal_final_window_seconds
+                            else one_way_reversal_early_seconds
+                        )
+                        refreshed_reversal_buffer = protective_open_cross_buffer(
+                            start_price,
+                            refreshed_fair.sigma_per_sqrt_second,
+                            Decimal(str(refreshed_required_reversal_seconds)),
+                            one_way_reversal_min_usd,
+                            hedge_open_cross_sigma_multiplier,
+                        )
+                        refreshed_signal = choose_open_reversal_stop_signal(
+                            current_market,
+                            primary_side_this_window or "",
+                            refreshed_spot.price,
+                            start_price,
+                            refreshed_up_quote,
+                            refreshed_down_quote,
+                            refreshed_seconds_to_end,
+                            hedge_entry_cutoff_seconds,
+                            refreshed_reversal_buffer,
+                            one_way_reversal_min_bid,
+                            one_way_reversal_max_entry,
+                            hedge_max_spread,
+                            min_ask_sum,
+                            max_ask_sum,
+                        )
+                    elif confirmed_signal.reason.startswith("protective_market_reversal"):
+                        refreshed_signal = choose_market_reversal_hedge_signal(
+                            current_market,
+                            primary_side_this_window or "",
+                            refreshed_up_quote,
+                            refreshed_down_quote,
+                            refreshed_seconds_to_end,
+                            hedge_entry_start_seconds,
+                            hedge_entry_cutoff_seconds,
+                            hedge_market_reversal_threshold,
+                            hedge_max_entry,
+                            hedge_max_spread,
+                            min_ask_sum,
+                            max_ask_sum,
+                        )
+                    else:
+                        refreshed_signal = choose_protective_hedge_signal(
+                            current_market,
+                            primary_side_this_window or "",
+                            refreshed_fair.probability_up,
+                            refreshed_up_quote,
+                            refreshed_down_quote,
+                            refreshed_seconds_to_end,
+                            hedge_entry_start_seconds,
+                            hedge_entry_cutoff_seconds,
+                            hedge_max_entry,
+                            hedge_min_edge,
+                            hedge_min_win_probability,
+                            hedge_max_spread,
+                            min_ask_sum,
+                            max_ask_sum,
+                        )
+                    if not confirmed_signal.reason.startswith("protective_open_reversal_stop"):
+                        open_cross_buffer = protective_open_cross_buffer(
+                            start_price,
+                            refreshed_fair.sigma_per_sqrt_second,
+                            Decimal(str(hedge_confirmation_min_seconds)),
+                            hedge_open_cross_min_usd,
+                            hedge_open_cross_sigma_multiplier,
+                        )
+                        if (
+                            refreshed_signal is not None
+                            and not protective_spot_confirms_open_cross(
+                                refreshed_prices,
+                                start_price,
+                                refreshed_signal.side,
+                                open_cross_buffer,
+                            )
+                        ):
+                            refreshed_signal = None
+                elif args.strategy == "late_favorite":
+                    refreshed_signal = choose_late_favorite_signal(
+                        current_market,
+                        refreshed_fair.probability_up,
+                        refreshed_up_quote,
+                        refreshed_down_quote,
+                        refreshed_seconds_to_end,
+                        refreshed_prices,
+                        start_price,
+                        Decimal(str(args.late_entry_start_seconds)),
+                        Decimal(str(args.late_entry_cutoff_seconds)),
+                        late_min_entry,
+                        late_max_entry,
+                        late_min_win_probability,
+                        late_edge_margin,
+                        late_fee_rate,
+                        late_max_spread,
+                        late_min_ask_sum,
+                        late_max_ask_sum,
+                        args.late_confirmation_samples,
+                        late_min_expected_roi,
+                        late_min_lead_bps,
+                        late_max_pullback_bps,
+                        args.late_no_cross_samples,
+                        late_max_pullback_ratio,
+                        refreshed_fair.sigma_per_sqrt_second,
+                        late_volatility_buffer_multiplier,
+                    )
+                elif args.strategy == "late_one_way":
+                    refreshed_signal = choose_one_way_trend_signal(
+                        current_market,
+                        refreshed_up_quote,
+                        refreshed_down_quote,
+                        refreshed_seconds_to_end,
+                        refreshed_spot.price,
+                        start_price,
+                        [
+                            *up_ask_prices,
+                            *(
+                                [refreshed_up_quote.ask]
+                                if refreshed_up_quote is not None
+                                and refreshed_up_quote.ask is not None
+                                else []
+                            ),
+                        ],
+                        [
+                            *down_ask_prices,
+                            *(
+                                [refreshed_down_quote.ask]
+                                if refreshed_down_quote is not None
+                                and refreshed_down_quote.ask is not None
+                                else []
+                            ),
+                        ],
+                        one_way_entry_seconds,
+                        one_way_entry_cutoff_seconds,
+                        one_way_min_entry,
+                        one_way_max_entry,
+                        args.one_way_trend_samples,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                    )
+                else:
+                    refreshed_signal = choose_fair_value_edge_signal(
+                        current_market,
+                        refreshed_fair.probability_up,
+                        refreshed_up_quote,
+                        refreshed_down_quote,
+                        refreshed_seconds_to_end,
+                        decision_seconds_before_end,
+                        min_entry,
+                        max_entry,
+                        edge_threshold,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                        min_seconds_before_end,
+                        min_win_probability,
+                        refreshed_prices,
+                        start_price,
+                        low_entry_cutoff,
+                        low_entry_min_win_probability,
+                        args.low_entry_confirmation_samples,
+                        probability_shrinkage,
+                    )
+                    if (
+                        refreshed_signal is not None
+                        and not recent_spot_samples_support_side(
+                            refreshed_prices,
+                            start_price,
+                            refreshed_signal.side,
+                            args.trend_confirmation_samples,
+                            (
+                                trend_pullback_tolerance_usd
+                                if refreshed_signal.price >= low_entry_cutoff
+                                else Decimal("0")
+                            ),
+                            (
+                                trend_pullback_tolerance_percent
+                                if refreshed_signal.price >= low_entry_cutoff
+                                else Decimal("0")
+                            ),
+                        )
+                    ):
+                        refreshed_signal = None
+
+                if refreshed_signal is None or refreshed_signal.side != confirmed_signal.side:
+                    logger.info(
+                        "ORDER_BLOCKED_SIGNAL_CHANGED slug=%s confirmed_side=%s latest_side=%s",
+                        current_market.slug,
+                        confirmed_signal.side,
+                        refreshed_signal.side if refreshed_signal is not None else "NONE",
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+
+                signal = refreshed_signal
+                spot = refreshed_spot
+                prices = refreshed_prices
+                price_sample_times = refreshed_sample_times
+                fair = refreshed_fair
+                up_quote, down_quote = refreshed_up_quote, refreshed_down_quote
+                seconds_to_end = refreshed_seconds_to_end
+                trade_size = order_size
+                quoted_ask = signal.price
+                if trader is not None:
+                    maximum_execution_price = (
+                        one_way_reversal_max_entry + live_buy_slippage
+                        if signal.reason.startswith("protective_open_reversal_stop")
+                        else hedge_max_entry + live_buy_slippage
+                        if is_protective_hedge
+                        else late_max_entry + live_buy_slippage
+                        if args.strategy == "late_favorite"
+                        else one_way_max_entry
+                        if signal.reason.startswith("one_way_trend")
+                        else max_entry + live_buy_slippage
+                    )
+                    if signal.reason.startswith("one_way_trend"):
+                        execution_price = buy_limit_price_with_slippage(
+                            quoted_ask,
+                            live_buy_slippage,
+                            current_market.minimum_tick_size,
+                            maximum_execution_price,
+                        )
+                    elif not is_protective_hedge and args.strategy == "fair_value_edge":
+                        selected_probability = (
+                            shrink_probability_toward_even(
+                                fair.probability_up,
+                                probability_shrinkage,
+                            )
+                            if signal.side == "UP"
+                            else Decimal("1")
+                            - shrink_probability_toward_even(
+                                fair.probability_up,
+                                probability_shrinkage,
+                            )
+                        )
+                        execution_price = buy_limit_price_preserving_edge(
+                            quoted_ask,
+                            live_buy_slippage,
+                            current_market.minimum_tick_size,
+                            maximum_execution_price,
+                            selected_probability,
+                            seconds_to_end,
+                            edge_threshold,
+                        )
+                    elif is_protective_hedge and signal.reason.startswith("protective_hedge"):
+                        selected_probability = (
+                            fair.probability_up
+                            if signal.side == "UP"
+                            else Decimal("1") - fair.probability_up
+                        )
+                        execution_price = buy_limit_price_with_slippage(
+                            quoted_ask,
+                            live_buy_slippage,
+                            current_market.minimum_tick_size,
+                            min(maximum_execution_price, selected_probability - hedge_min_edge),
+                        )
+                    else:
+                        execution_price = buy_limit_price_with_slippage(
+                            quoted_ask,
+                            live_buy_slippage,
+                            current_market.minimum_tick_size,
+                            maximum_execution_price,
+                        )
+                    signal = AutoTradeSignal(
+                        side=signal.side,
+                        token_id=signal.token_id,
+                        price=execution_price,
+                        reason=(
+                            f"{signal.reason} quoted_ask={quoted_ask} "
+                            f"max_slippage={live_buy_slippage} "
+                            f"applied_slippage={execution_price - quoted_ask}"
+                        ),
+                    )
+                if is_protective_hedge:
+                    is_one_way_reversal = (
+                        args.strategy == "late_one_way"
+                        and signal.reason.startswith("protective_open_reversal_stop")
+                    )
+                    if is_one_way_reversal:
+                        trade_size = order_size
+                        protection_notional = signal.price * trade_size
+                    else:
+                        protection_notional = (
+                            min(primary_cost_this_window, hedge_max_live_notional)
+                            if hedge_max_live_notional > 0
+                            else primary_cost_this_window
+                        )
+                        trade_size = (
+                            protection_notional / signal.price
+                        ).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
                     hedge_risk = evaluate_protective_hedge_risk(
                         primary_side_this_window or "",
                         primary_cost_this_window,
@@ -1876,14 +2812,40 @@ def watch() -> None:
                         )
                         sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
+                    if is_one_way_reversal:
+                        loss_reduction = (
+                            hedge_risk.max_loss_before - hedge_risk.max_loss_after
+                        )
+                        required_loss_reduction = max(
+                            primary_cost_this_window
+                            * one_way_reversal_min_loss_reduction_percent,
+                            one_way_reversal_min_loss_reduction_notional,
+                        )
+                        if loss_reduction < required_loss_reduction:
+                            logger.info(
+                                "HEDGE_REJECTED slug=%s side=%s loss_reduction=%s "
+                                "required_loss_reduction=%s",
+                                current_market.slug,
+                                signal.side,
+                                loss_reduction.quantize(Decimal("0.0001")),
+                                required_loss_reduction.quantize(Decimal("0.0001")),
+                            )
+                            sleep_until_next_poll(poll_interval, iteration_started_at)
+                            continue
                     signal = AutoTradeSignal(
                         side=signal.side,
                         token_id=signal.token_id,
                         price=signal.price,
                         reason=(
                             f"{signal.reason} "
+                            f"aggregate_primary_orders={primary_orders_this_window} "
+                            f"aggregate_primary_cost={primary_cost_this_window.quantize(Decimal('0.0001'))} "
+                            f"aggregate_primary_shares={primary_shares_this_window.quantize(Decimal('0.0001'))} "
+                            f"protection_notional={protection_notional.quantize(Decimal('0.0001'))} "
+                            f"protected_shares={trade_size.quantize(Decimal('0.0001'))} "
                             f"max_loss_before={hedge_risk.max_loss_before.quantize(Decimal('0.0001'))} "
-                            f"max_loss_after={hedge_risk.max_loss_after.quantize(Decimal('0.0001'))}"
+                            f"max_loss_after={hedge_risk.max_loss_after.quantize(Decimal('0.0001'))} "
+                            f"loss_reduction={(hedge_risk.max_loss_before - hedge_risk.max_loss_after).quantize(Decimal('0.0001'))}"
                         ),
                     )
                 logger.info(
@@ -1914,18 +2876,30 @@ def watch() -> None:
                             return
                     else:
                         logger.info("DRY RUN: would buy %s at %s x %s", signal.side, signal.price, trade_size)
-                    if primary_side_this_window is None:
+                    if is_protective_hedge:
+                        aggregate_protection_completed = True
+                        one_way_reversal_started_at = None
+                    elif primary_side_this_window is None:
                         primary_side_this_window = signal.side
+                        primary_orders_this_window = 1
                         if args.paper_trading:
                             primary_cost_this_window = paper_stake
                             primary_shares_this_window = paper_stake / signal.price
                         else:
                             primary_cost_this_window = signal.price * trade_size
                             primary_shares_this_window = trade_size
+                    elif args.strategy == "fair_value_edge" and signal.side == primary_side_this_window:
+                        primary_orders_this_window += 1
+                        if args.paper_trading:
+                            primary_cost_this_window += paper_stake
+                            primary_shares_this_window += paper_stake / signal.price
+                        else:
+                            primary_cost_this_window += signal.price * trade_size
+                            primary_shares_this_window += trade_size
                 else:
                     notional = signal.price * trade_size
                     live_notional_cap = (
-                        hedge_max_live_notional
+                        protection_notional
                         if is_protective_hedge
                         else late_max_live_notional
                         if args.strategy == "late_favorite"
@@ -1955,6 +2929,16 @@ def watch() -> None:
                         "size": str(trade_size),
                         "notional": str(notional),
                         "order_type": args.live_order_type,
+                        "order_role": (
+                            "reverse_protection"
+                            if is_protective_hedge
+                            else "primary"
+                            if primary_side_this_window is None
+                            else "same_direction_add"
+                        ),
+                        "quoted_ask": str(quoted_ask),
+                        "max_slippage": str(live_buy_slippage),
+                        "applied_slippage": str(signal.price - quoted_ask),
                         "reason": signal.reason,
                         "response": None,
                         "error": None,
@@ -2031,13 +3015,26 @@ def watch() -> None:
                         sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     live_orders_matched += 1
-                    if primary_side_this_window is None:
+                    if is_protective_hedge:
+                        aggregate_protection_completed = True
+                        one_way_reversal_started_at = None
+                    elif primary_side_this_window is None:
                         primary_side_this_window = signal.side
+                        primary_orders_this_window = 1
                         primary_cost_this_window, primary_shares_this_window = response_fill_amounts(
                             response,
                             signal.price,
                             trade_size,
                         )
+                    elif args.strategy == "fair_value_edge" and signal.side == primary_side_this_window:
+                        fill_cost, fill_shares = response_fill_amounts(
+                            response,
+                            signal.price,
+                            trade_size,
+                        )
+                        primary_orders_this_window += 1
+                        primary_cost_this_window += fill_cost
+                        primary_shares_this_window += fill_shares
                     live_summary["matched_orders"] = live_orders_matched
                     order_record["matched_at"] = datetime.now(timezone.utc).isoformat()
                     notifications.record_fill(order_record)

@@ -15,6 +15,49 @@ class PriceToBeat:
     incomplete: bool
     timestamp_ms: int | None
 
+    @property
+    def price_to_beat(self) -> Decimal:
+        """Polymarket exposes the window's Price to Beat as openPrice."""
+        return self.open_price
+
+
+@dataclass
+class StableOpenPriceTracker:
+    required_confirmations: int = 2
+    minimum_stable_seconds: float = 5.0
+    candidate: Decimal | None = None
+    confirmations: int = 0
+    candidate_since: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.required_confirmations < 2:
+            raise ValueError("Stable open price requires at least two confirmations")
+        if self.minimum_stable_seconds < 0:
+            raise ValueError("Stable open price duration must not be negative")
+
+    def reset(self) -> None:
+        self.candidate = None
+        self.confirmations = 0
+        self.candidate_since = None
+
+    def observe(self, open_price: Decimal, observed_at: float) -> Decimal | None:
+        if open_price <= 0:
+            self.reset()
+            return None
+        if self.candidate != open_price or self.candidate_since is None:
+            self.candidate = open_price
+            self.confirmations = 1
+            self.candidate_since = observed_at
+            return None
+        self.confirmations += 1
+        stable_seconds = max(0.0, observed_at - self.candidate_since)
+        if (
+            self.confirmations >= self.required_confirmations
+            and stable_seconds >= self.minimum_stable_seconds
+        ):
+            return open_price
+        return None
+
 
 class PolymarketPriceToBeatClient:
     URL = "https://polymarket.com/api/crypto/crypto-price"

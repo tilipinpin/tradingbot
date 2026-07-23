@@ -34,7 +34,10 @@ from src.watch_updown import (
     account_new_paper_settlements,
     advance_signal_confirmation,
     adverse_jump_exceeds_dynamic_threshold,
+    buy_limit_price_with_slippage,
+    buy_limit_price_preserving_edge,
     consume_pause_window,
+    effective_pullback_tolerance,
     evaluate_protective_hedge_risk,
     choose_fair_value_edge_signal,
     choose_market_reversal_hedge_signal,
@@ -46,7 +49,6 @@ from src.watch_updown import (
     live_session_should_continue,
     window_trade_count_after_attempt,
     open_paper_position,
-    official_open_retry_expired,
     price_alignment_status,
     polling_interval_for_seconds_left,
     protective_open_cross_buffer,
@@ -54,6 +56,7 @@ from src.watch_updown import (
     quotes_pass_sanity_checks,
     response_fill_amounts,
     recent_spot_samples_support_side,
+    required_fair_value_edge,
     settle_all_paper_positions,
     settle_paper_positions,
     shrink_probability_toward_even,
@@ -604,27 +607,40 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.max_live_orders == 0
     assert args.max_trades == 2
     assert args.duration == 0
+    assert args.decision_seconds_before_end == 120
+    assert args.min_seconds_before_end == 25
     assert args.min_entry == "0.50"
     assert args.trend_confirmation_samples == 3
+    assert args.trend_pullback_tolerance_usd == "1.00"
+    assert args.trend_pullback_tolerance_percent == "25"
     assert args.hedge_signal_confirmations == 2
-    assert args.hedge_confirmation_min_seconds == 5.0
+    assert args.hedge_confirmation_min_seconds == 2.0
     assert args.hedge_max_price_worsening == "0.05"
     assert args.hedge_entry_start_seconds == 300
-    assert args.hedge_entry_cutoff_seconds == 3
-    assert args.hedge_open_cross_min_usd == "2.00"
+    assert args.hedge_entry_cutoff_seconds == 1
+    assert args.hedge_open_cross_min_usd == "1.00"
     assert args.hedge_open_cross_sigma_multiplier == "1.00"
     assert args.hedge_max_spread == "0.10"
-    assert args.hedge_min_win_probability == "0.62"
+    assert args.hedge_market_reversal_threshold == "0.55"
+    assert args.hedge_min_win_probability == "0.53"
+    assert args.hedge_min_edge == "0.01"
     assert args.hedge_fee_rate == "0.07"
+    assert args.post_fill_poll_interval == 1.0
+    assert args.pre_submit_max_adverse_ask_drop == "0.02"
     assert args.max_entry == "0.78"
-    assert args.max_live_notional == "3.75"
+    assert args.max_live_notional == "4.05"
     assert args.late_max_live_notional == "4.70"
     assert args.low_entry_cutoff == "0.55"
-    assert args.low_entry_min_win_probability == "0.68"
+    assert args.low_entry_min_win_probability == "0.61"
     assert args.low_entry_confirmation_samples == 3
     assert args.probability_shrinkage == "1.00"
+    assert args.min_win_probability == "0.55"
+    assert args.edge == "0.02"
     assert args.max_spread == "0.05"
+    assert args.official_open_confirmations == 2
+    assert args.official_open_stable_seconds == 5.0
     assert args.live_order_type == "FAK"
+    assert args.live_buy_slippage == "0.03"
     assert args.late_entry_start_seconds == 55
     assert args.late_entry_cutoff_seconds == 8
     assert args.late_min_entry == "0.65"
@@ -644,6 +660,45 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.late_max_pullback_ratio == "0.50"
     assert args.late_volatility_buffer_multiplier == "0.50"
     assert args.late_pause_windows_after_loss == 0
+
+
+def test_buy_limit_slippage_adds_three_ticks_and_respects_execution_cap() -> None:
+    assert buy_limit_price_with_slippage(
+        Decimal("0.61"), Decimal("0.03"), "0.01", Decimal("0.81")
+    ) == Decimal("0.64")
+    assert buy_limit_price_with_slippage(
+        Decimal("0.79"), Decimal("0.03"), "0.01", Decimal("0.81")
+    ) == Decimal("0.81")
+
+
+def test_buy_limit_slippage_never_crosses_one() -> None:
+    assert buy_limit_price_with_slippage(
+        Decimal("0.98"), Decimal("0.03"), "0.01", Decimal("1.02")
+    ) == Decimal("0.99")
+
+
+def test_buy_limit_slippage_preserves_required_edge() -> None:
+    assert required_fair_value_edge(
+        Decimal("0.60"), Decimal("89"), Decimal("0.06")
+    ) == Decimal("0.06")
+    assert buy_limit_price_preserving_edge(
+        Decimal("0.60"),
+        Decimal("0.03"),
+        "0.01",
+        Decimal("0.81"),
+        Decimal("0.6681"),
+        Decimal("89"),
+        Decimal("0.06"),
+    ) == Decimal("0.60")
+    assert buy_limit_price_preserving_edge(
+        Decimal("0.60"),
+        Decimal("0.03"),
+        "0.01",
+        Decimal("0.81"),
+        Decimal("0.72"),
+        Decimal("89"),
+        Decimal("0.06"),
+    ) == Decimal("0.63")
 
 
 def test_live_response_requires_conclusive_match() -> None:
@@ -982,21 +1037,6 @@ def test_watch_updown_slug_helpers() -> None:
     assert next_5m_slug("btc-updown-5m-1783685100") == "btc-updown-5m-1783685400"
 
 
-def test_official_open_retries_until_the_strategy_entry_phase() -> None:
-    assert official_open_retry_expired(
-        Decimal("91"), "fair_value_edge", Decimal("90"), Decimal("55")
-    ) is False
-    assert official_open_retry_expired(
-        Decimal("90"), "fair_value_edge", Decimal("90"), Decimal("55")
-    ) is True
-    assert official_open_retry_expired(
-        Decimal("56"), "late_favorite", Decimal("90"), Decimal("55")
-    ) is False
-    assert official_open_retry_expired(
-        Decimal("55"), "late_favorite", Decimal("90"), Decimal("55")
-    ) is True
-
-
 def test_fair_value_edge_signal_buys_best_edge() -> None:
     market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
     signal = choose_fair_value_edge_signal(
@@ -1212,34 +1252,34 @@ def test_50_cent_entry_uses_strict_probability_tier_and_spot_samples() -> None:
     market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
     rejected = choose_fair_value_edge_signal(
         market=market,
-        probability_up=Decimal("0.62"),
+        probability_up=Decimal("0.60"),
         up_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
         down_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
         seconds_to_end=Decimal("70"),
         decision_seconds_before_end=Decimal("90"),
         min_entry=Decimal("0.50"),
         max_entry=Decimal("0.78"),
-        edge_threshold=Decimal("0.06"),
+        edge_threshold=Decimal("0.02"),
         max_spread=Decimal("0.04"),
         min_ask_sum=Decimal("0.90"),
         max_ask_sum=Decimal("1.10"),
-        min_win_probability=Decimal("0.62"),
+        min_win_probability=Decimal("0.55"),
         low_entry_cutoff=Decimal("0.55"),
     )
     accepted = choose_fair_value_edge_signal(
         market=market,
-        probability_up=Decimal("0.70"),
+        probability_up=Decimal("0.63"),
         up_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
         down_quote=OrderBookQuote(bid=Decimal("0.49"), ask=Decimal("0.50")),
         seconds_to_end=Decimal("70"),
         decision_seconds_before_end=Decimal("90"),
         min_entry=Decimal("0.50"),
         max_entry=Decimal("0.78"),
-        edge_threshold=Decimal("0.06"),
+        edge_threshold=Decimal("0.02"),
         max_spread=Decimal("0.04"),
         min_ask_sum=Decimal("0.90"),
         max_ask_sum=Decimal("1.10"),
-        min_win_probability=Decimal("0.62"),
+        min_win_probability=Decimal("0.55"),
         low_entry_cutoff=Decimal("0.55"),
         recent_spot_prices=[Decimal("100.5"), Decimal("101"), Decimal("102")],
         start_price=Decimal("100"),
@@ -1248,7 +1288,7 @@ def test_50_cent_entry_uses_strict_probability_tier_and_spot_samples() -> None:
     assert rejected is None
     assert accepted is not None
     assert accepted.price == Decimal("0.50")
-    assert "required_probability=0.6800" in accepted.reason
+    assert "required_probability=0.6100" in accepted.reason
 
 
 def test_recent_spot_samples_require_same_side_and_supporting_net_move() -> None:
@@ -1274,7 +1314,69 @@ def test_recent_spot_samples_require_same_side_and_supporting_net_move() -> None
     ) is True
 
 
-def test_low_entry_requires_68_percent_and_three_supporting_samples() -> None:
+def test_recent_spot_samples_allow_configured_pullback_without_crossing_open() -> None:
+    start = Decimal("100")
+
+    up_prices = [Decimal("101"), Decimal("100.8"), Decimal("100.3"), Decimal("100.1")]
+    assert recent_spot_samples_support_side(up_prices, start, "UP", 3) is False
+    assert recent_spot_samples_support_side(
+        up_prices,
+        start,
+        "UP",
+        3,
+        Decimal("1.00"),
+    ) is True
+
+    down_prices = [Decimal("99"), Decimal("99.2"), Decimal("99.7"), Decimal("99.9")]
+    assert recent_spot_samples_support_side(down_prices, start, "DOWN", 3) is False
+    assert recent_spot_samples_support_side(
+        down_prices,
+        start,
+        "DOWN",
+        3,
+        Decimal("1.00"),
+    ) is True
+
+    assert recent_spot_samples_support_side(
+        [Decimal("100.5"), Decimal("99.9"), Decimal("100.1")],
+        start,
+        "UP",
+        3,
+        Decimal("1.00"),
+    ) is False
+    assert recent_spot_samples_support_side(
+        [Decimal("106"), Decimal("116"), Decimal("113")],
+        start,
+        "UP",
+        3,
+        Decimal("1.00"),
+    ) is False
+
+
+def test_pullback_tolerance_uses_larger_fixed_or_percentage_value() -> None:
+    start = Decimal("66000")
+
+    assert effective_pullback_tolerance(Decimal("1.00"), Decimal("8"), Decimal("25")) == Decimal("2")
+    assert effective_pullback_tolerance(Decimal("1.00"), Decimal("2"), Decimal("25")) == Decimal("1.00")
+    assert recent_spot_samples_support_side(
+        [Decimal("66008"), Decimal("66012"), Decimal("66009")],
+        start,
+        "UP",
+        3,
+        Decimal("1.00"),
+        Decimal("25"),
+    ) is True
+    assert recent_spot_samples_support_side(
+        [Decimal("66008"), Decimal("66012"), Decimal("66008.5")],
+        start,
+        "UP",
+        3,
+        Decimal("1.00"),
+        Decimal("25"),
+    ) is False
+
+
+def test_low_entry_requires_61_percent_and_three_supporting_samples() -> None:
     market = make_market("Bitcoin Up or Down?", "btc-updown-5m-1", "c1", ("up", "down"), "0.01", False, Decimal("10"))
     base = {
         "market": market,
@@ -1284,19 +1386,19 @@ def test_low_entry_requires_68_percent_and_three_supporting_samples() -> None:
         "decision_seconds_before_end": Decimal("90"),
         "min_entry": Decimal("0.45"),
         "max_entry": Decimal("0.75"),
-        "edge_threshold": Decimal("0.06"),
+        "edge_threshold": Decimal("0.02"),
         "max_spread": Decimal("0.04"),
         "min_ask_sum": Decimal("0.90"),
         "max_ask_sum": Decimal("1.10"),
-        "min_win_probability": Decimal("0.62"),
+        "min_win_probability": Decimal("0.55"),
         "recent_spot_prices": [Decimal("101"), Decimal("100.5"), Decimal("102")],
         "start_price": Decimal("100"),
     }
 
-    accepted = choose_fair_value_edge_signal(probability_up=Decimal("0.70"), **base)
-    low_probability = choose_fair_value_edge_signal(probability_up=Decimal("0.67"), **base)
+    accepted = choose_fair_value_edge_signal(probability_up=Decimal("0.63"), **base)
+    low_probability = choose_fair_value_edge_signal(probability_up=Decimal("0.60"), **base)
     reversed_samples = choose_fair_value_edge_signal(
-        probability_up=Decimal("0.70"),
+        probability_up=Decimal("0.63"),
         **{
             **base,
             "recent_spot_prices": [Decimal("102"), Decimal("101"), Decimal("100.5")],
@@ -1305,7 +1407,7 @@ def test_low_entry_requires_68_percent_and_three_supporting_samples() -> None:
 
     assert accepted is not None
     assert accepted.side == "UP"
-    assert "required_probability=0.6800" in accepted.reason
+    assert "required_probability=0.6100" in accepted.reason
     assert low_probability is None
     assert reversed_samples is None
 
@@ -1549,7 +1651,7 @@ def test_late_favorite_requires_fee_adjusted_expected_roi() -> None:
 
 def test_late_favorite_is_limited_to_one_trade_per_window() -> None:
     assert strategy_trade_limit("late_favorite", 5) == 1
-    assert strategy_trade_limit("fair_value_edge", 5) == 5
+    assert strategy_trade_limit("fair_value_edge", 5) == 6
 
 
 def test_loss_pause_consumes_each_full_window_without_off_by_one() -> None:

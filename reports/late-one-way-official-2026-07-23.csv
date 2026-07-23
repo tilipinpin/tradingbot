@@ -1,0 +1,11 @@
+slug,source,side,winner,entry_seconds_left,entry_ask,entry_price,primary_cost_with_fee,protected,hedge_seconds_left,hedge_ask,hedge_price,total_cost_with_protection,pnl_without_protection,pnl_with_protection
+btc-updown-5m-1784361300,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,UP,UP,5,0.69,0.69,3.524865,False,,,,3.524865,1.475135,1.475135
+btc-updown-5m-1784362800,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,DOWN,UP,45,0.68,0.68,3.476160,False,,,,3.476160,-3.476160,-3.476160
+btc-updown-5m-1784363400,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,UP,UP,32,0.7,0.70,3.573500,False,,,,3.573500,1.426500,1.426500
+btc-updown-5m-1784364000,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,DOWN,DOWN,71,0.7,0.70,3.573500,False,,,,3.573500,1.426500,1.426500
+btc-updown-5m-1784364300,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,UP,UP,99,0.69,0.69,3.524865,False,,,,3.524865,1.475135,1.475135
+btc-updown-5m-1784365800,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,UP,UP,80,0.66,0.66,3.378540,False,,,,3.378540,1.621460,1.621460
+btc-updown-5m-1784368500,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,UP,UP,17,0.6,0.6,3.0840,False,,,,3.0840,1.9160,1.9160
+btc-updown-5m-1784369700,maker_momentum_v2_official_8h_20260718_153912.snapshots.jsonl,DOWN,DOWN,54,0.61,0.61,3.133265,False,,,,3.133265,1.866735,1.866735
+btc-updown-5m-1784370000,late_favorite_v5_official_8h_20260718_153912.snapshots.jsonl,UP,UP,86,0.7,0.70,3.573500,False,,,,3.573500,1.426500,1.426500
+btc-updown-5m-1784372100,low_price_reversal_v1_official_20260718_183524.snapshots.jsonl,UP,UP,61,0.65,0.65,3.329625,False,,,,3.329625,1.670375,1.670375

@@ -296,6 +296,7 @@ def format_fill_message(order: dict[str, Any]) -> str:
     lines = [
         "💰 Polymarket 实际成交",
         f"市场: {order.get('slug', 'N/A')}",
+        f"订单类型: {order_role_label(order)}",
         f"方向: {str(order.get('side', 'N/A')).upper()}",
         f"成交均价: {price.quantize(Decimal('0.0001'))}",
         f"数量: {shares.quantize(Decimal('0.0001'))} 份",
@@ -320,6 +321,24 @@ def settlement_key(order: dict[str, Any]) -> str:
     )
 
 
+def order_role(order: dict[str, Any]) -> str:
+    configured = str(order.get("order_role") or "").strip().lower()
+    if configured in {"primary", "same_direction_add", "reverse_protection"}:
+        return configured
+    reason = str(order.get("reason") or "").lower()
+    if reason.startswith("protective_"):
+        return "reverse_protection"
+    return "primary"
+
+
+def order_role_label(order: dict[str, Any]) -> str:
+    return {
+        "primary": "首单",
+        "same_direction_add": "同向加仓",
+        "reverse_protection": "反向保护单",
+    }[order_role(order)]
+
+
 def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
     cost, shares, price = fill_amounts(order)
     side = str(order.get("side") or "").upper()
@@ -333,6 +352,8 @@ def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
     return {
         "slug": str(order.get("slug") or ""),
         "side": side,
+        "order_role": order_role(order),
+        "reason": str(order.get("reason") or ""),
         "winner": winner.upper(),
         "won": won,
         "cost": str(cost),
@@ -445,6 +466,9 @@ def format_window_settlement_message(
     side_summary = " / ".join(
         f"{side} × {count}" for side, count in side_counts.items()
     )
+    reverse_orders = sum(
+        1 for item in window_settlements if order_role(item) == "reverse_protection"
+    )
     return_text = "N/A" if net_return_rate is None else f"{net_return_rate:+.2%}"
     first = window_settlements[0]
     lines = [
@@ -453,6 +477,7 @@ def format_window_settlement_message(
         f"本窗口净盈亏估算: {net_pnl:+.4f} pUSD",
         f"市场: {first.get('slug', 'N/A')}",
         f"本窗口成交: {len(window_settlements)} 单",
+        f"反向保护单: {reverse_orders} 单",
         f"买入方向: {side_summary}",
         f"结算方向: {first.get('winner', 'N/A')}",
         f"窗口胜负: {window_wins} 胜 / {len(window_settlements) - window_wins} 负",
@@ -466,7 +491,7 @@ def format_window_settlement_message(
         item_gross = _as_decimal(item.get("gross_pnl"))
         item_net = item_gross - settlement_estimated_fee(item)
         lines.append(
-            f"订单 {index}: {item.get('side', 'N/A')} "
+            f"订单 {index} [{order_role_label(item)}]: {item.get('side', 'N/A')} "
             f"{_as_decimal(item.get('shares')):.4f}份 @ "
             f"{_as_decimal(item.get('entry_price')):.4f} | "
             f"{'胜' if item.get('won') is True else '负'} {item_net:+.4f} pUSD"
@@ -687,9 +712,9 @@ class DiscordNotifier:
     def enabled(self) -> bool:
         return bool(self.webhook_url)
 
-    def send(self, message: str) -> bool:
+    def send_with_message_id(self, message: str) -> tuple[bool, str | None]:
         if not self.enabled:
-            return False
+            return False, None
         payload: dict[str, Any] = {
             "embeds": [build_discord_embed(message)],
             "username": self.username,
@@ -698,15 +723,41 @@ class DiscordNotifier:
         if self.mention:
             payload["content"] = self.mention
         try:
+            separator = "&" if "?" in self.webhook_url else "?"
             response = self.session.post(
-                self.webhook_url,
+                f"{self.webhook_url}{separator}wait=true",
                 json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            response_payload = response.json()
+            message_id = (
+                str(response_payload.get("id"))
+                if isinstance(response_payload, dict) and response_payload.get("id")
+                else None
+            )
+            return True, message_id
+        except Exception as exc:
+            logger.warning("Discord webhook failed: %s", sanitize_sensitive_text(exc))
+            return False, None
+
+    def send(self, message: str) -> bool:
+        sent, _ = self.send_with_message_id(message)
+        return sent
+
+    def delete_message(self, message_id: str) -> bool:
+        if not self.enabled or not message_id:
+            return False
+        webhook_url = self.webhook_url.split("?", 1)[0].rstrip("/")
+        try:
+            response = self.session.delete(
+                f"{webhook_url}/messages/{message_id}",
                 timeout=self.timeout,
             )
             response.raise_for_status()
             return True
         except Exception as exc:
-            logger.warning("Discord webhook failed: %s", sanitize_sensitive_text(exc))
+            logger.warning("Discord webhook message deletion failed: %s", sanitize_sensitive_text(exc))
             return False
 
     def alert(self, key: str, message: str, cooldown: float = 300) -> bool:
@@ -737,6 +788,9 @@ class TradingNotificationService:
         wallet_address: str | None = None,
         positions_api: str = POSITIONS_API,
         discord_notifier: DiscordNotifier | None = None,
+        discord_start_stop_retention_seconds: int = 300,
+        discord_settlement_retention_seconds: int = 259200,
+        discord_delete_retry_seconds: int = 900,
     ) -> None:
         self.notifier = notifier
         self.discord_notifier = discord_notifier or DiscordNotifier(None)
@@ -759,12 +813,16 @@ class TradingNotificationService:
         self.commands_enabled = commands_enabled
         self.wallet_address = (wallet_address or "").strip()
         self.positions_api = positions_api
+        self.discord_start_stop_retention_seconds = max(0, discord_start_stop_retention_seconds)
+        self.discord_settlement_retention_seconds = max(0, discord_settlement_retention_seconds)
+        self.discord_delete_retry_seconds = max(60, discord_delete_retry_seconds)
         try:
             self.local_timezone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
             logger.warning("Unknown Telegram timezone %s; using Asia/Shanghai", timezone_name)
             self.local_timezone = ZoneInfo("Asia/Shanghai")
         self.state = self._load_state()
+        self._next_discord_deletion_at = self._discord_next_deletion_at()
         self._pause_event = threading.Event()
         if bool(self.state.get("control", {}).get("paused")):
             self._pause_event.set()
@@ -808,6 +866,15 @@ class TradingNotificationService:
             in {"1", "true", "yes", "on"},
             wallet_address=wallet_address,
             positions_api=os.getenv("POLYMARKET_POSITIONS_API", POSITIONS_API),
+            discord_start_stop_retention_seconds=int(
+                os.getenv("DISCORD_START_STOP_RETENTION_SECONDS", "300")
+            ),
+            discord_settlement_retention_seconds=int(
+                os.getenv("DISCORD_SETTLEMENT_RETENTION_SECONDS", "259200")
+            ),
+            discord_delete_retry_seconds=int(
+                os.getenv("DISCORD_DELETE_RETRY_SECONDS", "900")
+            ),
         )
 
     @property
@@ -827,11 +894,20 @@ class TradingNotificationService:
         channel: str,
         message: str,
         telegram_reply_markup: dict[str, Any] | None = None,
+        discord_retention_seconds: int | None = None,
+        discord_message_kind: str = "notification",
     ) -> bool:
         if channel == "telegram":
             return self.notifier.send(message, reply_markup=telegram_reply_markup)
         if channel == "discord":
-            return self.discord_notifier.send(message)
+            sent, message_id = self.discord_notifier.send_with_message_id(message)
+            if sent and message_id and discord_retention_seconds is not None:
+                self._schedule_discord_deletion(
+                    message_id,
+                    discord_retention_seconds,
+                    discord_message_kind,
+                )
+            return sent
         return False
 
     @staticmethod
@@ -842,30 +918,134 @@ class TradingNotificationService:
         self,
         message: str,
         telegram_reply_markup: dict[str, Any] | None = None,
+        discord_retention_seconds: int | None = None,
+        discord_message_kind: str = "notification",
     ) -> bool:
         results = [
-            self._send_channel(channel, message, telegram_reply_markup)
+            self._send_channel(
+                channel,
+                message,
+                telegram_reply_markup,
+                discord_retention_seconds,
+                discord_message_kind,
+            )
             for channel in self._ordered_channels(self._enabled_channels())
         ]
         return any(results)
 
-    def _deliver_missing_channels(self, message: str, delivered: set[str]) -> set[str]:
-        return self._deliver_missing_channels_to(message, delivered, self._enabled_channels())
+    def _deliver_missing_channels(
+        self,
+        message: str,
+        delivered: set[str],
+        discord_retention_seconds: int | None = None,
+        discord_message_kind: str = "notification",
+    ) -> set[str]:
+        return self._deliver_missing_channels_to(
+            message,
+            delivered,
+            self._enabled_channels(),
+            discord_retention_seconds,
+            discord_message_kind,
+        )
 
     def _deliver_missing_channels_to(
         self,
         message: str,
         delivered: set[str],
         channels: set[str],
+        discord_retention_seconds: int | None = None,
+        discord_message_kind: str = "notification",
     ) -> set[str]:
         updated = set(delivered)
         for channel in self._ordered_channels(channels - delivered):
-            if self._send_channel(channel, message):
+            if self._send_channel(
+                channel,
+                message,
+                discord_retention_seconds=discord_retention_seconds,
+                discord_message_kind=discord_message_kind,
+            ):
                 updated.add(channel)
         return updated
 
     def _broadcast_alert(self, key: str, message: str, cooldown: float) -> bool:
         return self.notifier.alert(key, message, cooldown=cooldown) if self.notifier.enabled else False
+
+    def _discord_next_deletion_at(self) -> float | None:
+        queue = self.state.get("discord_message_deletions", [])
+        due_times: list[float] = []
+        if isinstance(queue, list):
+            for item in queue:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    due_times.append(float(item.get("next_attempt_at") or item["delete_at"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return min(due_times) if due_times else None
+
+    def _schedule_discord_deletion(
+        self,
+        message_id: str,
+        retention_seconds: int,
+        message_kind: str,
+    ) -> None:
+        if retention_seconds <= 0:
+            return
+        delete_at = time.time() + retention_seconds
+        queue = self.state.setdefault("discord_message_deletions", [])
+        if not isinstance(queue, list):
+            queue = []
+            self.state["discord_message_deletions"] = queue
+        queue.append(
+            {
+                "message_id": message_id,
+                "kind": message_kind,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "delete_at": delete_at,
+            }
+        )
+        self._next_discord_deletion_at = (
+            delete_at
+            if self._next_discord_deletion_at is None
+            else min(self._next_discord_deletion_at, delete_at)
+        )
+        self._save_state()
+
+    def maybe_delete_expired_discord_messages(self) -> None:
+        now = time.time()
+        if self._next_discord_deletion_at is None or now < self._next_discord_deletion_at:
+            return
+        queue = self.state.get("discord_message_deletions", [])
+        if not isinstance(queue, list):
+            self.state["discord_message_deletions"] = []
+            self._next_discord_deletion_at = None
+            self._save_state()
+            return
+        remaining: list[dict[str, Any]] = []
+        changed = False
+        for item in queue:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            message_id = str(item.get("message_id") or "")
+            try:
+                due_at = float(item.get("next_attempt_at") or item["delete_at"])
+            except (KeyError, TypeError, ValueError):
+                changed = True
+                continue
+            if due_at > now:
+                remaining.append(item)
+                continue
+            if message_id and self.discord_notifier.delete_message(message_id):
+                changed = True
+                continue
+            item["next_attempt_at"] = now + self.discord_delete_retry_seconds
+            remaining.append(item)
+            changed = True
+        self.state["discord_message_deletions"] = remaining
+        self._next_discord_deletion_at = self._discord_next_deletion_at()
+        if changed:
+            self._save_state()
 
     @property
     def trading_paused(self) -> bool:
@@ -1012,6 +1192,8 @@ class TradingNotificationService:
                 ]
             ),
             telegram_reply_markup=reply_keyboard_markup(),
+            discord_retention_seconds=self.discord_start_stop_retention_seconds,
+            discord_message_kind="start",
         )
         self._start_command_polling()
 
@@ -1196,6 +1378,8 @@ class TradingNotificationService:
                 after = self._deliver_missing_channels(
                     format_window_settlement_message(records, account, cumulative),
                     before,
+                    self.discord_settlement_retention_seconds,
+                    "settlement",
                 )
                 if after != before:
                     window_record["notified_channels"] = sorted(after)
@@ -1209,7 +1393,7 @@ class TradingNotificationService:
             self._save_state()
 
     def maybe_send_daily(self, winner_lookup: Callable[[str], str | None]) -> None:
-        if not self.notifier.enabled or time.monotonic() < self._next_daily_attempt:
+        if not self.enabled or time.monotonic() < self._next_daily_attempt:
             return
         local_today = datetime.now(self.local_timezone).date()
         days = self.state.get("days", {})
@@ -1247,7 +1431,7 @@ class TradingNotificationService:
         start_balance = self._optional_decimal(day_state.get("start_balance"))
         end_balance = self._optional_decimal(day_state.get("end_balance"))
         delivered = set(day_state.get("reported_channels") or [])
-        daily_channels = {"telegram"}
+        daily_channels = self._enabled_channels()
         delivered = self._deliver_missing_channels_to(
             format_daily_message(report_day, stats, start_balance, end_balance, account),
             delivered,
@@ -1280,7 +1464,11 @@ class TradingNotificationService:
         ]
         if latest_error:
             lines.append(f"最后错误: {sanitize_sensitive_text(latest_error)[:500]}")
-        self._broadcast("\n".join(lines))
+        self._broadcast(
+            "\n".join(lines),
+            discord_retention_seconds=self.discord_start_stop_retention_seconds,
+            discord_message_kind="stop",
+        )
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -1290,6 +1478,7 @@ class TradingNotificationService:
                 "settlement_windows": {},
                 "control": {},
                 "telegram": {},
+                "discord_message_deletions": [],
             }
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -1298,6 +1487,7 @@ class TradingNotificationService:
                 payload.setdefault("settlement_windows", {})
                 payload.setdefault("control", {})
                 payload.setdefault("telegram", {})
+                payload.setdefault("discord_message_deletions", [])
                 return payload
             return {
                 "days": {},
@@ -1305,6 +1495,7 @@ class TradingNotificationService:
                 "settlement_windows": {},
                 "control": {},
                 "telegram": {},
+                "discord_message_deletions": [],
             }
         except (OSError, json.JSONDecodeError):
             return {
@@ -1313,6 +1504,7 @@ class TradingNotificationService:
                 "settlement_windows": {},
                 "control": {},
                 "telegram": {},
+                "discord_message_deletions": [],
             }
 
     def _start_command_polling(self) -> None:
