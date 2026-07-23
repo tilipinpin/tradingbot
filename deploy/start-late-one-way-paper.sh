@@ -39,8 +39,8 @@ exec "$PYTHON" -u -m src.watch_updown \
   --paper-bankroll 50 \
   --paper-stake 1 \
   --stop-when-bust \
-  --one-way-entry-seconds 300 \
-  --one-way-entry-cutoff-seconds 1 \
+  --one-way-entry-seconds 100 \
+  --one-way-entry-cutoff-seconds 25 \
   --one-way-min-entry 0.60 \
   --one-way-max-entry 0.70 \
   --one-way-trend-samples 5 \

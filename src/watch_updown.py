@@ -118,14 +118,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--one-way-entry-seconds",
         type=int,
-        default=300,
-        help="Start evaluating the one-way live entry when the five-minute event opens.",
+        default=100,
+        help="Start evaluating the one-way primary entry 100 seconds before settlement.",
     )
     parser.add_argument(
         "--one-way-entry-cutoff-seconds",
         type=int,
-        default=1,
-        help="Stop opening the primary one-way position this many seconds before settlement.",
+        default=25,
+        help="Stop opening the primary one-way position 25 seconds before settlement.",
     )
     parser.add_argument("--one-way-min-entry", default="0.60")
     parser.add_argument("--one-way-max-entry", default="0.70")

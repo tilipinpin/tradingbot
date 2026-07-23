@@ -37,6 +37,8 @@ exec "$PYTHON" -u -m src.watch_updown \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
   --trend-confirmation-samples 3 \
+  --one-way-entry-seconds 100 \
+  --one-way-entry-cutoff-seconds 25 \
   --trend-pullback-tolerance-usd 1.00 \
   --trend-pullback-tolerance-percent 25 \
   --confirmation-jump-sigma-multiplier 1.25 \

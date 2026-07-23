@@ -611,6 +611,8 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.min_seconds_before_end == 25
     assert args.min_entry == "0.50"
     assert args.trend_confirmation_samples == 3
+    assert args.one_way_entry_seconds == 100
+    assert args.one_way_entry_cutoff_seconds == 25
     assert args.trend_pullback_tolerance_usd == "1.00"
     assert args.trend_pullback_tolerance_percent == "25"
     assert args.hedge_signal_confirmations == 2
