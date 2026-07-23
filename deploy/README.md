@@ -8,10 +8,8 @@ Git.
 Snapshot captured on 2026-07-18 before enabling official Polymarket `openPrice`
 alignment:
 
-- Live default: `fair_value_edge`, unlimited duration, at most two matched
-  orders per five-minute window. Telegram can switch the next complete window
-  to `late_favorite`, which is limited to one matched order per window.
-- Paper: `late_favorite` v5, eight hours, 20 pUSD bankroll, 1 pUSD stake.
+- Live default: `fair_value_edge`, unlimited duration. Telegram can switch the
+  next complete window to `late_one_way`.
 
 The shell launchers accept an optional first argument for the initial event slug.
 When omitted, they start from the current five-minute epoch.

@@ -221,7 +221,7 @@ Telegram 会发送以下全部通知；Discord 只发送其中的启动、结算
 
 策略选择需要二次确认，并持久化到 `data/telegram_daily_state.json`，只在下一个完整
 5 分钟窗口生效。纸面、dry-run 和实盘 Telegram 选择器均提供 `fair_value_edge` 与
-`late_favorite`。选择“恢复启动策略”可清除 Telegram 策略覆盖，回到启动命令指定的策略。
+`late_one_way`。选择“恢复启动策略”可清除 Telegram 策略覆盖，回到启动命令指定的策略。
 
 首次启用命令轮询时会丢弃启动前积压的旧消息，避免历史 `/stop` 或 `/restart` 被误执行。
 控制状态和 Telegram offset 也保存在 `data/telegram_daily_state.json`，所以进程重启后不会重复执行指令。
@@ -263,53 +263,6 @@ python -m src.watch_updown \
   --max-consecutive-losses 2 \
   --pause-windows-after-losses 2
 ```
-
-`late_favorite` v5 是可用于纸面或实盘的尾盘高置信度策略。它在剩余 55–8 秒观察市场 favorite，
-只在市场与 Chainlink 模型同向时考虑入场，并要求 BTC 相对开盘价保留动态价格安全距离。
-同一窗口最多一单；亏损结算后下一个窗口继续评估，不启用连败暂停。纸面余额和盈亏会按
-Polymarket 加密市场公式扣除 taker fee：
-
-```bash
-python -m src.watch_updown \
-  --slug btc-updown-5m-<timestamp> \
-  --duration 28800 \
-  --interval 5 \
-  --auto-trade \
-  --strategy late_favorite \
-  --price-source POLYMARKET_CHAINLINK \
-  --ws-proxy socks5h://127.0.0.1:7898 \
-  --paper-trading \
-  --paper-bankroll 20 \
-  --paper-stake 1 \
-  --stop-when-bust \
-  --max-spot-age 5 \
-  --late-entry-start-seconds 55 \
-  --late-entry-cutoff-seconds 8 \
-  --late-min-entry 0.65 \
-  --late-max-entry 0.94 \
-  --late-min-win-probability 0.80 \
-  --late-min-expected-roi 0.02 \
-  --late-fee-rate 0.07 \
-  --late-max-spread 0.03 \
-  --late-min-ask-sum 0.96 \
-  --late-max-ask-sum 1.04 \
-  --late-confirmation-samples 2 \
-  --late-no-cross-samples 3 \
-  --late-signal-confirmations 1 \
-  --late-min-lead-bps 1.0 \
-  --late-max-pullback-bps 1.50 \
-  --late-max-pullback-ratio 0.50 \
-  --late-volatility-buffer-multiplier 0.50 \
-  --late-pause-windows-after-loss 0
-```
-
-最低模型概率只是第一层过滤；每笔还必须覆盖 Taker fee 并保留至少 2% 的模型期望回报。
-最近 3 次 Chainlink 采样不得穿越开盘价，最近 2 次必须维持结算方向；当前领先既要达到
-1.0 bps，也要覆盖剩余时间波动率的 0.5 倍。相对近期极值的回撤不得超过 1.50 bps 和领先幅度
-的 50%。两个 outcome 的 bid/ask 通过一次批量请求读取，避免快速行情中多次请求产生交叉
-快照；内部趋势样本通过后只需一次完整信号，避免重复确认耗尽尾盘窗口。策略不会在同一盘口重复加仓。累计足够纸面
-样本并验证费后盈亏和回撤仍然必要；高命中率不等于保证盈利。实盘每个窗口最多一单，
-5 份订单的独立本金硬上限为 4.70 pUSD。
 
 `fair_value_edge` 会根据当前 BTC 价格、起始价、剩余时间和波动率估计出 UP 的理论概率，然后只在剩余 120–25 秒、模型概率相对盘口 ask 有足够 edge 时入场。波动率按每个样本的实际时间间隔计算，并始终不低于长期基准 `0.00005/√秒`。正常入场允许 `0.50–0.78`，模型概率至少 55%、edge 至少 2%；`0.55–0.78` 的三次趋势确认允许回撤 `max(1 USD, 本段最大领先距离的 25%)`，低于 0.55 的严格档要求至少 61% 胜率且仍禁止收窄。正常单最大 spread 为 0.05。确认完成后会重新读取 Chainlink 与双边盘口；所选 ask 下跌超过 0.02、方向改变或 edge 不再达标都会取消旧信号。首单成交后立即改为每秒轮询，第二个名额既可同方向加仓，也可反向保护并持续到剩余 1 秒。反向保护由两条独立路径触发：模型反向概率至少 53% 且 edge 至少 1%，或者反向盘口 bid 连续达到 0.55；盘口路径不再要求模型同步翻向。两条路径都要求 BTC 越过官方 `openPrice`，且距离至少为 `$1` 与两秒短期波动缓冲两者中的较大值。保护最大 spread 为 0.10，并要求同方向确认至少两次、持续至少 2 秒，ask 相对首次确认恶化不超过 0.05。最终仍使用首单实际成交成本和份数计算组合风险，只有最大亏损严格下降才提交。
 

@@ -74,7 +74,6 @@ exec "$PYTHON" -u -m src.watch_updown \
   --max-trades 2 \
   --max-live-orders 0 \
   --max-live-notional 4.05 \
-  --late-max-live-notional 4.70 \
   --live-order-type FAK \
   --live-buy-slippage 0.03 \
   --live-summary-json "$DATA_DIR/live_trade_summary.json"

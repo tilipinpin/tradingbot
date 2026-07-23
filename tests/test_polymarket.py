@@ -1649,8 +1649,7 @@ def test_late_favorite_requires_fee_adjusted_expected_roi() -> None:
     assert signal is None
 
 
-def test_late_favorite_is_limited_to_one_trade_per_window() -> None:
-    assert strategy_trade_limit("late_favorite", 5) == 1
+def test_fair_value_reserves_one_extra_protection_slot() -> None:
     assert strategy_trade_limit("fair_value_edge", 5) == 6
 
 

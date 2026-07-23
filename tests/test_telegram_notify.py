@@ -876,19 +876,19 @@ def test_paper_strategy_switch_is_queued_and_activated_next_window(tmp_path) -> 
         state_path=state,
     )
 
-    service._queue_strategy("late_favorite")
+    service._queue_strategy("late_one_way")
 
     assert service.strategy == "fair_value_edge"
-    assert service.pending_strategy == "late_favorite"
-    assert service.activate_pending_strategy("btc-updown-5m-2") == "late_favorite"
-    assert service.strategy == "late_favorite"
+    assert service.pending_strategy == "late_one_way"
+    assert service.activate_pending_strategy("btc-updown-5m-2") == "late_one_way"
+    assert service.strategy == "late_one_way"
     saved = json.loads(state.read_text())
-    assert saved["control"]["strategy_override"] == "late_favorite"
+    assert saved["control"]["strategy_override"] == "late_one_way"
     assert "pending_strategy" not in saved["control"]
     assert "生效市场: btc-updown-5m-2" in session.calls[-1][1]["text"]
 
 
-def test_live_strategy_switch_allows_late_favorite(tmp_path) -> None:
+def test_live_strategy_switch_allows_one_way(tmp_path) -> None:
     session = FakeSession()
     service = TradingNotificationService(
         notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
@@ -901,10 +901,10 @@ def test_live_strategy_switch_allows_late_favorite(tmp_path) -> None:
         state_path=tmp_path / "state.json",
     )
 
-    service._queue_strategy("late_favorite")
+    service._queue_strategy("late_one_way")
 
-    assert service.pending_strategy == "late_favorite"
-    assert "尾盘高置信度" in session.calls[-1][1]["text"]
+    assert service.pending_strategy == "late_one_way"
+    assert "尾盘单边趋势" in session.calls[-1][1]["text"]
 
 
 def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
@@ -919,7 +919,7 @@ def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
         summary={},
         state_path=state,
     )
-    paper._queue_strategy("late_favorite")
+    paper._queue_strategy("late_one_way")
     paper.activate_pending_strategy("btc-updown-5m-2")
 
     restarted_paper = TradingNotificationService(
@@ -943,8 +943,8 @@ def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
         state_path=state,
     )
 
-    assert restarted_paper.resolve_effective_strategy() == "late_favorite"
-    assert restarted_live.resolve_effective_strategy() == "late_favorite"
+    assert restarted_paper.resolve_effective_strategy() == "late_one_way"
+    assert restarted_live.resolve_effective_strategy() == "late_one_way"
 
 
 def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path) -> None:
@@ -960,7 +960,7 @@ def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path
         state_path=state,
     )
     service.update_runtime(slug="btc-updown-5m-1")
-    service._queue_strategy("late_favorite")
+    service._queue_strategy("late_one_way")
 
     restarted = TradingNotificationService(
         notifier=TelegramNotifier(None, None),
@@ -974,5 +974,5 @@ def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path
     )
 
     assert restarted.activate_pending_strategy("btc-updown-5m-1") is None
-    assert restarted.pending_strategy == "late_favorite"
-    assert restarted.activate_pending_strategy("btc-updown-5m-2") == "late_favorite"
+    assert restarted.pending_strategy == "late_one_way"
+    assert restarted.activate_pending_strategy("btc-updown-5m-2") == "late_one_way"

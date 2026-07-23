@@ -28,11 +28,10 @@ INTERNAL_CALLBACK_COMMANDS = {
 }
 STRATEGY_LABELS = {
     "fair_value_edge": "公允价值差",
-    "late_favorite": "尾盘高置信度",
     "late_one_way": "尾盘单边趋势",
 }
 PAPER_ONLY_STRATEGIES: set[str] = set()
-LIVE_STRATEGIES = {"fair_value_edge", "late_favorite", "late_one_way"}
+LIVE_STRATEGIES = {"fair_value_edge", "late_one_way"}
 DEFAULT_STRATEGY = "__default__"
 BUTTON_COMMANDS = {
     "📈 查看余额": "/balance",

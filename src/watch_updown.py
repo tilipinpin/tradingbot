@@ -261,7 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--late-max-live-notional",
         default="4.70",
-        help="Hard principal cap per late_favorite live order in pUSD.",
+        help="Legacy cap retained for backward-compatible command parsing.",
     )
     parser.add_argument("--live-order-type", choices=["FAK", "FOK"], default="FAK")
     parser.add_argument(
@@ -588,8 +588,6 @@ def late_spot_safety_metrics(
 
 
 def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
-    if strategy == "late_favorite":
-        return 1
     if strategy == "late_one_way":
         return min(2, configured_limit)
     if strategy == "fair_value_edge":
