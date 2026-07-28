@@ -23,7 +23,7 @@ exec "$PYTHON" -u -m src.watch_updown \
   --interval 5 \
   --auto-trade \
   --live-trading \
-  --strategy fair_value_edge \
+  --strategy reversal_v11 \
   --price-source POLYMARKET_CHAINLINK \
   --ws-proxy socks5h://127.0.0.1:7898 \
   --price-to-beat-proxy socks5h://127.0.0.1:7898 \
@@ -33,6 +33,7 @@ exec "$PYTHON" -u -m src.watch_updown \
   --official-open-confirmations 2 \
   --official-open-stable-seconds 5 \
   --env-file "$ENV_FILE" \
+  --reversal-state-json "$DATA_DIR/reversal_v11_state.json" \
   --decision-seconds-before-end 120 \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
@@ -61,6 +62,8 @@ exec "$PYTHON" -u -m src.watch_updown \
   --final-poll-interval 1 \
   --post-fill-poll-interval 1 \
   --pre-submit-max-adverse-ask-drop 0.02 \
+  --pre-submit-max-ask-worsening 0.02 \
+  --pre-submit-max-quote-age-seconds 1.0 \
   --min-win-probability 0.55 \
   --probability-shrinkage 1.00 \
   --edge 0.02 \
@@ -68,14 +71,14 @@ exec "$PYTHON" -u -m src.watch_updown \
   --low-entry-cutoff 0.55 \
   --low-entry-min-win-probability 0.61 \
   --low-entry-confirmation-samples 3 \
-  --max-entry 0.78 \
+  --max-entry 0.82 \
   --max-spread 0.05 \
   --min-ask-sum 0.90 \
   --max-ask-sum 1.10 \
   --order-size 5 \
   --max-trades 2 \
   --max-live-orders 0 \
-  --max-live-notional 4.05 \
+  --max-live-notional 4.25 \
   --live-order-type FAK \
   --live-buy-slippage 0.03 \
   --live-summary-json "$DATA_DIR/live_trade_summary.json"

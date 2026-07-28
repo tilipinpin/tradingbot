@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 
 from src.telegram_commands import (
+    EXECUTION_ADAPTER_PENDING_STRATEGIES,
     DEFAULT_STRATEGY,
     LIVE_STRATEGIES,
     PAPER_ONLY_STRATEGIES,
@@ -323,7 +324,12 @@ def settlement_key(order: dict[str, Any]) -> str:
 
 def order_role(order: dict[str, Any]) -> str:
     configured = str(order.get("order_role") or "").strip().lower()
-    if configured in {"primary", "same_direction_add", "reverse_protection"}:
+    if configured in {
+        "primary",
+        "same_direction_add",
+        "reverse_protection",
+        "reversal_retained",
+    }:
         return configured
     reason = str(order.get("reason") or "").lower()
     if reason.startswith("protective_"):
@@ -336,6 +342,7 @@ def order_role_label(order: dict[str, Any]) -> str:
         "primary": "首单",
         "same_direction_add": "同向加仓",
         "reverse_protection": "反向保护单",
+        "reversal_retained": "反转保留仓",
     }[order_role(order)]
 
 
@@ -349,7 +356,7 @@ def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
     net_pnl = gross_pnl - estimated_fee
     return_rate = gross_pnl / cost if cost > 0 else None
     net_return_rate = net_pnl / cost if cost > 0 else None
-    return {
+    result = {
         "slug": str(order.get("slug") or ""),
         "side": side,
         "order_role": order_role(order),
@@ -366,6 +373,16 @@ def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
         "return_rate": str(return_rate) if return_rate is not None else None,
         "net_return_rate": str(net_return_rate) if net_return_rate is not None else None,
     }
+    for key in (
+        "reversal_trend_side",
+        "reversal_exit_proceeds",
+        "reversal_split_amount",
+        "round_id",
+        "attempt",
+    ):
+        if order.get(key) not in (None, ""):
+            result[key] = order[key]
+    return result
 
 
 def format_settlement_message(
@@ -487,6 +504,24 @@ def format_window_settlement_message(
         f"Taker 手续费估算: {_money(estimated_fee)}",
         f"本窗口净收益率估算: {return_text}",
     ]
+    reversal = next(
+        (
+            item
+            for item in window_settlements
+            if order_role(item) == "reversal_retained"
+        ),
+        None,
+    )
+    if reversal is not None:
+        lines.extend(
+            [
+                f"反转仓位: 卖出 {reversal.get('reversal_trend_side', 'N/A')} / "
+                f"保留 {reversal.get('side', 'N/A')}",
+                f"拆分金额: {_money(_as_decimal(reversal.get('reversal_split_amount')))}",
+                f"趋势仓卖出回款: {_money(_as_decimal(reversal.get('reversal_exit_proceeds')))}",
+                f"轮次/阶段: {reversal.get('round_id', 'N/A')}/{reversal.get('attempt', 'N/A')}",
+            ]
+        )
     for index, item in enumerate(window_settlements, start=1):
         item_gross = _as_decimal(item.get("gross_pnl"))
         item_net = item_gross - settlement_estimated_fee(item)
@@ -1254,6 +1289,11 @@ class TradingNotificationService:
 
     def record_fill(self, order: dict[str, Any]) -> None:
         order["matched_at"] = order.get("matched_at") or datetime.now(timezone.utc).isoformat()
+        self._append_trade_ledger(order)
+        if self.notify_on_matched:
+            self.notifier.send(format_fill_message(order))
+
+    def _append_trade_ledger(self, order: dict[str, Any]) -> None:
         if self.enabled:
             try:
                 self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1261,8 +1301,66 @@ class TradingNotificationService:
                     handle.write(json.dumps(order, ensure_ascii=False, default=str) + "\n")
             except OSError as exc:
                 self.notify_exception("写入成交账本", exc, key="trade-ledger")
+
+    def record_reversal_exit(self, order: dict[str, Any]) -> None:
+        """Record the retained reversal position and optionally broadcast the SELL fill."""
+        order["matched_at"] = order.get("matched_at") or datetime.now(timezone.utc).isoformat()
+        response = order.get("response") if isinstance(order.get("response"), dict) else {}
+        shares = _as_decimal(response.get("makingAmount"))
+        proceeds = _as_decimal(response.get("takingAmount"))
+        price = proceeds / shares if shares > 0 else _as_decimal(order.get("price"))
+        if order.get("exit_complete"):
+            split_amount = _as_decimal(order.get("split_amount"))
+            total_proceeds = _as_decimal(order.get("cumulative_exit_proceeds"))
+            retained_cost = max(Decimal("0"), split_amount - total_proceeds)
+            retained_side = str(order.get("retained_side") or "N/A").upper()
+            retained_order = {
+                "slug": order.get("slug"),
+                "side": retained_side,
+                "price": str(retained_cost / split_amount) if split_amount > 0 else "0",
+                "size": str(split_amount),
+                "notional": str(retained_cost),
+                "reason": (
+                    f"reversal_v11 retained_after_direct_exit "
+                    f"trend_side={str(order.get('side') or 'N/A').upper()}"
+                ),
+                "order_role": "reversal_retained",
+                "round_id": order.get("round_id"),
+                "attempt": order.get("attempt"),
+                "reversal_trend_side": str(order.get("side") or "N/A").upper(),
+                "reversal_exit_proceeds": str(total_proceeds),
+                "reversal_split_amount": str(split_amount),
+                "matched_at": order["matched_at"],
+                "response": {
+                    "success": True,
+                    "status": "matched",
+                    "orderID": (
+                        f"reversal-retained:{order.get('slug')}:{order.get('round_id')}:"
+                        f"{order.get('attempt')}"
+                    ),
+                    "makingAmount": str(retained_cost),
+                    "takingAmount": str(split_amount),
+                },
+            }
+            self._append_trade_ledger(retained_order)
         if self.notify_on_matched:
-            self.notifier.send(format_fill_message(order))
+            self._broadcast(
+                "\n".join(
+                [
+                    "💱 反转策略趋势仓卖出",
+                    f"市场: {order.get('slug', 'N/A')}",
+                    f"原趋势方向: {str(order.get('side', 'N/A')).upper()}",
+                    f"保留方向: {str(order.get('retained_side', 'N/A')).upper()}",
+                    f"成交均价: {price.quantize(Decimal('0.0001'))}",
+                    f"卖出数量: {shares.quantize(Decimal('0.0001'))} 份",
+                    f"回款: {_money(proceeds)}",
+                    f"轮次/阶段: {order.get('round_id', 'N/A')}/{order.get('attempt', 'N/A')}",
+                ]
+                )
+            )
+
+    def send_strategy_report(self, message: str) -> bool:
+        return self.notifier.send(message)
 
     def notify_exception(
         self,
@@ -1722,9 +1820,7 @@ class TradingNotificationService:
     def _send_strategy_confirmation(self, strategy: str) -> None:
         target = self.launch_strategy if strategy == DEFAULT_STRATEGY else strategy
         if not self._strategy_available(target):
-            self._send_command_reply(
-                f"⚠️ {self._strategy_label(target)} 当前仅允许纸面或 dry-run 测试。"
-            )
+            self._send_command_reply(self._strategy_unavailable_message(target))
             return
         self.notifier.send(
             "\n".join(
@@ -1741,9 +1837,7 @@ class TradingNotificationService:
     def _queue_strategy(self, strategy: str) -> None:
         target = self.launch_strategy if strategy == DEFAULT_STRATEGY else strategy
         if not self._strategy_available(target):
-            self._send_command_reply(
-                f"⚠️ {self._strategy_label(target)} 当前仅允许纸面或 dry-run 测试。"
-            )
+            self._send_command_reply(self._strategy_unavailable_message(target))
             return
         control = self.state.setdefault("control", {})
         control["pending_strategy"] = strategy
@@ -1761,7 +1855,17 @@ class TradingNotificationService:
     def _strategy_available(self, strategy: str) -> bool:
         if strategy not in STRATEGY_LABELS:
             return False
+        if strategy in EXECUTION_ADAPTER_PENDING_STRATEGIES:
+            return False
         return self.mode != "live" or strategy in LIVE_STRATEGIES
+
+    def _strategy_unavailable_message(self, strategy: str) -> str:
+        if strategy in EXECUTION_ADAPTER_PENDING_STRATEGIES:
+            return (
+                f"⚠️ {self._strategy_label(strategy)} Polygon完整份额拆分已接入，"
+                "但新版Relayer执行链路尚未通过实盘自检，当前禁止切换。"
+            )
+        return f"⚠️ {self._strategy_label(strategy)} 当前仅允许纸面或 dry-run 测试。"
 
     @staticmethod
     def _strategy_label(strategy: str) -> str:

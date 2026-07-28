@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -10,6 +11,10 @@ import requests
 
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+
+
+class OrderQuoteExpiredError(TimeoutError):
+    """The final market quote became too old before the order POST began."""
 
 
 @dataclass(frozen=True)
@@ -294,6 +299,31 @@ class ClobTradingClient(ClobDataClient):
         best_ask = min(ask_prices) if ask_prices else None
         return OrderBookQuote(bid=best_bid, ask=best_ask)
 
+    def prewarm_order_submission(self) -> None:
+        """Populate SDK metadata that would otherwise delay the first signed order."""
+        resolver = getattr(self.client, "_ClobClient__resolve_version", None)
+        if resolver is not None:
+            resolver()
+        elif hasattr(self.client, "get_version"):
+            self.client.get_version()
+
+    def conditional_balance(self, token_id: str, signature_type: int) -> Decimal:
+        try:
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+        except ImportError:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+            signature_type=signature_type,
+        )
+        self.client.update_balance_allowance(params)
+        payload = self.client.get_balance_allowance(params)
+        return Decimal(str(payload.get("balance") or "0")) / Decimal("1000000")
+
+    def open_orders(self) -> list[Any]:
+        return list(self.client.get_open_orders() or [])
+
     def buy_limit(
         self,
         token_id: str,
@@ -302,6 +332,7 @@ class ClobTradingClient(ClobDataClient):
         tick_size: str,
         neg_risk: bool,
         order_type: str = "GTC",
+        submit_not_after_monotonic: float | None = None,
     ) -> dict[str, Any]:
         OrderArgs, OrderType, PartialCreateOrderOptions, buy_side = _import_order_types()
         return self._post_limit(
@@ -315,6 +346,7 @@ class ClobTradingClient(ClobDataClient):
             tick_size,
             neg_risk,
             order_type,
+            submit_not_after_monotonic,
         )
 
     def sell_limit(
@@ -325,6 +357,7 @@ class ClobTradingClient(ClobDataClient):
         tick_size: str,
         neg_risk: bool,
         order_type: str = "GTC",
+        submit_not_after_monotonic: float | None = None,
     ) -> dict[str, Any]:
         OrderArgs, OrderType, PartialCreateOrderOptions, sell_side = _import_sell_order_types()
         return self._post_limit(
@@ -338,6 +371,7 @@ class ClobTradingClient(ClobDataClient):
             tick_size,
             neg_risk,
             order_type,
+            submit_not_after_monotonic,
         )
 
     def _post_limit(
@@ -352,6 +386,7 @@ class ClobTradingClient(ClobDataClient):
         tick_size: str,
         neg_risk: bool,
         order_type: str,
+        submit_not_after_monotonic: float | None,
     ) -> dict[str, Any]:
         selected_order_type = getattr(OrderType, order_type.upper())
         order_args = OrderArgs(
@@ -362,17 +397,28 @@ class ClobTradingClient(ClobDataClient):
         )
         options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
 
-        if getattr(self, "_client_v2", False):
+        if getattr(self, "_client_v2", False) and submit_not_after_monotonic is None:
             return self.client.create_and_post_order(
                 order_args,
                 options=options,
                 order_type=selected_order_type,
             )
 
-        if order_type.upper() == "GTC" and hasattr(self.client, "create_and_post_order"):
+        if (
+            order_type.upper() == "GTC"
+            and submit_not_after_monotonic is None
+            and hasattr(self.client, "create_and_post_order")
+        ):
             return self.client.create_and_post_order(order_args, options=options)
 
         signed_order = self.client.create_order(order_args, options=options)
+        if (
+            submit_not_after_monotonic is not None
+            and time.monotonic() > submit_not_after_monotonic
+        ):
+            raise OrderQuoteExpiredError(
+                "Final order-book quote expired before order submission"
+            )
         return self.client.post_order(signed_order, selected_order_type)
 
 
@@ -446,7 +492,12 @@ def _import_sell_order_types() -> tuple[Any, Any, Any, str]:
 
 
 def _create_or_derive_creds(client: Any) -> Any:
-    for method_name in ("create_or_derive_api_creds", "create_or_derive_api_key"):
+    for method_name in (
+        "derive_api_creds",
+        "derive_api_key",
+        "create_or_derive_api_creds",
+        "create_or_derive_api_key",
+    ):
         method = getattr(client, method_name, None)
         if method is not None:
             return method()

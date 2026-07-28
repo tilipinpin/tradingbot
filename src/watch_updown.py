@@ -10,7 +10,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
@@ -27,11 +27,20 @@ from src.polymarket import (
     ClobTradingClient,
     GammaClient,
     Market,
+    OrderBookSnapshot,
     OrderBookQuote,
+    OrderQuoteExpiredError,
 )
 from src.price_alignment import PolymarketPriceToBeatClient, StableOpenPriceTracker
 from src.price_signal import SpotPriceClient
-from src.telegram_commands import LIVE_STRATEGIES, STRATEGY_LABELS
+from src.polygon_split import splitter_from_config
+from src.reversal_runtime import (
+    ReversalRuntime,
+    market_health_from_books,
+    reversal_startup_self_check,
+)
+from src.reversal_v11 import Direction, ReversalV11
+from src.telegram_commands import DEFAULT_LAUNCH_STRATEGY, LIVE_STRATEGIES, STRATEGY_LABELS
 from src.telegram_notify import TradingNotificationService
 
 
@@ -74,6 +83,17 @@ class HedgeRiskEvaluation:
     pnl_down_after: Decimal
 
 
+@dataclass(frozen=True)
+class SmartScoreBreakdown:
+    total: Decimal
+    required: Decimal
+    edge: Decimal
+    trend: Decimal
+    market: Decimal
+    stability: Decimal
+    timing: Decimal
+
+
 @dataclass
 class SignalConfirmationState:
     side: str | None = None
@@ -108,7 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-trading", action="store_true", help="Actually submit orders. Requires wallet env vars.")
     parser.add_argument(
         "--strategy",
-        default="fair_value_edge",
+        default=DEFAULT_LAUNCH_STRATEGY,
         choices=list(STRATEGY_LABELS),
     )
     parser.add_argument("--decision-seconds-before-end", type=int, default=120)
@@ -203,6 +223,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-poll-interval", type=float, default=1.0)
     parser.add_argument("--post-fill-poll-interval", type=float, default=1.0)
     parser.add_argument("--pre-submit-max-adverse-ask-drop", default="0.02")
+    parser.add_argument("--pre-submit-max-ask-worsening", default="0.02")
+    parser.add_argument("--pre-submit-max-quote-age-seconds", type=float, default=1.0)
     parser.add_argument("--max-spot-age", type=int, default=20, help="Maximum cached spot-price age allowed for entries.")
     parser.add_argument(
         "--price-to-beat-proxy",
@@ -241,6 +263,20 @@ def parse_args() -> argparse.Namespace:
         default="1.00",
         help="Shrink fair-value probability toward 0.50 before evaluating edge; 1 disables calibration.",
     )
+    parser.add_argument("--smart-score-threshold", default="70")
+    parser.add_argument("--smart-score-entry-seconds", type=int, default=100)
+    parser.add_argument("--smart-score-cutoff-seconds", type=int, default=25)
+    parser.add_argument("--smart-score-min-probability", default="0.52")
+    parser.add_argument("--smart-score-fee-rate", default="0.07")
+    parser.add_argument("--smart-score-slippage", default="0.01")
+    parser.add_argument("--smart-score-trend-samples", type=int, default=3)
+    parser.add_argument("--smart-score-stability-samples", type=int, default=3)
+    parser.add_argument("--open-060-entry-seconds", type=int, default=300)
+    parser.add_argument("--open-060-cutoff-seconds", type=int, default=270)
+    parser.add_argument("--open-060-target", default="0.60")
+    parser.add_argument("--open-060-slippage", default="0.01")
+    parser.add_argument("--open-060-fee-rate", default="0.07")
+    parser.add_argument("--open-060-initial-ask", default="0.50")
     parser.add_argument("--low-entry-cutoff", default="0.55")
     parser.add_argument("--low-entry-min-win-probability", default="0.61")
     parser.add_argument("--low-entry-confirmation-samples", type=int, default=3)
@@ -279,6 +315,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper-trading", action="store_true", help="Track a simulated bankroll and settle windows.")
     parser.add_argument("--paper-bankroll", default="20", help="Starting simulated bankroll in USDC.")
     parser.add_argument("--paper-stake", default="1", help="Simulated USDC stake per signal.")
+    parser.add_argument(
+        "--paper-shares",
+        default="0",
+        help="Simulated shares per signal; when positive, overrides --paper-stake.",
+    )
+    parser.add_argument(
+        "--reversal-state-json",
+        default="data/reversal_v11_state.json",
+        help="Crash-safe persistent state for reversal_v11.",
+    )
     parser.add_argument("--late-entry-start-seconds", type=int, default=55)
     parser.add_argument("--late-entry-cutoff-seconds", type=int, default=8)
     parser.add_argument("--late-min-entry", default="0.65")
@@ -304,6 +350,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--private-key-env", default="PRIVATE_KEY")
     parser.add_argument("--funder-address-env", default="FUNDER_ADDRESS")
     parser.add_argument("--env-file", help="Optional dotenv file containing wallet settings.")
+    parser.add_argument(
+        "--disable-telegram-commands",
+        action="store_true",
+        help="Disable Telegram command polling while retaining outbound notifications.",
+    )
+    parser.add_argument(
+        "--disable-discord",
+        action="store_true",
+        help="Disable Discord notifications for this process.",
+    )
     return parser.parse_args()
 
 
@@ -394,6 +450,22 @@ def quotes_pass_sanity_checks(
     if ask_sum < min_ask_sum or ask_sum > max_ask_sum:
         return False, f"ask_sum {ask_sum} outside {min_ask_sum}-{max_ask_sum}"
     return True, "ok"
+
+
+def executable_ask_depth(
+    book: OrderBookSnapshot,
+    maximum_price: Decimal,
+) -> Decimal:
+    if maximum_price <= 0:
+        return Decimal("0")
+    return sum(
+        (
+            level.size
+            for level in book.asks
+            if level.price <= maximum_price and level.size > 0
+        ),
+        Decimal("0"),
+    )
 
 
 def effective_pullback_tolerance(
@@ -590,11 +662,131 @@ def late_spot_safety_metrics(
 def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
     if strategy == "late_one_way":
         return min(2, configured_limit)
-    if strategy == "fair_value_edge":
+    if strategy in {"smart_score", "open_060", "open_060_late_070"}:
+        return min(1, configured_limit)
+    if is_fair_value_strategy(strategy):
         # --max-trades remains the primary-entry allowance. Aggregate protection
         # gets one additional reserved matched-order slot.
         return configured_limit + 1
     return configured_limit
+
+
+def is_fair_value_strategy(strategy: str) -> bool:
+    return strategy in {"fair_value_edge", "late_070", "open_060_late_070"}
+
+
+def primary_signal_confirmation_count(strategy: str, configured_count: int) -> int:
+    """Return the confirmation count for non-protective primary signals."""
+    if strategy in {"late_070", "open_060_late_070"}:
+        return 1
+    return configured_count
+
+
+def choose_open_060_signal(
+    market: Market,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    previous_up_ask: Decimal,
+    previous_down_ask: Decimal,
+    entry_seconds: Decimal = Decimal("300"),
+    cutoff_seconds: Decimal = Decimal("270"),
+    target: Decimal = Decimal("0.60"),
+    slippage: Decimal = Decimal("0.01"),
+    max_spread: Decimal = Decimal("0.05"),
+    min_ask_sum: Decimal = Decimal("0.90"),
+    max_ask_sum: Decimal = Decimal("1.10"),
+) -> AutoTradeSignal | None:
+    if (
+        seconds_to_end > entry_seconds
+        or seconds_to_end < cutoff_seconds
+        or target <= 0
+        or target >= 1
+        or slippage < 0
+    ):
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and up_quote.ask is not None
+    assert down_quote is not None and down_quote.ask is not None
+
+    crossed: list[tuple[str, str, Decimal, Decimal]] = []
+    if previous_up_ask < target <= up_quote.ask:
+        crossed.append(("UP", market.token_ids[0], up_quote.ask, up_quote.bid or Decimal("0")))
+    if previous_down_ask < target <= down_quote.ask:
+        crossed.append(("DOWN", market.token_ids[1], down_quote.ask, down_quote.bid or Decimal("0")))
+    if not crossed:
+        return None
+
+    # A sane ask sum prevents both asks from being at or above 0.60, but keep
+    # deterministic tie-breaking for synthetic tests and unusual books.
+    side, token_id, observed_ask, bid = max(
+        crossed,
+        key=lambda item: (item[2], item[3], item[0] == "UP"),
+    )
+    # Preserve the configured 0.01 allowance at the target, but when polling
+    # first observes the ask above that planned price, simulate the fill at the
+    # actual observed ask instead of inventing a cheaper 0.61 fill.
+    entry = min(max(target + slippage, observed_ask), Decimal("0.99"))
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=entry,
+        reason=(
+            f"open_060 first_cross target={target} observed_ask={observed_ask} "
+            f"previous_ask={previous_up_ask if side == 'UP' else previous_down_ask} "
+            f"slippage={slippage} seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def refresh_open_060_signal(
+    market: Market,
+    side: str,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    cutoff_seconds: Decimal = Decimal("270"),
+    target: Decimal = Decimal("0.60"),
+    slippage: Decimal = Decimal("0.01"),
+    max_spread: Decimal = Decimal("0.05"),
+    min_ask_sum: Decimal = Decimal("0.90"),
+    max_ask_sum: Decimal = Decimal("1.10"),
+) -> AutoTradeSignal | None:
+    if side not in {"UP", "DOWN"} or seconds_to_end < cutoff_seconds:
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and up_quote.ask is not None
+    assert down_quote is not None and down_quote.ask is not None
+    quote = up_quote if side == "UP" else down_quote
+    if quote.ask < target:
+        return None
+    entry = min(max(target + slippage, quote.ask), Decimal("0.99"))
+    return AutoTradeSignal(
+        side=side,
+        token_id=market.token_ids[0] if side == "UP" else market.token_ids[1],
+        price=entry,
+        reason=(
+            f"open_060 first_cross target={target} observed_ask={quote.ask} "
+            f"slippage={slippage} seconds_left={int(seconds_to_end)} "
+            "pre_submit_refresh=true"
+        ),
+    )
 
 
 def price_alignment_status(
@@ -759,6 +951,247 @@ def choose_fair_value_edge_signal(
             f"p_up={probability_up.quantize(Decimal('0.0001'))} "
             f"raw_p_up={raw_probability_up.quantize(Decimal('0.0001'))} "
             f"shrinkage={probability_shrinkage.quantize(Decimal('0.01'))} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def _clamp_unit(value: Decimal) -> Decimal:
+    return max(Decimal("0"), min(Decimal("1"), value))
+
+
+def _smart_trend_quality(
+    recent_spot_prices: list[Decimal],
+    start_price: Decimal,
+    side: str,
+    sample_count: int,
+) -> Decimal:
+    if sample_count < 1 or len(recent_spot_prices) < sample_count or start_price <= 0:
+        return Decimal("0")
+    recent = recent_spot_prices[-sample_count:]
+    distances = [
+        price - start_price if side == "UP" else start_price - price
+        for price in recent
+    ]
+    correct_fraction = Decimal(sum(distance > 0 for distance in distances)) / Decimal(
+        sample_count
+    )
+    if all(distance > 0 for distance in distances):
+        if distances[-1] >= distances[0]:
+            return Decimal("1")
+        peak = max(distances)
+        if peak > 0:
+            retained = _clamp_unit(distances[-1] / peak)
+            return Decimal("0.70") + retained * Decimal("0.20")
+        return Decimal("0.70")
+    return correct_fraction * Decimal("0.60")
+
+
+def _smart_stability_quality(
+    ask_prices: list[Decimal],
+    sample_count: int,
+) -> Decimal:
+    if sample_count < 2 or len(ask_prices) < sample_count:
+        return Decimal("0")
+    recent = ask_prices[-sample_count:]
+    price_range = max(recent) - min(recent)
+    return _clamp_unit(Decimal("1") - price_range / Decimal("0.10"))
+
+
+def choose_smart_score_signal(
+    market: Market,
+    probability_up: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    decision_seconds_before_end: Decimal,
+    min_seconds_before_end: Decimal,
+    min_entry: Decimal,
+    max_entry: Decimal,
+    edge_threshold: Decimal,
+    max_spread: Decimal,
+    min_ask_sum: Decimal,
+    max_ask_sum: Decimal,
+    recent_spot_prices: list[Decimal],
+    start_price: Decimal,
+    up_ask_prices: list[Decimal],
+    down_ask_prices: list[Decimal],
+    score_threshold: Decimal = Decimal("70"),
+    min_probability: Decimal = Decimal("0.52"),
+    fee_rate: Decimal = Decimal("0.07"),
+    assumed_slippage: Decimal = Decimal("0.01"),
+    trend_samples: int = 3,
+    stability_samples: int = 3,
+    probability_shrinkage: Decimal = Decimal("1"),
+) -> AutoTradeSignal | None:
+    if (
+        seconds_to_end > decision_seconds_before_end
+        or seconds_to_end < min_seconds_before_end
+    ):
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and up_quote.bid is not None and up_quote.ask is not None
+    assert down_quote is not None and down_quote.bid is not None and down_quote.ask is not None
+
+    calibrated_up = shrink_probability_toward_even(
+        probability_up,
+        probability_shrinkage,
+    )
+    candidates = (
+        ("UP", market.token_ids[0], up_quote, calibrated_up, up_ask_prices),
+        (
+            "DOWN",
+            market.token_ids[1],
+            down_quote,
+            Decimal("1") - calibrated_up,
+            down_ask_prices,
+        ),
+    )
+    ranked: list[
+        tuple[Decimal, str, str, OrderBookQuote, Decimal, Decimal, list[Decimal]]
+    ] = []
+    for side, token_id, quote, probability, ask_prices in candidates:
+        execution_entry = quote.ask + assumed_slippage
+        fee_per_share = (
+            fee_rate * execution_entry * (Decimal("1") - execution_entry)
+        )
+        net_edge = probability - execution_entry - fee_per_share
+        ranked.append(
+            (
+                net_edge,
+                side,
+                token_id,
+                quote,
+                probability,
+                execution_entry,
+                ask_prices,
+            )
+        )
+    (
+        net_edge,
+        side,
+        token_id,
+        quote,
+        selected_probability,
+        entry,
+        selected_ask_prices,
+    ) = max(ranked, key=lambda item: item[0])
+    if (
+        entry < min_entry
+        or entry > max_entry
+        or selected_probability < min_probability
+        or net_edge <= 0
+    ):
+        return None
+
+    required_edge = required_fair_value_edge(entry, seconds_to_end, edge_threshold)
+    edge_quality = _clamp_unit(
+        net_edge / max(required_edge, Decimal("0.01"))
+    )
+    trend_quality = _smart_trend_quality(
+        recent_spot_prices,
+        start_price,
+        side,
+        trend_samples,
+    )
+    selected_spread = quote.ask - quote.bid
+    spread_quality = (
+        _clamp_unit(Decimal("1") - selected_spread / max_spread)
+        if max_spread > 0
+        else Decimal("1")
+    )
+    ask_sum = up_quote.ask + down_quote.ask
+    ask_sum_radius = max(
+        Decimal("1") - min_ask_sum,
+        max_ask_sum - Decimal("1"),
+    )
+    ask_sum_quality = (
+        _clamp_unit(Decimal("1") - abs(ask_sum - Decimal("1")) / ask_sum_radius)
+        if ask_sum_radius > 0
+        else Decimal("1")
+    )
+    market_quality = spread_quality * Decimal("0.60") + ask_sum_quality * Decimal(
+        "0.40"
+    )
+    stability_quality = _smart_stability_quality(
+        selected_ask_prices,
+        stability_samples,
+    )
+    timing_span = decision_seconds_before_end - min_seconds_before_end
+    timing_quality = (
+        _clamp_unit((seconds_to_end - min_seconds_before_end) / timing_span)
+        if timing_span > 0
+        else Decimal("1")
+    )
+    breakdown = SmartScoreBreakdown(
+        total=(
+            edge_quality * Decimal("45")
+            + trend_quality * Decimal("20")
+            + market_quality * Decimal("15")
+            + stability_quality * Decimal("15")
+            + timing_quality * Decimal("5")
+        ),
+        required=(
+            score_threshold
+            + (Decimal("5") if seconds_to_end < Decimal("45") else Decimal("0"))
+            + (
+                _clamp_unit(
+                    (entry - Decimal("0.65")) / Decimal("0.13")
+                )
+                * Decimal("5")
+                if entry > Decimal("0.65")
+                else Decimal("0")
+            )
+        ),
+        edge=edge_quality * Decimal("45"),
+        trend=trend_quality * Decimal("20"),
+        market=market_quality * Decimal("15"),
+        stability=stability_quality * Decimal("15"),
+        timing=timing_quality * Decimal("5"),
+    )
+    logger.info(
+        "SMART_SCORE side=%s total=%s required=%s eligible=%s "
+        "entry=%s probability=%s net_edge=%s "
+        "components=edge:%s,trend:%s,market:%s,stability:%s,timing:%s",
+        side,
+        breakdown.total.quantize(Decimal("0.01")),
+        breakdown.required.quantize(Decimal("0.01")),
+        breakdown.total >= breakdown.required,
+        entry,
+        selected_probability.quantize(Decimal("0.0001")),
+        net_edge.quantize(Decimal("0.0001")),
+        breakdown.edge.quantize(Decimal("0.01")),
+        breakdown.trend.quantize(Decimal("0.01")),
+        breakdown.market.quantize(Decimal("0.01")),
+        breakdown.stability.quantize(Decimal("0.01")),
+        breakdown.timing.quantize(Decimal("0.01")),
+    )
+    if breakdown.total < breakdown.required:
+        return None
+
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=entry,
+        reason=(
+            f"smart_score total={breakdown.total.quantize(Decimal('0.01'))} "
+            f"required={breakdown.required.quantize(Decimal('0.01'))} "
+            f"quoted_ask={quote.ask} entry={entry} "
+            f"probability={selected_probability.quantize(Decimal('0.0001'))} "
+            f"net_edge={net_edge.quantize(Decimal('0.0001'))} "
+            f"components=edge:{breakdown.edge.quantize(Decimal('0.01'))},"
+            f"trend:{breakdown.trend.quantize(Decimal('0.01'))},"
+            f"market:{breakdown.market.quantize(Decimal('0.01'))},"
+            f"stability:{breakdown.stability.quantize(Decimal('0.01'))},"
+            f"timing:{breakdown.timing.quantize(Decimal('0.01'))} "
             f"seconds_left={int(seconds_to_end)}"
         ),
     )
@@ -1266,13 +1699,15 @@ def build_live_trader(args: argparse.Namespace) -> ClobTradingClient | None:
         raise ValueError(
             f"--live-trading requires {args.private_key_env} and {args.funder_address_env} environment variables"
         )
-    return ClobTradingClient(
+    trader = ClobTradingClient(
         host=args.clob_host,
         chain_id=args.chain_id,
         private_key=private_key,
         funder_address=funder_address,
         signature_type=args.signature_type,
     )
+    trader.prewarm_order_submission()
+    return trader
 
 
 def open_paper_position(
@@ -1428,6 +1863,10 @@ def watch() -> None:
     if env_args.env_file:
         load_dotenv(env_args.env_file, override=True)
     args = parse_args()
+    if args.disable_telegram_commands:
+        os.environ["TELEGRAM_COMMANDS_ENABLED"] = "false"
+    if args.disable_discord:
+        os.environ["DISCORD_ENABLED"] = "false"
     gamma = GammaClient()
     clob = ClobDataClient(args.clob_host, timeout=args.market_data_timeout)
     trader: ClobTradingClient | None = None
@@ -1451,6 +1890,9 @@ def watch() -> None:
     price_sample_times: list[float] = []
     up_ask_prices: list[Decimal] = []
     down_ask_prices: list[Decimal] = []
+    open_060_previous_up_ask = Decimal("0.50")
+    open_060_previous_down_ask = Decimal("0.50")
+    open_060_reference_spot: Decimal | None = None
     signals_this_window = 0
     confirmation_state = SignalConfirmationState()
     one_way_reversal_started_at: float | None = None
@@ -1503,6 +1945,18 @@ def watch() -> None:
     max_ask_sum = Decimal(args.max_ask_sum)
     min_win_probability = Decimal(args.min_win_probability)
     probability_shrinkage = Decimal(args.probability_shrinkage)
+    smart_score_threshold = Decimal(args.smart_score_threshold)
+    smart_score_entry_seconds = Decimal(str(args.smart_score_entry_seconds))
+    smart_score_cutoff_seconds = Decimal(str(args.smart_score_cutoff_seconds))
+    smart_score_min_probability = Decimal(args.smart_score_min_probability)
+    smart_score_fee_rate = Decimal(args.smart_score_fee_rate)
+    smart_score_slippage = Decimal(args.smart_score_slippage)
+    open_060_entry_seconds = Decimal(str(args.open_060_entry_seconds))
+    open_060_cutoff_seconds = Decimal(str(args.open_060_cutoff_seconds))
+    open_060_target = Decimal(args.open_060_target)
+    open_060_slippage = Decimal(args.open_060_slippage)
+    open_060_fee_rate = Decimal(args.open_060_fee_rate)
+    open_060_initial_ask = Decimal(args.open_060_initial_ask)
     low_entry_cutoff = Decimal(args.low_entry_cutoff)
     low_entry_min_win_probability = Decimal(args.low_entry_min_win_probability)
     max_price_alignment_difference = Decimal(args.max_price_alignment_difference)
@@ -1522,24 +1976,33 @@ def watch() -> None:
     order_size = Decimal(args.order_size)
     live_buy_slippage = Decimal(args.live_buy_slippage)
     pre_submit_max_adverse_ask_drop = Decimal(args.pre_submit_max_adverse_ask_drop)
+    pre_submit_max_ask_worsening = Decimal(args.pre_submit_max_ask_worsening)
+    pre_submit_max_quote_age_seconds = args.pre_submit_max_quote_age_seconds
     max_live_notional = Decimal(args.max_live_notional)
     late_max_live_notional = Decimal(args.late_max_live_notional)
     decision_seconds_before_end = Decimal(str(args.decision_seconds_before_end))
     min_seconds_before_end = Decimal(str(args.min_seconds_before_end))
     paper_bankroll = Decimal(args.paper_bankroll)
     paper_stake = Decimal(args.paper_stake)
+    paper_shares = Decimal(args.paper_shares)
     paper_positions: list[PaperPosition] = []
     consecutive_losses = 0
     pause_windows_remaining = 0
     risk_pause_active_for_window = False
     live_orders_submitted = 0
     live_orders_matched = 0
+    reversal_runtime: ReversalRuntime | None = None
+    reversal_daily_restart_pending = False
     live_summary = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
         "mode": "live" if args.live_trading else "paper" if args.paper_trading else "dry_run",
         "status": "running",
         "strategy": args.strategy,
+        "primary_signal_confirmations": primary_signal_confirmation_count(
+            args.strategy,
+            args.signal_confirmations,
+        ),
         "max_live_orders": args.max_live_orders,
         "max_trades_per_window": strategy_trade_limit(args.strategy, args.max_trades),
         "max_primary_trades_per_window": args.max_trades,
@@ -1552,6 +2015,19 @@ def watch() -> None:
         ),
         "late_max_live_notional": str(late_max_live_notional),
         "probability_shrinkage": str(probability_shrinkage),
+        "smart_score_threshold": str(smart_score_threshold),
+        "smart_score_entry_seconds": str(smart_score_entry_seconds),
+        "smart_score_cutoff_seconds": str(smart_score_cutoff_seconds),
+        "smart_score_min_probability": str(smart_score_min_probability),
+        "smart_score_fee_rate": str(smart_score_fee_rate),
+        "smart_score_slippage": str(smart_score_slippage),
+        "smart_score_trend_samples": args.smart_score_trend_samples,
+        "smart_score_stability_samples": args.smart_score_stability_samples,
+        "open_060_entry_seconds": str(open_060_entry_seconds),
+        "open_060_cutoff_seconds": str(open_060_cutoff_seconds),
+        "open_060_target": str(open_060_target),
+        "open_060_slippage": str(open_060_slippage),
+        "open_060_fee_rate": str(open_060_fee_rate),
         "trend_pullback_tolerance_usd": str(trend_pullback_tolerance_usd),
         "trend_pullback_tolerance_percent": str(trend_pullback_tolerance_percent),
         "one_way_entry_seconds": str(one_way_entry_seconds),
@@ -1576,6 +2052,8 @@ def watch() -> None:
         "live_buy_slippage": str(live_buy_slippage),
         "post_fill_poll_interval": args.post_fill_poll_interval,
         "pre_submit_max_adverse_ask_drop": str(pre_submit_max_adverse_ask_drop),
+        "pre_submit_max_ask_worsening": str(pre_submit_max_ask_worsening),
+        "pre_submit_max_quote_age_seconds": pre_submit_max_quote_age_seconds,
         "max_spread": str(max_spread),
         "hedge_max_spread": str(hedge_max_spread),
         "hedge_signal_confirmations": args.hedge_signal_confirmations,
@@ -1629,6 +2107,14 @@ def watch() -> None:
             raise ValueError("--live-trading requires --auto-trade")
         if args.duration < 0:
             raise ValueError("--duration must be zero (unlimited) or positive")
+        if args.paper_trading and (
+            paper_bankroll <= 0
+            or paper_stake <= 0
+            or paper_shares < 0
+        ):
+            raise ValueError(
+                "Paper bankroll and fallback stake must be positive; paper shares cannot be negative"
+            )
         if args.live_trading and args.strategy not in LIVE_STRATEGIES:
             raise ValueError(f"{args.strategy} is not approved for live strategy selection")
         if args.strategy == "late_one_way" and args.max_trades < 2:
@@ -1649,6 +2135,26 @@ def watch() -> None:
             raise ValueError("Low-entry minimum win probability must be between zero and one")
         if not Decimal("0") <= probability_shrinkage <= Decimal("1"):
             raise ValueError("Probability shrinkage must be between zero and one")
+        if (
+            not Decimal("0") <= smart_score_threshold <= Decimal("100")
+            or smart_score_cutoff_seconds < 0
+            or smart_score_cutoff_seconds >= smart_score_entry_seconds
+            or not Decimal("0.5") <= smart_score_min_probability <= Decimal("1")
+            or smart_score_fee_rate < 0
+            or smart_score_slippage < 0
+            or args.smart_score_trend_samples < 1
+            or args.smart_score_stability_samples < 2
+        ):
+            raise ValueError("Smart-score thresholds, costs, and sample counts must be valid")
+        if (
+            open_060_cutoff_seconds < 0
+            or open_060_cutoff_seconds >= open_060_entry_seconds
+            or not Decimal("0") < open_060_initial_ask < open_060_target < Decimal("1")
+            or open_060_slippage < 0
+            or open_060_target + open_060_slippage >= Decimal("1")
+            or open_060_fee_rate < 0
+        ):
+            raise ValueError("Open-0.60 timing, price, slippage, and fee parameters must be valid")
         if fallback_sigma <= 0:
             raise ValueError("Fallback sigma must be positive")
         if args.trend_confirmation_samples < 1:
@@ -1713,6 +2219,10 @@ def watch() -> None:
             raise ValueError("Live buy slippage must not be negative")
         if pre_submit_max_adverse_ask_drop < 0:
             raise ValueError("Pre-submit adverse ask drop must not be negative")
+        if pre_submit_max_ask_worsening < 0:
+            raise ValueError("Pre-submit ask worsening must not be negative")
+        if pre_submit_max_quote_age_seconds <= 0:
+            raise ValueError("Pre-submit quote age must be positive")
         if args.max_boundary_sample_offset_ms < 0:
             raise ValueError("Maximum boundary-sample offset must be non-negative")
         if args.official_open_confirmations < 2:
@@ -1746,6 +2256,91 @@ def watch() -> None:
             raise ValueError("late_favorite confirmations must be positive and pause must not be negative")
         trader = build_live_trader(args)
         notifications.trader = trader
+        if args.live_trading or args.strategy == "reversal_v11":
+            reversal_state_path = Path(args.reversal_state_json)
+            reversal_strategy = ReversalV11.load(reversal_state_path)
+            active_reversal = reversal_strategy.state.active_round
+            prepared_reversal = reversal_strategy.state.prepared_split
+            if (
+                args.live_trading
+                and (
+                    (
+                        active_reversal is not None
+                        and (
+                            active_reversal.execution_phase
+                            in {"split_submitting", "split_uncertain"}
+                            or (
+                                active_reversal.awaiting_window != current_market.slug
+                                and active_reversal.execution_phase
+                                != "trend_exit_complete"
+                            )
+                        )
+                    )
+                    or (
+                        prepared_reversal is not None
+                        and prepared_reversal.execution_phase
+                        in {
+                            "split_submitting",
+                            "split_uncertain",
+                            "merge_submitting",
+                            "merge_uncertain",
+                        }
+                    )
+                )
+            ):
+                raise ValueError(
+                    "reversal_v11 split/merge outcome is uncertain; reconcile positions before restart"
+                )
+            reversal_splitter = None
+            if args.live_trading:
+                assert trader is not None
+                startup_market = load_updown_market(gamma, slug)
+                if startup_market is None:
+                    raise ValueError("reversal_v11 startup could not load the current market")
+                reversal_splitter = splitter_from_config(dict(os.environ))
+                if (
+                    prepared_reversal is not None
+                    and prepared_reversal.execution_phase == "split_confirmed"
+                ):
+                    required_reversal_collateral = Decimal("0")
+                elif active_reversal is None:
+                    required_reversal_collateral = Decimal("30")
+                elif active_reversal.awaiting_window is not None and active_reversal.execution_phase in {
+                    "split_confirmed",
+                    "trend_exit_partial",
+                    "trend_exit_submitting",
+                    "trend_exit_complete",
+                }:
+                    required_reversal_collateral = Decimal("0")
+                else:
+                    required_reversal_collateral = reversal_strategy.settings.stakes[
+                        active_reversal.failures
+                    ]
+                startup_report = reversal_startup_self_check(
+                    market=startup_market,
+                    splitter=reversal_splitter,
+                    trader=trader,
+                    signature_type=args.signature_type,
+                    required_collateral=required_reversal_collateral,
+                )
+                live_summary["reversal_startup_self_check"] = {
+                    "wallet": startup_report.wallet,
+                    "collateral_units": startup_report.collateral_units,
+                    "open_orders": startup_report.open_orders,
+                    "up_balance": str(startup_report.up_balance),
+                    "down_balance": str(startup_report.down_balance),
+                    "relayer_deployed": startup_report.relayer_deployed,
+                }
+            reversal_runtime = ReversalRuntime(
+                strategy=reversal_strategy,
+                state_path=reversal_state_path,
+                winner_lookup=fetch_winner,
+                splitter=reversal_splitter,
+                trader=trader,
+                signature_type=args.signature_type,
+                live=args.live_trading,
+                order_callback=notifications.record_reversal_exit,
+            )
     except Exception as exc:
         live_summary["error"] = f"{type(exc).__name__}: {exc}"
         notifications.notify_exception("启动检查或钱包签名", exc, key="startup", cooldown=0)
@@ -1758,9 +2353,10 @@ def watch() -> None:
         logger.warning("LIVE TRADING ENABLED. Orders may be submitted.")
     elif args.paper_trading:
         logger.info(
-            "PAPER TRADING mode. Starting bankroll=%s stake_per_signal=%s",
+            "PAPER TRADING mode. Starting bankroll=%s stake_per_signal=%s shares_per_signal=%s",
             paper_bankroll,
             paper_stake,
+            paper_shares,
         )
     else:
         logger.info("DRY RUN mode. No orders will be submitted.")
@@ -1781,6 +2377,13 @@ def watch() -> None:
             )
         notifications.maybe_send_settlements(fetch_winner)
         notifications.maybe_send_daily(fetch_winner)
+        if reversal_runtime is not None and args.strategy == "reversal_v11":
+            report_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+            if reversal_runtime.send_daily_report_once(
+                report_day,
+                notifications.send_strategy_report,
+            ):
+                reversal_daily_restart_pending = True
         if args.paper_trading:
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
             if args.strategy == "late_favorite":
@@ -1815,6 +2418,9 @@ def watch() -> None:
             price_sample_times = []
             up_ask_prices = []
             down_ask_prices = []
+            open_060_previous_up_ask = open_060_initial_ask
+            open_060_previous_down_ask = open_060_initial_ask
+            open_060_reference_spot = None
             signals_this_window = 0
             confirmation_state.reset()
             one_way_reversal_started_at = None
@@ -1844,7 +2450,22 @@ def watch() -> None:
                     "RISK_PAUSE_ACTIVE remaining_windows_after_this=%s",
                     pause_windows_remaining,
                 )
-            activated_strategy = notifications.activate_pending_strategy(current_market.slug)
+            reversal_round_active = False
+            if reversal_runtime is not None and args.strategy == "reversal_v11":
+                reversal_round_active = (
+                    reversal_runtime.strategy.state.active_round is not None
+                )
+            activated_strategy = (
+                None
+                if reversal_round_active
+                else notifications.activate_pending_strategy(current_market.slug)
+            )
+            if reversal_round_active and notifications.pending_strategy is not None:
+                logger.info(
+                    "REVERSAL_SWITCH_DEFERRED active_round=%s pending=%s",
+                    reversal_runtime.strategy.state.active_round.round_id,
+                    notifications.pending_strategy,
+                )
             if activated_strategy is not None:
                 args.strategy = activated_strategy
                 live_summary["strategy"] = activated_strategy
@@ -1900,6 +2521,340 @@ def watch() -> None:
                 spot.price,
             )
             time.sleep(min(args.interval, max(1, float(seconds_to_start))))
+            continue
+
+        if (
+            args.strategy == "open_060"
+            or (
+                args.strategy == "open_060_late_070"
+                and seconds_to_end >= open_060_cutoff_seconds
+            )
+        ):
+            if open_060_reference_spot is None:
+                open_060_reference_spot = spot.price
+            up_quote, down_quote = quote_outcomes(clob, current_market)
+            signal = choose_open_060_signal(
+                current_market,
+                up_quote,
+                down_quote,
+                seconds_to_end,
+                open_060_previous_up_ask,
+                open_060_previous_down_ask,
+                open_060_entry_seconds,
+                open_060_cutoff_seconds,
+                open_060_target,
+                open_060_slippage,
+                max_spread,
+                min_ask_sum,
+                max_ask_sum,
+            )
+            if up_quote is not None and up_quote.ask is not None:
+                open_060_previous_up_ask = up_quote.ask
+            if down_quote is not None and down_quote.ask is not None:
+                open_060_previous_down_ask = down_quote.ask
+
+            if snapshot_writer is not None:
+                snapshot_writer.write(
+                    build_snapshot(
+                        observed_at=now.isoformat(),
+                        observed_ts=int(now.timestamp()),
+                        slug=current_market.slug,
+                        market_start_ts=int(current_market.event_start_time.timestamp()),
+                        market_end_ts=int(current_market.end_time.timestamp()),
+                        seconds_left=seconds_to_end,
+                        spot=spot.price,
+                        start_spot=open_060_reference_spot,
+                        spot_source=spot.source,
+                        probability_up=Decimal("0.5"),
+                        up_quote=up_quote,
+                        down_quote=down_quote,
+                    )
+                )
+            logger.info(
+                "%s OPEN_060 seconds_left=%s up=%s down=%s previous_up=%s previous_down=%s",
+                current_market.slug,
+                int(seconds_to_end),
+                up_quote,
+                down_quote,
+                open_060_previous_up_ask,
+                open_060_previous_down_ask,
+            )
+
+            if (
+                signal is not None
+                and args.auto_trade
+                and signals_this_window < strategy_trade_limit(args.strategy, args.max_trades)
+                and not risk_pause_active_for_window
+                and not notifications.trading_paused
+            ):
+                if trader is None:
+                    logger.info(
+                        "AUTO_SIGNAL %s side=%s price=%s size=%s reason=%s",
+                        current_market.slug,
+                        signal.side,
+                        signal.price,
+                        order_size,
+                        signal.reason,
+                    )
+                    signals_this_window = window_trade_count_after_attempt(
+                        signals_this_window,
+                        live=False,
+                    )
+                if args.paper_trading:
+                    paper_trade_stake = (
+                        signal.price * paper_shares
+                        if paper_shares > 0
+                        else paper_stake
+                    )
+                    paper_bankroll = open_paper_position(
+                        paper_positions,
+                        paper_bankroll,
+                        current_market.slug,
+                        signal,
+                        paper_trade_stake,
+                        open_060_fee_rate,
+                    )
+                    if args.stop_when_bust and paper_bankroll <= 0:
+                        logger.info("PAPER_BUST bankroll=%s. Exiting after open position.", paper_bankroll)
+                        return
+                elif trader is not None:
+                    try:
+                        refreshed_up_book, refreshed_down_book = clob.books(
+                            current_market.token_ids
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ORDER_BLOCKED_PRE_SUBMIT_REFRESH slug=%s error=%s",
+                            current_market.slug,
+                            exc,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    refreshed_signal = refresh_open_060_signal(
+                        current_market,
+                        signal.side,
+                        refreshed_up_book.quote,
+                        refreshed_down_book.quote,
+                        max(
+                            Decimal("0"),
+                            _seconds_to_end(
+                                current_market,
+                                datetime.now(timezone.utc),
+                            ),
+                        ),
+                        open_060_cutoff_seconds,
+                        open_060_target,
+                        open_060_slippage,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                    )
+                    if refreshed_signal is None:
+                        logger.info(
+                            "ORDER_BLOCKED_SIGNAL_CHANGED slug=%s confirmed_side=%s latest_side=NONE",
+                            current_market.slug,
+                            signal.side,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    signal = refreshed_signal
+                    selected_book = (
+                        refreshed_up_book
+                        if signal.side == "UP"
+                        else refreshed_down_book
+                    )
+                    refreshed_quote = selected_book.quote
+                    assert refreshed_quote.ask is not None
+                    quoted_ask = refreshed_quote.ask
+                    available_depth = executable_ask_depth(
+                        selected_book,
+                        signal.price,
+                    )
+                    if available_depth < order_size:
+                        logger.info(
+                            "ORDER_BLOCKED_INSUFFICIENT_DEPTH slug=%s side=%s "
+                            "limit=%s required=%s available=%s",
+                            current_market.slug,
+                            signal.side,
+                            signal.price,
+                            order_size,
+                            available_depth,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    signal = AutoTradeSignal(
+                        side=signal.side,
+                        token_id=signal.token_id,
+                        price=signal.price,
+                        reason=(
+                            f"{signal.reason} "
+                            f"pre_submit_depth={available_depth.quantize(Decimal('0.000001'))} "
+                            f"quote_ttl={pre_submit_max_quote_age_seconds:g}s"
+                        ),
+                    )
+                    notional = signal.price * order_size
+                    if not live_session_should_continue(
+                        live_orders_submitted,
+                        args.max_live_orders,
+                    ):
+                        logger.warning(
+                            "LIVE ORDER LIMIT reached=%s. Exiting.",
+                            live_orders_submitted,
+                        )
+                        return
+                    if notional > max_live_notional:
+                        logger.warning(
+                            "LIVE SIGNAL SKIPPED notional=%s exceeds hard cap=%s; continuing.",
+                            notional,
+                            max_live_notional,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    if notifications.trading_paused:
+                        logger.warning(
+                            "LIVE ORDER blocked by Telegram trading pause before submission."
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    logger.info(
+                        "AUTO_SIGNAL %s side=%s price=%s size=%s reason=%s",
+                        current_market.slug,
+                        signal.side,
+                        signal.price,
+                        order_size,
+                        signal.reason,
+                    )
+                    order_record = {
+                        "attempted_at": datetime.now(timezone.utc).isoformat(),
+                        "slug": current_market.slug,
+                        "side": signal.side,
+                        "token_id": signal.token_id,
+                        "price": str(signal.price),
+                        "size": str(order_size),
+                        "notional": str(notional),
+                        "order_type": args.live_order_type,
+                        "order_role": "primary",
+                        "quoted_ask": str(quoted_ask),
+                        "max_slippage": str(open_060_slippage),
+                        "applied_slippage": str(signal.price - quoted_ask),
+                        "reason": signal.reason,
+                        "response": None,
+                        "error": None,
+                    }
+                    live_summary["status"] = "submitting"
+                    live_summary["order_attempts"] = live_orders_submitted + 1
+                    live_summary["order"] = {
+                        key: value
+                        for key, value in order_record.items()
+                        if key not in {"response", "error"}
+                    }
+                    live_summary["orders"].append(order_record)
+                    live_orders_submitted += 1
+                    live_summary["order_attempts"] = live_orders_submitted
+                    write_live_summary(finalize=False)
+                    try:
+                        response = trader.buy_limit(
+                            token_id=signal.token_id,
+                            price=signal.price,
+                            size=order_size,
+                            tick_size=current_market.minimum_tick_size,
+                            neg_risk=current_market.neg_risk,
+                            order_type=args.live_order_type,
+                            submit_not_after_monotonic=(
+                                time.monotonic()
+                                + pre_submit_max_quote_age_seconds
+                            ),
+                        )
+                    except OrderQuoteExpiredError as exc:
+                        live_orders_submitted -= 1
+                        live_summary["status"] = "running"
+                        live_summary["order_attempts"] = live_orders_submitted
+                        live_summary["error"] = None
+                        order_record["error"] = f"{type(exc).__name__}: {exc}"
+                        write_live_summary(finalize=False)
+                        logger.info(
+                            "ORDER_BLOCKED_QUOTE_EXPIRED slug=%s side=%s error=%s",
+                            current_market.slug,
+                            signal.side,
+                            exc,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    except Exception as exc:
+                        live_summary["status"] = "running"
+                        live_summary["error"] = f"{type(exc).__name__}: {exc}"
+                        order_record["error"] = live_summary["error"]
+                        write_live_summary(finalize=False)
+                        notifications.notify_exception(
+                            f"提交订单 {current_market.slug} {signal.side}",
+                            exc,
+                            key=f"order:{current_market.slug}:{live_orders_submitted}",
+                            cooldown=0,
+                        )
+                        logger.warning(
+                            "LIVE ORDER attempt=%s raised %s; continuing.",
+                            live_orders_submitted,
+                            live_summary["error"],
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    live_summary["response"] = response
+                    order_record["response"] = response
+                    logger.info("LIVE ORDER response=%s", response)
+                    matched = live_response_is_matched(
+                        response,
+                        require_fill_amounts=args.live_order_type == "FAK",
+                    )
+                    signals_this_window = window_trade_count_after_attempt(
+                        signals_this_window,
+                        live=True,
+                        matched=matched,
+                    )
+                    if not matched:
+                        live_summary["status"] = "running"
+                        live_summary["error"] = (
+                            f"Order response was not conclusively matched: {response}"
+                        )
+                        order_record["error"] = live_summary["error"]
+                        write_live_summary(finalize=False)
+                        notifications.notify_exception(
+                            f"订单未成交 {current_market.slug} {signal.side}",
+                            live_summary["error"],
+                            key=f"unmatched:{current_market.slug}:{live_orders_submitted}",
+                            cooldown=0,
+                        )
+                        logger.warning(
+                            "LIVE ORDER attempt=%s was not matched; continuing.",
+                            live_orders_submitted,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    live_orders_matched += 1
+                    live_summary["matched_orders"] = live_orders_matched
+                    order_record["matched_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    notifications.record_fill(order_record)
+                    live_summary["status"] = "running"
+                    write_live_summary(finalize=False)
+                    logger.warning(
+                        "LIVE ORDER attempt=%s matched_count=%s. Continuing; session_limit=%s.",
+                        live_orders_submitted,
+                        live_orders_matched,
+                        (
+                            args.max_live_orders
+                            if args.max_live_orders > 0
+                            else "unlimited"
+                        ),
+                    )
+                else:
+                    logger.info(
+                        "DRY RUN: would buy %s at %s x %s",
+                        signal.side,
+                        signal.price,
+                        order_size,
+                    )
+            sleep_until_next_poll(poll_interval, iteration_started_at)
             continue
 
         if start_price is None:
@@ -2069,6 +3024,103 @@ def watch() -> None:
             action,
         )
 
+        if args.strategy == "reversal_v11":
+            if reversal_runtime is None:
+                error = RuntimeError("reversal_v11 runtime was not initialized")
+                notifications.notify_exception(
+                    "反转策略运行时",
+                    error,
+                    key="reversal-runtime-missing",
+                    cooldown=0,
+                )
+                notifications._set_trading_paused(True)
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            try:
+                reversal_state = reversal_runtime.strategy.state
+                next_amount = reversal_runtime.strategy.opening_split_amount(
+                    current_market.slug
+                )
+                up_book, down_book = clob.books(current_market.token_ids)
+                reversal_health_by_side = {
+                    side: market_health_from_books(
+                        trend_side=side,
+                        up_book=up_book,
+                        down_book=down_book,
+                        making_amount=next_amount,
+                        spot_prices=prices,
+                        open_price=start_price,
+                    )
+                    for side in (Direction.UP, Direction.DOWN)
+                }
+                reversal_result = reversal_runtime.tick(
+                    market=current_market,
+                    up_book=up_book,
+                    down_book=down_book,
+                    health_by_side=reversal_health_by_side,
+                    book_refresh=lambda: clob.books(current_market.token_ids),
+                )
+                logger.info(
+                    "REVERSAL_V11 slug=%s status=%s plan=%s detail=%s",
+                    current_market.slug,
+                    reversal_result.status,
+                    reversal_result.plan,
+                    reversal_result.detail,
+                )
+                if reversal_result.order is not None:
+                    live_summary["orders"].append(reversal_result.order)
+                    live_orders_submitted += 1
+                    live_summary["order_attempts"] = live_orders_submitted
+                    if live_response_is_matched(
+                        reversal_result.order.get("response"),
+                        require_fill_amounts=True,
+                    ):
+                        live_orders_matched += 1
+                        live_summary["matched_orders"] = live_orders_matched
+                    write_live_summary(finalize=False)
+                if (
+                    reversal_daily_restart_pending
+                    and reversal_runtime.strategy.state.active_round is None
+                    and reversal_runtime.strategy.state.prepared_split is None
+                ):
+                    live_summary["status"] = "daily_safe_restart"
+                    write_live_summary()
+                    notifications.stop("反转策略日报安全重启")
+                    os.execv(
+                        sys.executable,
+                        [sys.executable, "-m", "src.watch_updown", *sys.argv[1:]],
+                    )
+            except Exception as exc:
+                live_summary["error"] = f"{type(exc).__name__}: {exc}"
+                notifications.notify_exception(
+                    f"反转策略 {current_market.slug}",
+                    exc,
+                    key=f"reversal:{current_market.slug}",
+                    cooldown=0,
+                )
+                active_reversal = reversal_runtime.strategy.state.active_round
+                prepared_reversal = reversal_runtime.strategy.state.prepared_split
+                if (
+                    (
+                        active_reversal is not None
+                        and active_reversal.execution_phase
+                        in {"split_submitting", "split_uncertain"}
+                    )
+                    or (
+                        prepared_reversal is not None
+                        and prepared_reversal.execution_phase
+                        in {
+                            "split_submitting",
+                            "split_uncertain",
+                            "merge_submitting",
+                            "merge_uncertain",
+                        }
+                    )
+                ):
+                    notifications._set_trading_paused(True)
+            sleep_until_next_poll(poll_interval, iteration_started_at)
+            continue
+
         if (
             args.auto_trade
             and signals_this_window < strategy_trade_limit(args.strategy, args.max_trades)
@@ -2173,6 +3225,33 @@ def watch() -> None:
                         )
                         if signal is None:
                             confirmation_state.reset()
+            elif args.strategy == "smart_score":
+                signal = choose_smart_score_signal(
+                    current_market,
+                    fair.probability_up,
+                    up_quote,
+                    down_quote,
+                    seconds_to_end,
+                    smart_score_entry_seconds,
+                    smart_score_cutoff_seconds,
+                    min_entry,
+                    max_entry,
+                    edge_threshold,
+                    max_spread,
+                    min_ask_sum,
+                    max_ask_sum,
+                    prices,
+                    start_price,
+                    up_ask_prices,
+                    down_ask_prices,
+                    smart_score_threshold,
+                    smart_score_min_probability,
+                    smart_score_fee_rate,
+                    smart_score_slippage,
+                    args.smart_score_trend_samples,
+                    args.smart_score_stability_samples,
+                    probability_shrinkage,
+                )
             else:
                 protection_slot_reserved = (
                     primary_orders_this_window < args.max_trades
@@ -2293,7 +3372,7 @@ def watch() -> None:
                     continue
                 is_protective_hedge = signal.reason.startswith("protective_")
                 if (
-                    args.strategy == "fair_value_edge"
+                    is_fair_value_strategy(args.strategy)
                     and not is_protective_hedge
                     and signal.reason.startswith("fair_value_edge")
                     and not recent_spot_samples_support_side(
@@ -2368,7 +3447,10 @@ def watch() -> None:
                     if signal.reason.startswith("one_way_trend")
                     else args.late_signal_confirmations
                     if args.strategy == "late_favorite"
-                    else args.signal_confirmations
+                    else primary_signal_confirmation_count(
+                        args.strategy,
+                        args.signal_confirmations,
+                    )
                 )
                 confirmed, confirmation_status = advance_signal_confirmation(
                     confirmation_state,
@@ -2439,10 +3521,11 @@ def watch() -> None:
                             raise RuntimeError(
                                 f"Pre-submit Chainlink report is stale by {refreshed_age}s"
                             )
-                    refreshed_up_quote, refreshed_down_quote = quote_outcomes(
-                        clob,
-                        current_market,
+                    refreshed_up_book, refreshed_down_book = clob.books(
+                        current_market.token_ids
                     )
+                    refreshed_up_quote = refreshed_up_book.quote
+                    refreshed_down_quote = refreshed_down_book.quote
                 except Exception as exc:
                     logger.warning(
                         "ORDER_BLOCKED_PRE_SUBMIT_REFRESH slug=%s error=%s",
@@ -2477,8 +3560,25 @@ def watch() -> None:
                     )
                     sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
+                ask_worsening = refreshed_quote.ask - confirmed_signal.price
+                if ask_worsening > pre_submit_max_ask_worsening:
+                    logger.info(
+                        "ORDER_BLOCKED_ASK_WORSENING slug=%s side=%s confirmed_ask=%s "
+                        "latest_ask=%s worsening=%s max_worsening=%s",
+                        current_market.slug,
+                        confirmed_signal.side,
+                        confirmed_signal.price,
+                        refreshed_quote.ask,
+                        ask_worsening,
+                        pre_submit_max_ask_worsening,
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
 
                 refreshed_at = time.monotonic()
+                submit_not_after_monotonic = (
+                    refreshed_at + pre_submit_max_quote_age_seconds
+                )
                 refreshed_prices = [*prices, refreshed_spot.price]
                 refreshed_sample_times = [*price_sample_times, refreshed_at]
                 refreshed_seconds_to_end = max(
@@ -2642,6 +3742,49 @@ def watch() -> None:
                         min_ask_sum,
                         max_ask_sum,
                     )
+                elif args.strategy == "smart_score":
+                    refreshed_signal = choose_smart_score_signal(
+                        current_market,
+                        refreshed_fair.probability_up,
+                        refreshed_up_quote,
+                        refreshed_down_quote,
+                        refreshed_seconds_to_end,
+                        smart_score_entry_seconds,
+                        smart_score_cutoff_seconds,
+                        min_entry,
+                        max_entry,
+                        edge_threshold,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                        refreshed_prices,
+                        start_price,
+                        [
+                            *up_ask_prices,
+                            *(
+                                [refreshed_up_quote.ask]
+                                if refreshed_up_quote is not None
+                                and refreshed_up_quote.ask is not None
+                                else []
+                            ),
+                        ],
+                        [
+                            *down_ask_prices,
+                            *(
+                                [refreshed_down_quote.ask]
+                                if refreshed_down_quote is not None
+                                and refreshed_down_quote.ask is not None
+                                else []
+                            ),
+                        ],
+                        smart_score_threshold,
+                        smart_score_min_probability,
+                        smart_score_fee_rate,
+                        smart_score_slippage,
+                        args.smart_score_trend_samples,
+                        args.smart_score_stability_samples,
+                        probability_shrinkage,
+                    )
                 else:
                     refreshed_signal = choose_fair_value_edge_signal(
                         current_market,
@@ -2724,7 +3867,7 @@ def watch() -> None:
                             current_market.minimum_tick_size,
                             maximum_execution_price,
                         )
-                    elif not is_protective_hedge and args.strategy == "fair_value_edge":
+                    elif not is_protective_hedge and is_fair_value_strategy(args.strategy):
                         selected_probability = (
                             shrink_probability_toward_even(
                                 fair.probability_up,
@@ -2846,6 +3989,38 @@ def watch() -> None:
                             f"loss_reduction={(hedge_risk.max_loss_before - hedge_risk.max_loss_after).quantize(Decimal('0.0001'))}"
                         ),
                     )
+                if trader is not None:
+                    selected_book = (
+                        refreshed_up_book
+                        if signal.side == "UP"
+                        else refreshed_down_book
+                    )
+                    available_depth = executable_ask_depth(
+                        selected_book,
+                        signal.price,
+                    )
+                    if available_depth < trade_size:
+                        logger.info(
+                            "ORDER_BLOCKED_INSUFFICIENT_DEPTH slug=%s side=%s "
+                            "limit=%s required=%s available=%s",
+                            current_market.slug,
+                            signal.side,
+                            signal.price,
+                            trade_size,
+                            available_depth,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    signal = AutoTradeSignal(
+                        side=signal.side,
+                        token_id=signal.token_id,
+                        price=signal.price,
+                        reason=(
+                            f"{signal.reason} "
+                            f"pre_submit_depth={available_depth.quantize(Decimal('0.000001'))} "
+                            f"quote_ttl={pre_submit_max_quote_age_seconds:g}s"
+                        ),
+                    )
                 logger.info(
                     "AUTO_SIGNAL %s side=%s price=%s size=%s reason=%s",
                     current_market.slug,
@@ -2860,13 +4035,24 @@ def watch() -> None:
                         live=False,
                     )
                     if args.paper_trading:
-                        paper_fee_rate = late_fee_rate if args.strategy == "late_favorite" else Decimal("0")
+                        paper_trade_stake = (
+                            signal.price * paper_shares
+                            if paper_shares > 0
+                            else paper_stake
+                        )
+                        paper_fee_rate = (
+                            late_fee_rate
+                            if args.strategy == "late_favorite"
+                            else smart_score_fee_rate
+                            if args.strategy == "smart_score"
+                            else Decimal("0")
+                        )
                         paper_bankroll = open_paper_position(
                             paper_positions,
                             paper_bankroll,
                             current_market.slug,
                             signal,
-                            paper_stake,
+                            paper_trade_stake,
                             paper_fee_rate,
                         )
                         if args.stop_when_bust and paper_bankroll <= 0:
@@ -2881,16 +4067,19 @@ def watch() -> None:
                         primary_side_this_window = signal.side
                         primary_orders_this_window = 1
                         if args.paper_trading:
-                            primary_cost_this_window = paper_stake
-                            primary_shares_this_window = paper_stake / signal.price
+                            primary_cost_this_window = paper_trade_stake
+                            primary_shares_this_window = paper_trade_stake / signal.price
                         else:
                             primary_cost_this_window = signal.price * trade_size
                             primary_shares_this_window = trade_size
-                    elif args.strategy == "fair_value_edge" and signal.side == primary_side_this_window:
+                    elif (
+                        is_fair_value_strategy(args.strategy)
+                        and signal.side == primary_side_this_window
+                    ):
                         primary_orders_this_window += 1
                         if args.paper_trading:
-                            primary_cost_this_window += paper_stake
-                            primary_shares_this_window += paper_stake / signal.price
+                            primary_cost_this_window += paper_trade_stake
+                            primary_shares_this_window += paper_trade_stake / signal.price
                         else:
                             primary_cost_this_window += signal.price * trade_size
                             primary_shares_this_window += trade_size
@@ -2956,7 +4145,23 @@ def watch() -> None:
                             tick_size=current_market.minimum_tick_size,
                             neg_risk=current_market.neg_risk,
                             order_type=args.live_order_type,
+                            submit_not_after_monotonic=submit_not_after_monotonic,
                         )
+                    except OrderQuoteExpiredError as exc:
+                        live_orders_submitted -= 1
+                        live_summary["status"] = "running"
+                        live_summary["order_attempts"] = live_orders_submitted
+                        live_summary["error"] = None
+                        order_record["error"] = f"{type(exc).__name__}: {exc}"
+                        write_live_summary(finalize=False)
+                        logger.info(
+                            "ORDER_BLOCKED_QUOTE_EXPIRED slug=%s side=%s error=%s",
+                            current_market.slug,
+                            signal.side,
+                            exc,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
                     except Exception as exc:
                         live_summary["status"] = "running"
                         live_summary["error"] = f"{type(exc).__name__}: {exc}"
@@ -3024,7 +4229,10 @@ def watch() -> None:
                             signal.price,
                             trade_size,
                         )
-                    elif args.strategy == "fair_value_edge" and signal.side == primary_side_this_window:
+                    elif (
+                        is_fair_value_strategy(args.strategy)
+                        and signal.side == primary_side_this_window
+                    ):
                         fill_cost, fill_shares = response_fill_amounts(
                             response,
                             signal.price,

@@ -14,7 +14,10 @@ from src.polymarket import (
     ClobDataClient,
     ClobTradingClient,
     Market,
+    OrderBookLevel,
+    OrderBookSnapshot,
     OrderBookQuote,
+    OrderQuoteExpiredError,
     _parse_token_ids,
     choose_btc_markets,
     filter_markets_by_liquidity,
@@ -39,7 +42,10 @@ from src.watch_updown import (
     consume_pause_window,
     effective_pullback_tolerance,
     evaluate_protective_hedge_risk,
+    executable_ask_depth,
     choose_fair_value_edge_signal,
+    choose_open_060_signal,
+    choose_smart_score_signal,
     choose_market_reversal_hedge_signal,
     choose_protective_hedge_signal,
     choose_late_favorite_signal,
@@ -51,6 +57,8 @@ from src.watch_updown import (
     open_paper_position,
     price_alignment_status,
     polling_interval_for_seconds_left,
+    primary_signal_confirmation_count,
+    refresh_open_060_signal,
     protective_open_cross_buffer,
     protective_spot_confirms_open_cross,
     quotes_pass_sanity_checks,
@@ -542,6 +550,51 @@ def test_live_fak_order_uses_v2_order_type(monkeypatch) -> None:
     assert calls[-1][2] == "FAK"
 
 
+def test_live_v2_order_blocks_post_when_final_quote_expires(monkeypatch) -> None:
+    calls = []
+
+    class OrderArgs:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class OrderType:
+        FAK = "FAK"
+
+    class Options:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class Client:
+        def create_order(self, order_args, options=None):
+            calls.append(("create", order_args.kwargs, options.kwargs))
+            return "signed"
+
+        def post_order(self, order, order_type):
+            calls.append(("post", order, order_type))
+            return {"success": True}
+
+    monkeypatch.setattr(
+        "src.polymarket._import_order_types",
+        lambda: (OrderArgs, OrderType, Options, "BUY"),
+    )
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+    trader._client_v2 = True
+
+    with pytest.raises(OrderQuoteExpiredError):
+        trader.buy_limit(
+            token_id="up",
+            price=Decimal("0.50"),
+            size=Decimal("5"),
+            tick_size="0.01",
+            neg_risk=False,
+            order_type="FAK",
+            submit_not_after_monotonic=time.monotonic() - 1,
+        )
+
+    assert [call[0] for call in calls] == ["create"]
+
+
 def test_live_fok_sell_uses_sell_side(monkeypatch) -> None:
     calls = []
 
@@ -604,6 +657,7 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
 
     args = parse_watch_args()
 
+    assert args.strategy == "reversal_v11"
     assert args.max_live_orders == 0
     assert args.max_trades == 2
     assert args.duration == 0
@@ -629,6 +683,8 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.hedge_fee_rate == "0.07"
     assert args.post_fill_poll_interval == 1.0
     assert args.pre_submit_max_adverse_ask_drop == "0.02"
+    assert args.pre_submit_max_ask_worsening == "0.02"
+    assert args.pre_submit_max_quote_age_seconds == 1.0
     assert args.max_entry == "0.78"
     assert args.max_live_notional == "4.05"
     assert args.late_max_live_notional == "4.70"
@@ -636,6 +692,23 @@ def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatc
     assert args.low_entry_min_win_probability == "0.61"
     assert args.low_entry_confirmation_samples == 3
     assert args.probability_shrinkage == "1.00"
+    assert args.smart_score_threshold == "70"
+    assert args.smart_score_entry_seconds == 100
+    assert args.smart_score_cutoff_seconds == 25
+    assert args.smart_score_min_probability == "0.52"
+    assert args.smart_score_fee_rate == "0.07"
+    assert args.smart_score_slippage == "0.01"
+    assert args.smart_score_trend_samples == 3
+    assert args.smart_score_stability_samples == 3
+    assert args.open_060_entry_seconds == 300
+    assert args.open_060_cutoff_seconds == 270
+    assert args.open_060_target == "0.60"
+    assert args.open_060_slippage == "0.01"
+    assert args.open_060_fee_rate == "0.07"
+    assert args.open_060_initial_ask == "0.50"
+    assert args.paper_shares == "0"
+    assert args.disable_telegram_commands is False
+    assert args.disable_discord is False
     assert args.min_win_probability == "0.55"
     assert args.edge == "0.02"
     assert args.max_spread == "0.05"
@@ -955,6 +1028,22 @@ def test_clob_books_fetches_atomic_depth_and_maps_token_order(monkeypatch) -> No
     ]
 
 
+def test_executable_ask_depth_only_counts_liquidity_within_limit() -> None:
+    book = OrderBookSnapshot(
+        token_id="up",
+        timestamp="1",
+        bids=(),
+        asks=(
+            OrderBookLevel(price=Decimal("0.60"), size=Decimal("2")),
+            OrderBookLevel(price=Decimal("0.61"), size=Decimal("3.5")),
+            OrderBookLevel(price=Decimal("0.62"), size=Decimal("10")),
+        ),
+        minimum_order_size=Decimal("1"),
+    )
+
+    assert executable_ask_depth(book, Decimal("0.61")) == Decimal("5.5")
+
+
 def test_btc_up_probability_moves_with_price() -> None:
     higher = btc_up_probability(Decimal("100"), Decimal("101"), Decimal("60"), Decimal("0.001"))
     lower = btc_up_probability(Decimal("100"), Decimal("99"), Decimal("60"), Decimal("0.001"))
@@ -1059,6 +1148,209 @@ def test_fair_value_edge_signal_buys_best_edge() -> None:
     assert signal is not None
     assert signal.side == "UP"
     assert signal.price == Decimal("0.52")
+
+
+def test_open_060_buys_first_side_crossing_target() -> None:
+    market = make_market(
+        "Bitcoin Up or Down?",
+        "btc-updown-5m-1",
+        "c1",
+        ("up", "down"),
+        "0.01",
+        False,
+        Decimal("10"),
+    )
+
+    signal = choose_open_060_signal(
+        market=market,
+        up_quote=OrderBookQuote(bid=Decimal("0.60"), ask=Decimal("0.61")),
+        down_quote=OrderBookQuote(bid=Decimal("0.39"), ask=Decimal("0.40")),
+        seconds_to_end=Decimal("285"),
+        previous_up_ask=Decimal("0.58"),
+        previous_down_ask=Decimal("0.43"),
+    )
+
+    assert signal is not None
+    assert signal.side == "UP"
+    assert signal.price == Decimal("0.61")
+    assert signal.reason.startswith("open_060 first_cross")
+
+
+def test_open_060_uses_observed_ask_after_price_jumps_above_planned_entry() -> None:
+    market = make_market(
+        "Bitcoin Up or Down?",
+        "btc-updown-5m-1",
+        "c1",
+        ("up", "down"),
+        "0.01",
+        False,
+        Decimal("10"),
+    )
+
+    signal = choose_open_060_signal(
+        market=market,
+        up_quote=OrderBookQuote(bid=Decimal("0.61"), ask=Decimal("0.65")),
+        down_quote=OrderBookQuote(bid=Decimal("0.34"), ask=Decimal("0.35")),
+        seconds_to_end=Decimal("285"),
+        previous_up_ask=Decimal("0.58"),
+        previous_down_ask=Decimal("0.43"),
+    )
+
+    assert signal is not None
+    assert signal.side == "UP"
+    assert signal.price == Decimal("0.65")
+
+
+def test_open_060_rejects_non_cross_and_late_cross() -> None:
+    market = make_market(
+        "Bitcoin Up or Down?",
+        "btc-updown-5m-1",
+        "c1",
+        ("up", "down"),
+        "0.01",
+        False,
+        Decimal("10"),
+    )
+    quotes = {
+        "up_quote": OrderBookQuote(bid=Decimal("0.61"), ask=Decimal("0.62")),
+        "down_quote": OrderBookQuote(bid=Decimal("0.38"), ask=Decimal("0.39")),
+    }
+
+    assert choose_open_060_signal(
+        market,
+        seconds_to_end=Decimal("285"),
+        previous_up_ask=Decimal("0.61"),
+        previous_down_ask=Decimal("0.39"),
+        **quotes,
+    ) is None
+    assert choose_open_060_signal(
+        market,
+        seconds_to_end=Decimal("269"),
+        previous_up_ask=Decimal("0.58"),
+        previous_down_ask=Decimal("0.39"),
+        **quotes,
+    ) is None
+
+
+def test_open_060_live_refresh_uses_current_actual_ask() -> None:
+    market = make_market(
+        "Bitcoin Up or Down?",
+        "btc-updown-5m-1",
+        "c1",
+        ("up", "down"),
+        "0.01",
+        False,
+        Decimal("10"),
+    )
+
+    signal = refresh_open_060_signal(
+        market,
+        "UP",
+        OrderBookQuote(bid=Decimal("0.64"), ask=Decimal("0.65")),
+        OrderBookQuote(bid=Decimal("0.34"), ask=Decimal("0.35")),
+        Decimal("285"),
+    )
+
+    assert signal is not None
+    assert signal.price == Decimal("0.65")
+    assert "pre_submit_refresh=true" in signal.reason
+
+
+def test_open_060_live_refresh_rejects_price_falling_below_target() -> None:
+    market = make_market(
+        "Bitcoin Up or Down?",
+        "btc-updown-5m-1",
+        "c1",
+        ("up", "down"),
+        "0.01",
+        False,
+        Decimal("10"),
+    )
+
+    assert refresh_open_060_signal(
+        market,
+        "UP",
+        OrderBookQuote(bid=Decimal("0.58"), ask=Decimal("0.59")),
+        OrderBookQuote(bid=Decimal("0.40"), ask=Decimal("0.41")),
+        Decimal("285"),
+    ) is None
+
+
+def test_smart_score_accepts_strong_explainable_signal() -> None:
+    market = make_market(
+        "Bitcoin Up or Down?",
+        "btc-updown-5m-1",
+        "c1",
+        ("up", "down"),
+        "0.01",
+        False,
+        Decimal("10"),
+    )
+    signal = choose_smart_score_signal(
+        market=market,
+        probability_up=Decimal("0.82"),
+        up_quote=OrderBookQuote(bid=Decimal("0.59"), ask=Decimal("0.60")),
+        down_quote=OrderBookQuote(bid=Decimal("0.40"), ask=Decimal("0.41")),
+        seconds_to_end=Decimal("70"),
+        decision_seconds_before_end=Decimal("100"),
+        min_seconds_before_end=Decimal("25"),
+        min_entry=Decimal("0.50"),
+        max_entry=Decimal("0.78"),
+        edge_threshold=Decimal("0.02"),
+        max_spread=Decimal("0.05"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+        recent_spot_prices=[Decimal("101"), Decimal("102"), Decimal("103")],
+        start_price=Decimal("100"),
+        up_ask_prices=[Decimal("0.58"), Decimal("0.59"), Decimal("0.60")],
+        down_ask_prices=[Decimal("0.43"), Decimal("0.42"), Decimal("0.41")],
+    )
+
+    assert signal is not None
+    assert signal.side == "UP"
+    assert signal.price == Decimal("0.61")
+    assert "smart_score total=" in signal.reason
+    assert "components=edge:" in signal.reason
+    components = signal.reason.split("components=", 1)[1]
+    assert ",trend:" in components
+    assert ",market:" in components
+    assert ",stability:" in components
+    assert ",timing:" in components
+    assert "probability:" not in components
+    assert "price:" not in components
+
+
+def test_smart_score_rejects_weak_combined_evidence() -> None:
+    market = make_market(
+        "Bitcoin Up or Down?",
+        "btc-updown-5m-1",
+        "c1",
+        ("up", "down"),
+        "0.01",
+        False,
+        Decimal("10"),
+    )
+    signal = choose_smart_score_signal(
+        market=market,
+        probability_up=Decimal("0.55"),
+        up_quote=OrderBookQuote(bid=Decimal("0.51"), ask=Decimal("0.52")),
+        down_quote=OrderBookQuote(bid=Decimal("0.47"), ask=Decimal("0.48")),
+        seconds_to_end=Decimal("70"),
+        decision_seconds_before_end=Decimal("100"),
+        min_seconds_before_end=Decimal("25"),
+        min_entry=Decimal("0.45"),
+        max_entry=Decimal("0.78"),
+        edge_threshold=Decimal("0.02"),
+        max_spread=Decimal("0.05"),
+        min_ask_sum=Decimal("0.90"),
+        max_ask_sum=Decimal("1.10"),
+        recent_spot_prices=[Decimal("99"), Decimal("100"), Decimal("99")],
+        start_price=Decimal("100"),
+        up_ask_prices=[Decimal("0.47"), Decimal("0.55"), Decimal("0.52")],
+        down_ask_prices=[Decimal("0.53"), Decimal("0.45"), Decimal("0.48")],
+    )
+
+    assert signal is None
 
 
 def test_protective_hedge_allows_opposite_low_price_after_model_flip() -> None:
@@ -1653,6 +1945,16 @@ def test_late_favorite_requires_fee_adjusted_expected_roi() -> None:
 
 def test_fair_value_reserves_one_extra_protection_slot() -> None:
     assert strategy_trade_limit("fair_value_edge", 5) == 6
+    assert strategy_trade_limit("late_070", 5) == 6
+    assert strategy_trade_limit("smart_score", 5) == 1
+    assert strategy_trade_limit("open_060", 5) == 1
+    assert strategy_trade_limit("open_060_late_070", 5) == 1
+
+
+def test_late_070_uses_first_primary_confirmation_only() -> None:
+    assert primary_signal_confirmation_count("late_070", 2) == 1
+    assert primary_signal_confirmation_count("open_060_late_070", 2) == 1
+    assert primary_signal_confirmation_count("fair_value_edge", 2) == 2
 
 
 def test_loss_pause_consumes_each_full_window_without_off_by_one() -> None:

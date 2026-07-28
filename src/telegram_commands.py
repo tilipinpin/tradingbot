@@ -28,10 +28,14 @@ INTERNAL_CALLBACK_COMMANDS = {
 }
 STRATEGY_LABELS = {
     "fair_value_edge": "公允价值差",
-    "late_one_way": "尾盘单边趋势",
+    "open_060_late_070": "开盘0.6 + 尾盘0.7",
+    "smart_score": "智能评分",
+    "reversal_v11": "BTC 5分钟反转 V1.1",
 }
-PAPER_ONLY_STRATEGIES: set[str] = set()
-LIVE_STRATEGIES = {"fair_value_edge", "late_one_way"}
+PAPER_ONLY_STRATEGIES = {"smart_score"}
+LIVE_STRATEGIES = {"fair_value_edge", "open_060_late_070", "reversal_v11"}
+EXECUTION_ADAPTER_PENDING_STRATEGIES: set[str] = set()
+DEFAULT_LAUNCH_STRATEGY = "reversal_v11"
 DEFAULT_STRATEGY = "__default__"
 BUTTON_COMMANDS = {
     "📈 查看余额": "/balance",
@@ -67,10 +71,13 @@ def strategy_selection_markup(
 ) -> dict[str, Any]:
     buttons: list[dict[str, str]] = []
     for strategy, label in STRATEGY_LABELS.items():
-        unavailable = mode == "live" and strategy not in LIVE_STRATEGIES
+        adapter_pending = strategy in EXECUTION_ADAPTER_PENDING_STRATEGIES
+        unavailable = adapter_pending or (mode == "live" and strategy not in LIVE_STRATEGIES)
         prefix = "✅ " if strategy == active_strategy else "⏳ " if strategy == pending_strategy else ""
         suffix = (
-            "（仅纸面）"
+            "（链上配置待完成）"
+            if adapter_pending
+            else "（仅纸面）"
             if unavailable and strategy in PAPER_ONLY_STRATEGIES
             else "（实盘待验证）"
             if unavailable

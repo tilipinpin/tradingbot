@@ -8,8 +8,11 @@ Git.
 Snapshot captured on 2026-07-18 before enabling official Polymarket `openPrice`
 alignment:
 
-- Live default: `fair_value_edge`, unlimited duration. Telegram can switch the
-  next complete window to `late_one_way`.
+- Live launch default: `reversal_v11`, unlimited duration. Telegram retains the
+  combined `open_060_late_070` strategy (“开盘0.6 + 尾盘0.7”): it first watches
+  for the opening 0.60 crossing, and only falls through to the one-confirmation
+  late 0.70 logic when no opening order was filled. The standalone `open_060`,
+  `late_070`, and `late_one_way` entries are no longer shown.
 
 The shell launchers accept an optional first argument for the initial event slug.
 When omitted, they start from the current five-minute epoch.

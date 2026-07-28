@@ -63,11 +63,15 @@ DEPOSIT_WALLET=0x...
 SIGNATURE_TYPE=3
 ```
 
-V2 新账户必须先通过 Polymarket Builder Relayer 部署 deposit wallet，再把 pUSD
+V2 新账户必须先通过 Polymarket Relayer 部署 deposit wallet，再把 pUSD
 转入该钱包并由该钱包授权交易合约。EOA 中的余额和授权不能用于 deposit wallet
 订单。部署和钱包批处理还需要 `RELAYER_URL`、`RPC_URL`、
 `RELAYER_API_KEY` 和 `RELAYER_API_KEY_ADDRESS`；CLOB 下单使用 `SIGNATURE_TYPE=3`，且 `FUNDER_ADDRESS`
 必须是已部署的 deposit wallet。本项目不会自动转移资金或发起授权。
+
+Polygon 完整份额拆分使用官方统一版 `polymarket-client` 的 `SecureClient`，直接复用
+上述 Relayer API key/address 与现有 deposit wallet，不再依赖 Builder API
+key/secret/passphrase 三凭据接口。
 
 ## 运行
 
@@ -220,8 +224,27 @@ Telegram 会发送以下全部通知；Discord 只发送其中的启动、结算
 `setChatMenuButton` 保留输入框旁的 `/` 命令菜单作为备用。Reply Keyboard 不用于频道。
 
 策略选择需要二次确认，并持久化到 `data/telegram_daily_state.json`，只在下一个完整
-5 分钟窗口生效。纸面、dry-run 和实盘 Telegram 选择器均提供 `fair_value_edge` 与
-`late_one_way`。选择“恢复启动策略”可清除 Telegram 策略覆盖，回到启动命令指定的策略。
+5 分钟窗口生效。实盘 Telegram 选择器提供默认的 `reversal_v11`、
+`open_060_late_070` 组合策略和 `fair_value_edge`；`smart_score` 保持纸面专用。
+反转轮次尚未结束时，切换会延后到整轮结束，避免中途遗留递增状态。选择“恢复启动策略”
+可清除 Telegram 策略覆盖，回到启动命令指定的策略。
+
+`reversal_v11` 在新窗口开盘先确认刚结束窗口的结果，不提交链上交易等待未知结果。
+最近两个结果同向时，立即按阶段金额（2U→4U→8U→16U）拆分完整 UP/DOWN 份额；
+拆分确认后马上刷新盘口，并以最新最优 bid 提交一笔 FAK 卖出原趋势侧，保留反向侧
+等待结算。该直接退出模式不再使用波动率、单边幅度、深度或 spread 过滤；结果不同向时
+不拆分。Polygon 完整份额
+合并仅用于恢复已经确认、但最终未被策略采用的异常拆分，不作为正常窗口流程。拆分、
+合并、部分卖出和整轮进度保存在
+`data/reversal_v11_state.json`。拆分或合并提交中的进程中断会锁定为不确定状态，必须先
+核对链上仓位，程序不会自动重复交易；卖单提交中断则先读取实际 token 余额再决定是否补卖。
+趋势仓全部卖出后，账本以“拆分金额减趋势仓累计回款”作为反向保留仓的等效投入；窗口
+结算后复用公允价值策略的盈利/亏损窗口模板，同时向 Telegram 和 Discord 推送组合净盈亏、
+拆分金额、卖出回款、保留方向及轮次阶段。
+
+实盘启动自检要求 Polygon chain 137、当前 CTF/适配器合约、至少 30 pUSD（新一轮）、
+已部署 Deposit Wallet、有效 Relayer nonce、CLOB 认证、可读取双边持仓且没有未完成订单。
+日报发送后会等待窗口结束和当前反转轮次结束，再执行安全重启。
 
 首次启用命令轮询时会丢弃启动前积压的旧消息，避免历史 `/stop` 或 `/restart` 被误执行。
 控制状态和 Telegram offset 也保存在 `data/telegram_daily_state.json`，所以进程重启后不会重复执行指令。

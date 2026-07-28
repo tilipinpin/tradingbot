@@ -3,4 +3,8 @@ requests>=2.32.0
 websocket-client>=1.8.0
 python-socks>=2.7.0
 py-clob-client-v2>=1.0.2
-py-builder-relayer-client>=0.0.2
+polymarket-client==0.1.0b21
+eth-abi>=5.2.0
+eth-account>=0.13.7
+eth-utils>=4.0.0,<6
+web3>=6.5.0

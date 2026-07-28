@@ -369,6 +369,77 @@ def test_settlement_service_sends_one_notification_per_window(tmp_path) -> None:
     assert len(saved["settlements"]) == 2
 
 
+def test_reversal_retained_position_uses_window_pnl_notification_on_both_channels(
+    tmp_path,
+) -> None:
+    telegram_session = FakeSession()
+    discord_session = FakeSession()
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(
+            "123456:telegram-token-value_1234567890",
+            "42",
+            session=telegram_session,
+        ),
+        discord_notifier=DiscordNotifier(
+            "https://discord.com/api/webhooks/123456/secret_webhook_token",
+            session=discord_session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="reversal_v11",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+        settlement_interval=5,
+        notify_on_matched=False,
+    )
+    service.record_reversal_exit(
+        {
+            "slug": "btc-updown-5m-700",
+            "side": "UP",
+            "retained_side": "DOWN",
+            "split_amount": "2",
+            "cumulative_exit_proceeds": "1.20",
+            "round_id": 3,
+            "attempt": 2,
+            "exit_complete": True,
+            "response": {
+                "status": "matched",
+                "makingAmount": "2",
+                "takingAmount": "1.20",
+            },
+        }
+    )
+
+    ledger_order = json.loads(ledger.read_text().strip())
+    assert ledger_order["side"] == "DOWN"
+    assert ledger_order["order_role"] == "reversal_retained"
+    assert ledger_order["response"]["makingAmount"] == "0.80"
+    assert ledger_order["response"]["takingAmount"] == "2"
+
+    service.maybe_send_settlements(lambda slug: "DOWN")
+
+    assert len(telegram_session.calls) == 1
+    telegram_text = telegram_session.calls[0][1]["text"]
+    assert "结果: ✅ 盈利" in telegram_text
+    assert "订单 1 [反转保留仓]: DOWN" in telegram_text
+    assert "反转仓位: 卖出 UP / 保留 DOWN" in telegram_text
+    assert "拆分金额: 2.0000 pUSD" in telegram_text
+    assert "趋势仓卖出回款: 1.2000 pUSD" in telegram_text
+    assert "轮次/阶段: 3/2" in telegram_text
+    assert len(discord_session.calls) == 1
+    discord_embed = discord_session.calls[0][1]["embeds"][0]
+    assert "✅ 盈利" in json.dumps(discord_embed, ensure_ascii=False)
+    saved = json.loads(state.read_text())
+    assert saved["settlement_windows"]["btc-updown-5m-700"][
+        "notified_channels"
+    ] == ["discord", "telegram"]
+
+
 def test_settlement_window_migration_does_not_repeat_legacy_notifications(tmp_path) -> None:
     session = FakeSession()
     notifier = TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session)
@@ -862,7 +933,7 @@ def test_status_command_reports_health_and_trading_pause(tmp_path) -> None:
     assert "BTC/USD: 118000.50（CHAINLINK）" in message
 
 
-def test_paper_strategy_switch_is_queued_and_activated_next_window(tmp_path) -> None:
+def test_paper_reversal_strategy_is_queued_and_activated(tmp_path) -> None:
     session = FakeSession()
     state = tmp_path / "state.json"
     service = TradingNotificationService(
@@ -876,19 +947,15 @@ def test_paper_strategy_switch_is_queued_and_activated_next_window(tmp_path) -> 
         state_path=state,
     )
 
-    service._queue_strategy("late_one_way")
+    service._queue_strategy("reversal_v11")
 
     assert service.strategy == "fair_value_edge"
-    assert service.pending_strategy == "late_one_way"
-    assert service.activate_pending_strategy("btc-updown-5m-2") == "late_one_way"
-    assert service.strategy == "late_one_way"
-    saved = json.loads(state.read_text())
-    assert saved["control"]["strategy_override"] == "late_one_way"
-    assert "pending_strategy" not in saved["control"]
-    assert "生效市场: btc-updown-5m-2" in session.calls[-1][1]["text"]
+    assert service.pending_strategy == "reversal_v11"
+    assert service.activate_pending_strategy("btc-updown-5m-2") == "reversal_v11"
+    assert service.strategy == "reversal_v11"
 
 
-def test_live_strategy_switch_allows_one_way(tmp_path) -> None:
+def test_live_strategy_switch_queues_reversal_v11(tmp_path) -> None:
     session = FakeSession()
     service = TradingNotificationService(
         notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
@@ -901,10 +968,10 @@ def test_live_strategy_switch_allows_one_way(tmp_path) -> None:
         state_path=tmp_path / "state.json",
     )
 
-    service._queue_strategy("late_one_way")
+    service._queue_strategy("reversal_v11")
 
-    assert service.pending_strategy == "late_one_way"
-    assert "尾盘单边趋势" in session.calls[-1][1]["text"]
+    assert service.pending_strategy == "reversal_v11"
+    assert "BTC 5分钟反转 V1.1" in session.calls[-1][1]["text"]
 
 
 def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
@@ -919,8 +986,8 @@ def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
         summary={},
         state_path=state,
     )
-    paper._queue_strategy("late_one_way")
-    paper.activate_pending_strategy("btc-updown-5m-2")
+    paper.state.setdefault("control", {})["strategy_override"] = "reversal_v11"
+    paper._save_state()
 
     restarted_paper = TradingNotificationService(
         notifier=TelegramNotifier(None, None),
@@ -943,11 +1010,11 @@ def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
         state_path=state,
     )
 
-    assert restarted_paper.resolve_effective_strategy() == "late_one_way"
-    assert restarted_live.resolve_effective_strategy() == "late_one_way"
+    assert restarted_paper.resolve_effective_strategy() == "reversal_v11"
+    assert restarted_live.resolve_effective_strategy() == "reversal_v11"
 
 
-def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path) -> None:
+def test_queued_reversal_strategy_survives_restart(tmp_path) -> None:
     state = tmp_path / "state.json"
     service = TradingNotificationService(
         notifier=TelegramNotifier(None, None),
@@ -960,7 +1027,7 @@ def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path
         state_path=state,
     )
     service.update_runtime(slug="btc-updown-5m-1")
-    service._queue_strategy("late_one_way")
+    service._queue_strategy("reversal_v11")
 
     restarted = TradingNotificationService(
         notifier=TelegramNotifier(None, None),
@@ -974,5 +1041,5 @@ def test_queued_strategy_survives_restart_without_switching_same_window(tmp_path
     )
 
     assert restarted.activate_pending_strategy("btc-updown-5m-1") is None
-    assert restarted.pending_strategy == "late_one_way"
-    assert restarted.activate_pending_strategy("btc-updown-5m-2") == "late_one_way"
+    assert restarted.pending_strategy == "reversal_v11"
+    assert restarted.activate_pending_strategy("btc-updown-5m-2") == "reversal_v11"

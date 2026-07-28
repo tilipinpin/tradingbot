@@ -136,20 +136,37 @@ def test_poller_maps_large_keyboard_button_to_command() -> None:
     assert [item.command for item in poller.drain()] == ["/positions"]
 
 
-def test_live_strategy_menu_allows_two_active_strategies() -> None:
-    markup = strategy_selection_markup("live", "fair_value_edge", "late_one_way")
+def test_live_strategy_menu_keeps_combined_strategy_and_adds_reversal_v11() -> None:
+    markup = strategy_selection_markup("live", "fair_value_edge", None)
     buttons = [button for row in markup["inline_keyboard"] for button in row]
     by_data = {button["callback_data"]: button["text"] for button in buttons}
 
     assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
-    assert "⏳ 尾盘单边趋势" == by_data["strategy:select:late_one_way"]
+    assert "开盘0.6 + 尾盘0.7" == by_data[
+        "strategy:select:open_060_late_070"
+    ]
+    assert "智能评分（仅纸面）" == by_data["strategy:unavailable:smart_score"]
+    assert "BTC 5分钟反转 V1.1" == by_data[
+        "strategy:select:reversal_v11"
+    ]
+    assert "strategy:select:late_070" not in by_data
+    assert "strategy:select:late_one_way" not in by_data
+    assert "strategy:select:open_060" not in by_data
     assert "↩️ 恢复启动策略" == by_data[f"strategy:select:{DEFAULT_STRATEGY}"]
-    assert all("仅纸面" not in button["text"] for button in buttons)
-    assert len(buttons) == 4
+    assert len(buttons) == 6
+
+
+def test_paper_strategy_menu_allows_smart_score() -> None:
+    markup = strategy_selection_markup("paper", "fair_value_edge", None)
+    buttons = [button for row in markup["inline_keyboard"] for button in row]
+    by_data = {button["callback_data"]: button["text"] for button in buttons}
+
+    assert by_data["strategy:select:smart_score"] == "智能评分"
+    assert by_data["strategy:select:reversal_v11"] == "BTC 5分钟反转 V1.1"
 
 
 def test_poller_parses_strategy_callback_from_authorized_chat() -> None:
-    notifier = FakeNotifier([telegram_callback(40, 42, "strategy:select:late_one_way")])
+    notifier = FakeNotifier([telegram_callback(40, 42, "strategy:select:reversal_v11")])
     poller = TelegramCommandPoller(notifier, "42", 40, Event())
 
     poller.poll_once()
@@ -157,5 +174,5 @@ def test_poller_parses_strategy_callback_from_authorized_chat() -> None:
 
     assert len(commands) == 1
     assert commands[0].command == "/strategy_select"
-    assert commands[0].argument == "late_one_way"
+    assert commands[0].argument == "reversal_v11"
     assert commands[0].callback_query_id == "callback-40"
