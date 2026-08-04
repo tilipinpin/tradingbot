@@ -37,11 +37,16 @@ class FakeRpc:
         self.split_done = False
         self.merge_done = False
         self.operator_approved = False
+        self.chain_id_calls = 0
+        self.code_calls: list[str] = []
+        self.allowance_calls = 0
 
     def chain_id(self) -> int:
+        self.chain_id_calls += 1
         return self._chain_id
 
     def code(self, address: str) -> str:
+        self.code_calls.append(address.lower())
         return "0x6001"
 
     def call(self, to: str, data: str) -> str:
@@ -49,6 +54,7 @@ class FakeRpc:
         if to.lower() == PUSD_ADDRESS.lower() and selector == "0x70a08231":
             return _uint(50_000_000 + (2_000_000 if self.merge_done else 0))
         if to.lower() == PUSD_ADDRESS.lower() and selector == "0xdd62ed3e":
+            self.allowance_calls += 1
             return _uint(self.allowance)
         if to.lower() in {CTF_ADDRESS.lower(), NEG_RISK_ADAPTER.lower()} and selector == "0x00fdd58e":
             token_id = decode(["address", "uint256"], bytes.fromhex(data[10:]))[1]
@@ -169,6 +175,32 @@ def test_split_skips_approval_when_allowance_is_sufficient() -> None:
     assert receipt.approval_included is False
 
 
+def test_startup_preflight_caches_static_checks_and_sufficient_allowance() -> None:
+    rpc = FakeRpc(allowance=50_000_000)
+    splitter = CompleteSetSplitter(rpc, FakeSubmitter(rpc), WALLET)
+
+    splitter.preflight(
+        condition_id=CONDITION,
+        up_token_id=UP_TOKEN,
+        down_token_id=DOWN_TOKEN,
+        amount=Decimal("30"),
+        neg_risk=False,
+    )
+    first_code_calls = list(rpc.code_calls)
+    splitter.preflight(
+        condition_id=CONDITION,
+        up_token_id=UP_TOKEN,
+        down_token_id=DOWN_TOKEN,
+        amount=Decimal("2"),
+        neg_risk=False,
+    )
+
+    assert rpc.chain_id_calls == 1
+    assert len(first_code_calls) == 3
+    assert rpc.code_calls == first_code_calls
+    assert rpc.allowance_calls == 1
+
+
 def test_merge_batches_erc1155_operator_approval_and_verifies_deltas() -> None:
     rpc = FakeRpc(allowance=20_000_000)
     rpc.split_done = True
@@ -272,6 +304,123 @@ def test_secure_relayer_uses_existing_api_key_and_batches_calls() -> None:
         "0xnewtransaction",
         "STATE_CONFIRMED",
     )
+
+
+def test_secure_relayer_recovers_confirmation_after_sdk_wait_timeout(monkeypatch) -> None:
+    payloads = [
+        {"state": "STATE_EXECUTED", "transaction_hash": ""},
+        {
+            "state": "STATE_CONFIRMED",
+            "transaction_id": "slow-relay-id",
+            "transaction_hash": "0xconfirmedlater",
+        },
+    ]
+    requests_seen = []
+
+    class Handle:
+        transaction_id = "slow-relay-id"
+        transaction_hash = None
+
+        def wait(self):
+            raise TimeoutError("SDK confirmation window expired")
+
+    class Client:
+        wallet = WALLET
+        wallet_type = "DEPOSIT_WALLET"
+
+        def execute_transaction(self, *, calls, metadata):
+            return Handle()
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, **kwargs):
+        requests_seen.append((url, kwargs))
+        return Response(payloads.pop(0))
+
+    monkeypatch.setattr("src.polygon_split.requests.get", fake_get)
+    submitter = SecureRelayerSubmitter(
+        relayer_url="https://relayer-v2.polymarket.com",
+        private_key="0x" + "11" * 32,
+        signature_type=3,
+        wallet=WALLET,
+        rpc_url="https://polygon.example",
+        relayer_api_key="existing-key",
+        relayer_api_key_address=WALLET,
+        client_factory=lambda **kwargs: Client(),
+        transaction_call_factory=lambda **kwargs: ContractCall(
+            to=kwargs["to"], data=kwargs["data"], value=str(kwargs["value"])
+        ),
+        confirmation_recovery_attempts=3,
+        confirmation_recovery_poll_seconds=0,
+    )
+
+    result = submitter.submit(
+        [ContractCall(to=CTF_COLLATERAL_ADAPTER, data="0x1234")],
+        "complete-set split",
+    )
+
+    assert result == ("slow-relay-id", "0xconfirmedlater", "STATE_CONFIRMED")
+    assert len(requests_seen) == 2
+    assert requests_seen[0][0].endswith(
+        "/v1/account/transactions/slow-relay-id"
+    )
+    assert requests_seen[0][1]["headers"]["RELAYER_API_KEY"] == "existing-key"
+
+
+def test_secure_relayer_keeps_unknown_timeout_uncertain(monkeypatch) -> None:
+    class Handle:
+        transaction_id = "unknown-relay-id"
+        transaction_hash = None
+
+        def wait(self):
+            raise TimeoutError("SDK confirmation window expired")
+
+    class Client:
+        wallet = WALLET
+        wallet_type = "DEPOSIT_WALLET"
+
+        def execute_transaction(self, *, calls, metadata):
+            return Handle()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"state": "STATE_EXECUTED", "transaction_hash": ""}
+
+    monkeypatch.setattr(
+        "src.polygon_split.requests.get", lambda *args, **kwargs: Response()
+    )
+    submitter = SecureRelayerSubmitter(
+        relayer_url="https://relayer-v2.polymarket.com",
+        private_key="0x" + "11" * 32,
+        signature_type=3,
+        wallet=WALLET,
+        rpc_url="https://polygon.example",
+        relayer_api_key="existing-key",
+        relayer_api_key_address=WALLET,
+        client_factory=lambda **kwargs: Client(),
+        transaction_call_factory=lambda **kwargs: ContractCall(
+            to=kwargs["to"], data=kwargs["data"], value=str(kwargs["value"])
+        ),
+        confirmation_recovery_attempts=2,
+        confirmation_recovery_poll_seconds=0,
+    )
+
+    with pytest.raises(TimeoutError, match="SDK confirmation window expired"):
+        submitter.submit(
+            [ContractCall(to=CTF_COLLATERAL_ADAPTER, data="0x1234")],
+            "complete-set split",
+        )
 
 
 def test_secure_relayer_read_only_check_verifies_deployment_and_nonce(monkeypatch) -> None:

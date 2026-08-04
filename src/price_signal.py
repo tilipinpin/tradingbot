@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import os
 import re
 import json
+import ssl
 import threading
 import time
 from collections import deque
-from urllib.parse import urlparse
 from dataclasses import dataclass
 from decimal import Decimal
 
+import aiohttp
 import requests
-import websocket
 import certifi
 from requests import RequestException
 
@@ -46,6 +47,7 @@ class SpotPriceClient:
         self.timeout = timeout
         self.ws_proxy = ws_proxy
         self._polymarket_stream: PolymarketChainlinkStream | None = None
+        self._polymarket_failures = 0
 
     def btc_usd(self) -> SpotPrice:
         if self.source == "CHAINLINK":
@@ -59,9 +61,20 @@ class SpotPriceClient:
         errors: list[str] = []
         for source in sources:
             try:
-                return self._btc_usd_from_source(source)
+                price = self._btc_usd_from_source(source)
+                if source == "POLYMARKET_CHAINLINK":
+                    self._polymarket_failures = 0
+                return price
             except (KeyError, RequestException, RuntimeError, ValueError) as exc:
                 errors.append(f"{source}: {exc}")
+                if source == "POLYMARKET_CHAINLINK":
+                    self._polymarket_failures += 1
+                    if self._polymarket_failures >= 3:
+                        stream = self._polymarket_stream
+                        self._polymarket_stream = None
+                        self._polymarket_failures = 0
+                        if stream is not None:
+                            stream.close()
         raise RuntimeError(f"All BTC/USD price sources failed: {'; '.join(errors)}")
 
     def polymarket_chainlink_price_near(
@@ -213,6 +226,7 @@ class PolymarketChainlinkStream:
         self._latest: SpotPrice | None = None
         self._history: deque[SpotPrice] = deque(maxlen=4096)
         self._ready = threading.Event()
+        self._stop = threading.Event()
         self._started = False
         self._lock = threading.Lock()
         self._last_error: str | None = None
@@ -239,7 +253,8 @@ class PolymarketChainlinkStream:
             if not self._started:
                 self._started = True
                 threading.Thread(target=self._run, name="polymarket-chainlink", daemon=True).start()
-        if not self._ready.wait(self.timeout):
+        initial_stream_timeout = max(12, self.timeout)
+        if not self._ready.wait(initial_stream_timeout):
             detail = f": {self._last_error}" if self._last_error else ""
             raise RuntimeError(f"Timed out waiting for Polymarket Chainlink BTC/USD stream{detail}")
         with self._lock:
@@ -267,50 +282,70 @@ class PolymarketChainlinkStream:
             )
         return nearest
 
+    def close(self) -> None:
+        self._stop.set()
+
     def _run(self) -> None:
-        while True:
-            connection = None
+        asyncio.run(self._run_async())
+
+    async def _run_async(self) -> None:
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        timeout = aiohttp.ClientTimeout(total=None, connect=self.timeout)
+        while not self._stop.is_set():
             try:
-                options: dict[str, object] = {"timeout": self.timeout, "sslopt": {"ca_certs": certifi.where()}}
-                if self.proxy_url:
-                    proxy = urlparse(self.proxy_url)
-                    if not proxy.hostname or not proxy.port:
-                        raise ValueError("WebSocket proxy must include scheme, host, and port")
-                    options.update(
-                        http_proxy_host=proxy.hostname,
-                        http_proxy_port=proxy.port,
-                        proxy_type=proxy.scheme,
-                    )
-                connection = websocket.create_connection(self.URL, **options)
-                connection.send(json.dumps(self.SUBSCRIPTION))
-                while True:
-                    try:
-                        message = connection.recv()
-                    except websocket.WebSocketTimeoutException:
-                        with self._lock:
-                            latest = self._latest
-                        if (
-                            latest is not None
-                            and latest.observed_at is not None
-                            and int(time.time()) - latest.observed_at > self.max_stale_seconds
-                        ):
-                            raise RuntimeError("Polymarket Chainlink BTC/USD stream stopped updating")
-                        connection.send("PING")
-                        continue
-                    if not isinstance(message, str) or not message.strip():
-                        continue
-                    price = self.parse_message(message)
-                    if price is not None:
-                        with self._lock:
-                            self._latest = price
-                            self._history.append(price)
-                        self._ready.set()
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.ws_connect(
+                        self.URL,
+                        proxy=self.proxy_url,
+                        ssl=ssl_context,
+                        heartbeat=None,
+                    ) as connection:
+                        await connection.send_json(self.SUBSCRIPTION)
+                        await connection.send_str("PING")
+                        last_ping_at = time.monotonic()
+                        while not self._stop.is_set():
+                            try:
+                                message = await connection.receive(timeout=self.timeout)
+                            except asyncio.TimeoutError:
+                                message = None
+                            if time.monotonic() - last_ping_at >= 5:
+                                await connection.send_str("PING")
+                                last_ping_at = time.monotonic()
+                            if message is None:
+                                with self._lock:
+                                    latest = self._latest
+                                if (
+                                    latest is not None
+                                    and latest.observed_at is not None
+                                    and int(time.time()) - latest.observed_at
+                                    > self.max_stale_seconds
+                                ):
+                                    raise RuntimeError(
+                                        "Polymarket Chainlink BTC/USD stream stopped updating"
+                                    )
+                                continue
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                if not message.data:
+                                    continue
+                                price = self.parse_message(str(message.data))
+                                if price is not None:
+                                    with self._lock:
+                                        self._latest = price
+                                        self._history.append(price)
+                                    self._ready.set()
+                                continue
+                            if message.type in {
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            }:
+                                raise RuntimeError(
+                                    f"Polymarket Chainlink WebSocket closed: {message.data}"
+                                )
             except Exception as exc:
-                self._last_error = str(exc)
-                time.sleep(1)
-            finally:
-                if connection is not None:
-                    connection.close()
+                with self._lock:
+                    self._last_error = str(exc)
+                await asyncio.sleep(1)
 
 
 def extract_price_threshold(text: str) -> Decimal | None:

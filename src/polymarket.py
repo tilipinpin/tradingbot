@@ -321,8 +321,43 @@ class ClobTradingClient(ClobDataClient):
         payload = self.client.get_balance_allowance(params)
         return Decimal(str(payload.get("balance") or "0")) / Decimal("1000000")
 
+    def collateral_balance(self, signature_type: int) -> Decimal:
+        try:
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+        except ImportError:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=signature_type,
+        )
+        self.client.update_balance_allowance(params)
+        payload = self.client.get_balance_allowance(params)
+        return Decimal(str(payload.get("balance") or "0")) / Decimal("1000000")
+
     def open_orders(self) -> list[Any]:
         return list(self.client.get_open_orders() or [])
+
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        payload = self.client.get_order(order_id)
+        if not isinstance(payload, dict):
+            raise ValueError("CLOB get_order response must be an object")
+        return payload
+
+    def cancel_orders(self, order_ids: list[str]) -> Any:
+        clean = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
+        if not clean:
+            return None
+        if len(clean) == 1 and hasattr(self.client, "cancel_order"):
+            try:
+                from py_clob_client_v2 import OrderPayload
+            except ImportError:
+                try:
+                    from py_clob_client.clob_types import OrderPayload
+                except ImportError:
+                    OrderPayload = None
+            payload = OrderPayload(orderID=clean[0]) if OrderPayload is not None else clean[0]
+            return self.client.cancel_order(payload)
+        return self.client.cancel_orders(clean)
 
     def buy_limit(
         self,
@@ -333,6 +368,7 @@ class ClobTradingClient(ClobDataClient):
         neg_risk: bool,
         order_type: str = "GTC",
         submit_not_after_monotonic: float | None = None,
+        post_only: bool = False,
     ) -> dict[str, Any]:
         OrderArgs, OrderType, PartialCreateOrderOptions, buy_side = _import_order_types()
         return self._post_limit(
@@ -347,6 +383,7 @@ class ClobTradingClient(ClobDataClient):
             neg_risk,
             order_type,
             submit_not_after_monotonic,
+            post_only,
         )
 
     def sell_limit(
@@ -358,6 +395,7 @@ class ClobTradingClient(ClobDataClient):
         neg_risk: bool,
         order_type: str = "GTC",
         submit_not_after_monotonic: float | None = None,
+        post_only: bool = False,
     ) -> dict[str, Any]:
         OrderArgs, OrderType, PartialCreateOrderOptions, sell_side = _import_sell_order_types()
         return self._post_limit(
@@ -372,6 +410,7 @@ class ClobTradingClient(ClobDataClient):
             neg_risk,
             order_type,
             submit_not_after_monotonic,
+            post_only,
         )
 
     def _post_limit(
@@ -387,6 +426,7 @@ class ClobTradingClient(ClobDataClient):
         neg_risk: bool,
         order_type: str,
         submit_not_after_monotonic: float | None,
+        post_only: bool,
     ) -> dict[str, Any]:
         selected_order_type = getattr(OrderType, order_type.upper())
         order_args = OrderArgs(
@@ -398,10 +438,17 @@ class ClobTradingClient(ClobDataClient):
         options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
 
         if getattr(self, "_client_v2", False) and submit_not_after_monotonic is None:
+            if not post_only:
+                return self.client.create_and_post_order(
+                    order_args,
+                    options=options,
+                    order_type=selected_order_type,
+                )
             return self.client.create_and_post_order(
                 order_args,
                 options=options,
                 order_type=selected_order_type,
+                post_only=True,
             )
 
         if (
@@ -409,6 +456,12 @@ class ClobTradingClient(ClobDataClient):
             and submit_not_after_monotonic is None
             and hasattr(self.client, "create_and_post_order")
         ):
+            if post_only:
+                return self.client.create_and_post_order(
+                    order_args,
+                    options=options,
+                    post_only=True,
+                )
             return self.client.create_and_post_order(order_args, options=options)
 
         signed_order = self.client.create_order(order_args, options=options)
@@ -418,6 +471,12 @@ class ClobTradingClient(ClobDataClient):
         ):
             raise OrderQuoteExpiredError(
                 "Final order-book quote expired before order submission"
+            )
+        if post_only:
+            return self.client.post_order(
+                signed_order,
+                selected_order_type,
+                post_only=True,
             )
         return self.client.post_order(signed_order, selected_order_type)
 

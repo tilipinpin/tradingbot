@@ -431,6 +431,7 @@ def test_reversal_retained_position_uses_window_pnl_notification_on_both_channel
     assert "拆分金额: 2.0000 pUSD" in telegram_text
     assert "趋势仓卖出回款: 1.2000 pUSD" in telegram_text
     assert "轮次/阶段: 3/2" in telegram_text
+    assert "本轮累计净盈亏估算: +1.1664 pUSD" in telegram_text
     assert len(discord_session.calls) == 1
     discord_embed = discord_session.calls[0][1]["embeds"][0]
     assert "✅ 盈利" in json.dumps(discord_embed, ensure_ascii=False)
@@ -438,6 +439,46 @@ def test_reversal_retained_position_uses_window_pnl_notification_on_both_channel
     assert saved["settlement_windows"]["btc-updown-5m-700"][
         "notified_channels"
     ] == ["discord", "telegram"]
+
+
+def test_reversal_notification_round_pnl_includes_prior_attempt_losses() -> None:
+    prior_order = matched_order(side="UP", cost="1.20", shares="2")
+    prior_order.update(
+        {
+            "slug": "btc-updown-5m-695",
+            "order_role": "reversal_retained",
+            "round_id": 3,
+            "attempt": 1,
+        }
+    )
+    prior = settlement_values(prior_order, "DOWN")
+
+    current_order = matched_order(side="DOWN", cost="0.80", shares="2")
+    current_order.update(
+        {
+            "slug": "btc-updown-5m-700",
+            "order_role": "reversal_retained",
+            "round_id": 3,
+            "attempt": 2,
+        }
+    )
+    current = settlement_values(current_order, "DOWN")
+    unrelated = dict(prior, round_id=2)
+
+    message = format_window_settlement_message(
+        [current],
+        AccountSnapshot(Decimal("20"), Decimal("0"), Decimal("0"), 0),
+        [unrelated, prior, current],
+    )
+
+    assert "轮次/阶段: 3/2" in message
+    assert "本轮累计净盈亏估算: -0.0672 pUSD" in message
+    lines = message.splitlines()
+    window_pnl_index = lines.index("本窗口净盈亏估算: +1.1664 pUSD")
+    assert lines[window_pnl_index + 1 : window_pnl_index + 3] == [
+        "轮次/阶段: 3/2",
+        "本轮累计净盈亏估算: -0.0672 pUSD",
+    ]
 
 
 def test_settlement_window_migration_does_not_repeat_legacy_notifications(tmp_path) -> None:
@@ -971,7 +1012,7 @@ def test_live_strategy_switch_queues_reversal_v11(tmp_path) -> None:
     service._queue_strategy("reversal_v11")
 
     assert service.pending_strategy == "reversal_v11"
-    assert "BTC 5分钟反转 V1.1" in session.calls[-1][1]["text"]
+    assert "反转·2窗" in session.calls[-1][1]["text"]
 
 
 def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:
@@ -1043,3 +1084,88 @@ def test_queued_reversal_strategy_survives_restart(tmp_path) -> None:
     assert restarted.activate_pending_strategy("btc-updown-5m-1") is None
     assert restarted.pending_strategy == "reversal_v11"
     assert restarted.activate_pending_strategy("btc-updown-5m-2") == "reversal_v11"
+
+
+def test_manual_buy_confirmation_queues_independent_two_share_request(tmp_path) -> None:
+    session = FakeSession()
+    submitted = []
+    service = TradingNotificationService(
+        notifier=TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session),
+        trader=None,
+        signature_type=3,
+        strategy="reversal_v11_four_streak",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=tmp_path / "state.json",
+    )
+    service.attach_manual_executor(submitted.append)
+    service.update_runtime(slug="btc-updown-5m-900")
+
+    service._send_manual_confirmation("current_buy_up")
+    service._queue_manual_trade("current_buy_up", "77")
+
+    assert len(submitted) == 1
+    assert submitted[0].request_id == "telegram-77"
+    assert submitted[0].target_slug == "btc-updown-5m-900"
+    assert submitted[0].action == "buy"
+    assert submitted[0].side == "UP"
+    assert service.state["manual_orders"][0]["status"] == "queued"
+    assert service.strategy == "reversal_v11_four_streak"
+
+
+def test_manual_next_window_buy_targets_exact_next_slug(tmp_path) -> None:
+    submitted = []
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="reversal_v11_four_streak",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=tmp_path / "state.json",
+    )
+    service.attach_manual_executor(submitted.append)
+    service.update_runtime(slug="btc-updown-5m-900")
+
+    service._send_manual_confirmation("next_buy_down")
+    service._queue_manual_trade("next_buy_down", "78")
+
+    assert submitted[0].target_slug == "btc-updown-5m-1200"
+    assert submitted[0].side == "DOWN"
+
+
+def test_manual_current_window_confirmation_expires_after_window_change(tmp_path) -> None:
+    submitted = []
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="reversal_v11_four_streak",
+        mode="live",
+        version="test",
+        summary={},
+        state_path=tmp_path / "state.json",
+    )
+    service.attach_manual_executor(submitted.append)
+    service.update_runtime(slug="btc-updown-5m-900")
+    service.state["manual_orders"] = [
+        {
+            "request_id": "prior-buy",
+            "target_slug": "btc-updown-5m-900",
+            "action": "buy",
+            "side": "UP",
+            "status": "matched",
+            "filled_size": "2",
+        }
+    ]
+    service._send_manual_confirmation("current_sell_up")
+    service.update_runtime(slug="btc-updown-5m-1200")
+
+    service._queue_manual_trade("current_sell_up", "79")
+
+    assert submitted == []
+    assert [item["request_id"] for item in service.state["manual_orders"]] == [
+        "prior-buy"
+    ]

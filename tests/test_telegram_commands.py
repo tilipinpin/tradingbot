@@ -123,6 +123,7 @@ def test_persistent_keyboard_has_all_control_buttons() -> None:
         "⛔ 停止交易",
         "▶️ 恢复交易",
         "🧠 选择策略",
+        "🎛 手动交易",
         "🔄 重启机器人",
     ]
 
@@ -142,18 +143,25 @@ def test_live_strategy_menu_keeps_combined_strategy_and_adds_reversal_v11() -> N
     by_data = {button["callback_data"]: button["text"] for button in buttons}
 
     assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
-    assert "开盘0.6 + 尾盘0.7" == by_data[
-        "strategy:select:open_060_late_070"
-    ]
+    assert "strategy:select:open_060_late_070" not in by_data
     assert "智能评分（仅纸面）" == by_data["strategy:unavailable:smart_score"]
-    assert "BTC 5分钟反转 V1.1" == by_data[
+    assert "反转·2窗" == by_data[
         "strategy:select:reversal_v11"
+    ]
+    assert "反转·3窗" == by_data[
+        "strategy:select:reversal_v11_three_streak"
+    ]
+    assert "反转·4窗" == by_data[
+        "strategy:select:reversal_v11_four_streak"
+    ]
+    assert "盘口价差做市" == by_data[
+        "strategy:select:spread_market_maker"
     ]
     assert "strategy:select:late_070" not in by_data
     assert "strategy:select:late_one_way" not in by_data
     assert "strategy:select:open_060" not in by_data
     assert "↩️ 恢复启动策略" == by_data[f"strategy:select:{DEFAULT_STRATEGY}"]
-    assert len(buttons) == 6
+    assert len(buttons) == 8
 
 
 def test_paper_strategy_menu_allows_smart_score() -> None:
@@ -162,7 +170,13 @@ def test_paper_strategy_menu_allows_smart_score() -> None:
     by_data = {button["callback_data"]: button["text"] for button in buttons}
 
     assert by_data["strategy:select:smart_score"] == "智能评分"
-    assert by_data["strategy:select:reversal_v11"] == "BTC 5分钟反转 V1.1"
+    assert by_data["strategy:select:reversal_v11"] == "反转·2窗"
+    assert by_data["strategy:select:reversal_v11_three_streak"] == (
+        "反转·3窗"
+    )
+    assert by_data["strategy:select:reversal_v11_four_streak"] == (
+        "反转·4窗"
+    )
 
 
 def test_poller_parses_strategy_callback_from_authorized_chat() -> None:
@@ -176,3 +190,21 @@ def test_poller_parses_strategy_callback_from_authorized_chat() -> None:
     assert commands[0].command == "/strategy_select"
     assert commands[0].argument == "reversal_v11"
     assert commands[0].callback_query_id == "callback-40"
+
+
+def test_poller_parses_manual_trade_callbacks() -> None:
+    notifier = FakeNotifier(
+        [
+            telegram_callback(50, 42, "manual:select:current_buy_up"),
+            telegram_callback(51, 42, "manual:confirm:next_buy_down"),
+        ]
+    )
+    poller = TelegramCommandPoller(notifier, "42", 50, Event())
+
+    poller.poll_once()
+    commands = poller.drain()
+
+    assert [(item.command, item.argument) for item in commands] == [
+        ("/manual_select", "current_buy_up"),
+        ("/manual_confirm", "next_buy_down"),
+    ]

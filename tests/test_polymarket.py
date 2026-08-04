@@ -1,5 +1,7 @@
 from decimal import Decimal
+from datetime import datetime, timedelta, timezone
 import json
+import math
 import time
 
 import pytest
@@ -35,6 +37,7 @@ from src.strategy import build_buy_intent
 from src.watch_updown import (
     SignalConfirmationState,
     account_new_paper_settlements,
+    accept_open_price,
     advance_signal_confirmation,
     adverse_jump_exceeds_dynamic_threshold,
     buy_limit_price_with_slippage,
@@ -43,6 +46,8 @@ from src.watch_updown import (
     effective_pullback_tolerance,
     evaluate_protective_hedge_risk,
     executable_ask_depth,
+    fetch_reversal_completed_window_prices,
+    fetch_reversal_chainlink_open_prices,
     choose_fair_value_edge_signal,
     choose_open_060_signal,
     choose_smart_score_signal,
@@ -53,7 +58,9 @@ from src.watch_updown import (
     live_order_limit_reached,
     live_response_is_matched,
     live_session_should_continue,
+    is_http_rate_limit,
     window_trade_count_after_attempt,
+    window_priority_initialization_complete,
     open_paper_position,
     price_alignment_status,
     polling_interval_for_seconds_left,
@@ -64,6 +71,8 @@ from src.watch_updown import (
     quotes_pass_sanity_checks,
     response_fill_amounts,
     recent_spot_samples_support_side,
+    rolling_realized_volatility,
+    reversal_notifications_may_run,
     required_fair_value_edge,
     settle_all_paper_positions,
     settle_paper_positions,
@@ -74,6 +83,14 @@ from src.watch_updown import (
     slug_from_value,
     parse_args as parse_watch_args,
 )
+
+
+def test_http_rate_limit_detection_requires_429_response() -> None:
+    response = type("Response", (), {"status_code": 429})()
+    error = HTTPError("too many requests", response=response)
+
+    assert is_http_rate_limit(error)
+    assert not is_http_rate_limit(RuntimeError("network failure"))
 
 
 def make_market(
@@ -97,6 +114,297 @@ def make_market(
         None,
         None,
     )
+
+
+def test_fetch_reversal_chainlink_boundaries_seeds_two_previous_windows() -> None:
+    class FakePriceClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def fetch(self, start_time, end_time):
+            self.calls.append((start_time, end_time))
+            return type(
+                "PriceToBeat",
+                (),
+                {"open_price": Decimal(str(int(start_time.timestamp())))},
+            )()
+
+    start = datetime.fromtimestamp(700, timezone.utc)
+    market = Market(
+        "BTC Up or Down",
+        "btc-updown-5m-700",
+        "0xcondition",
+        ("101", "202"),
+        "0.01",
+        False,
+        Decimal("100"),
+        ("Up", "Down"),
+        start,
+        start + timedelta(seconds=300),
+    )
+    client = FakePriceClient()
+
+    prices = fetch_reversal_chainlink_open_prices(
+        client,
+        market,
+        Decimal("700"),
+        {"btc-updown-5m-100": Decimal("100")},
+    )
+
+    assert prices == {
+        "btc-updown-5m-100": Decimal("100"),
+        "btc-updown-5m-400": Decimal("400"),
+        "btc-updown-5m-700": Decimal("700"),
+    }
+    assert client.calls == [
+        (start - timedelta(seconds=300), start),
+    ]
+
+
+def test_fetch_reversal_chainlink_boundaries_supports_four_window_trigger() -> None:
+    class FakePriceClient:
+        def fetch(self, start_time, end_time):
+            return type(
+                "PriceToBeat",
+                (),
+                {"open_price": Decimal(str(int(start_time.timestamp())))},
+            )()
+
+    start = datetime.fromtimestamp(1300, timezone.utc)
+    market = Market(
+        "BTC Up or Down",
+        "btc-updown-5m-1300",
+        "0xcondition",
+        ("101", "202"),
+        "0.01",
+        False,
+        Decimal("100"),
+        ("Up", "Down"),
+        start,
+        start + timedelta(seconds=300),
+    )
+
+    prices = fetch_reversal_chainlink_open_prices(
+        FakePriceClient(), market, Decimal("1300"), lookback_windows=4
+    )
+
+    assert list(prices) == [
+        "btc-updown-5m-100",
+        "btc-updown-5m-400",
+        "btc-updown-5m-700",
+        "btc-updown-5m-1000",
+        "btc-updown-5m-1300",
+    ]
+
+
+def test_fetch_reversal_completed_prices_only_returns_final_missing_windows() -> None:
+    class FakePriceClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def fetch(self, start_time, end_time):
+            self.calls.append((start_time, end_time))
+            return type(
+                "PriceToBeat",
+                (),
+                {
+                    "open_price": Decimal("101"),
+                    "close_price": Decimal("99"),
+                    "completed": True,
+                    "incomplete": False,
+                },
+            )()
+
+    start = datetime.fromtimestamp(700, timezone.utc)
+    market = Market(
+        "BTC Up or Down",
+        "btc-updown-5m-700",
+        "0xcondition",
+        ("101", "202"),
+        "0.01",
+        False,
+        Decimal("100"),
+        ("Up", "Down"),
+        start,
+        start + timedelta(seconds=300),
+    )
+    client = FakePriceClient()
+
+    prices = fetch_reversal_completed_window_prices(
+        client,
+        market,
+        "btc-updown-5m-100",
+    )
+
+    assert prices == {"btc-updown-5m-400": (Decimal("101"), Decimal("99"))}
+    assert client.calls == [
+        (datetime.fromtimestamp(400, timezone.utc), datetime.fromtimestamp(700, timezone.utc))
+    ]
+
+
+def test_fetch_reversal_completed_prices_supports_four_window_trigger() -> None:
+    class FakePriceClient:
+        def fetch(self, start_time, end_time):
+            return type(
+                "PriceToBeat",
+                (),
+                {
+                    "open_price": Decimal("101"),
+                    "close_price": Decimal("102"),
+                    "completed": True,
+                    "incomplete": False,
+                },
+            )()
+
+    start = datetime.fromtimestamp(1300, timezone.utc)
+    market = Market(
+        "BTC Up or Down",
+        "btc-updown-5m-1300",
+        "0xcondition",
+        ("101", "202"),
+        "0.01",
+        False,
+        Decimal("100"),
+        ("Up", "Down"),
+        start,
+        start + timedelta(seconds=300),
+    )
+
+    prices = fetch_reversal_completed_window_prices(
+        FakePriceClient(), market, None, lookback_windows=4
+    )
+
+    assert list(prices) == [
+        "btc-updown-5m-100",
+        "btc-updown-5m-400",
+        "btc-updown-5m-700",
+        "btc-updown-5m-1000",
+    ]
+
+
+def test_reversal_accepts_first_valid_price_to_beat_without_stability_wait() -> None:
+    from src.price_alignment import StableOpenPriceTracker
+
+    tracker = StableOpenPriceTracker(
+        required_confirmations=2,
+        minimum_stable_seconds=5.0,
+    )
+
+    accepted = accept_open_price(
+        "reversal_v11",
+        tracker,
+        Decimal("63749.33434881677"),
+        100.0,
+    )
+
+    assert accepted == Decimal("63749.33434881677")
+    assert tracker.confirmations == 0
+
+def test_other_strategies_keep_stable_price_to_beat_confirmation() -> None:
+    from src.price_alignment import StableOpenPriceTracker
+
+    tracker = StableOpenPriceTracker(
+        required_confirmations=2,
+        minimum_stable_seconds=5.0,
+    )
+
+    assert (
+        accept_open_price(
+            "fair_value_edge",
+            tracker,
+            Decimal("63749.33434881677"),
+            100.0,
+        )
+        is None
+    )
+
+
+def test_slow_maintenance_waits_until_window_and_reversal_boundary_are_ready() -> None:
+    now = datetime(2026, 7, 29, 0, 0, 10, tzinfo=timezone.utc)
+    market = Market(
+        "BTC Up or Down",
+        "btc-updown-5m-1000",
+        "0xcondition",
+        ("101", "202"),
+        "0.01",
+        False,
+        Decimal("100"),
+        ("Up", "Down"),
+        now - timedelta(seconds=10),
+        now + timedelta(seconds=290),
+    )
+
+    assert not window_priority_initialization_complete(
+        market, now, None, "reversal_v11", None
+    )
+    assert not window_priority_initialization_complete(
+        market, now, Decimal("100"), "reversal_v11", None
+    )
+    assert window_priority_initialization_complete(
+        market,
+        now,
+        Decimal("100"),
+        "reversal_v11",
+        market.slug,
+    )
+    assert window_priority_initialization_complete(
+        market, now, Decimal("100"), "fair_value_edge", None
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "entry_unmatched",
+        "entry_amount_rejected",
+        "entry_partial",
+        "entry_book_pending",
+        "entry_balance_insufficient",
+        "exit_unmatched",
+        "exit_partial",
+        "exit_book_pending",
+        "exit_balance_pending",
+        "waiting_chainlink_boundary_no_split",
+    ],
+)
+def test_reversal_notifications_wait_while_order_work_is_pending(status: str) -> None:
+    assert not reversal_notifications_may_run(status)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "entry_complete",
+        "entry_reconciled",
+        "exit_complete",
+        "awaiting_settlement",
+        "no_trigger_no_split",
+        "opening_already_processed",
+    ],
+)
+def test_reversal_notifications_run_only_after_order_path_is_complete(status: str) -> None:
+    assert reversal_notifications_may_run(status)
+
+
+def test_rolling_realized_volatility_uses_cross_window_timestamped_samples() -> None:
+    samples = [
+        (940.0, Decimal("100")),
+        (970.0, Decimal("101")),
+        (1000.0, Decimal("100")),
+    ]
+
+    result = rolling_realized_volatility(samples, observed_at=1000.0)
+
+    assert result is not None
+    expected = Decimal(
+        str(
+            math.sqrt(
+                math.log(1.01) ** 2
+                + math.log(Decimal("100") / Decimal("101")) ** 2
+            )
+        )
+    )
+    assert abs(result - expected) < Decimal("0.000000000001")
 
 
 def test_parse_token_ids_accepts_json_string() -> None:
@@ -368,6 +676,29 @@ def test_polymarket_chainlink_stream_rejects_stale_cached_price() -> None:
         raise AssertionError("Expected stale Chainlink data to be rejected")
 
 
+def test_spot_client_rebuilds_chainlink_stream_after_three_failures() -> None:
+    class FailingStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def btc_usd(self) -> SpotPrice:
+            raise RuntimeError("stream unavailable")
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = FailingStream()
+    client = SpotPriceClient("POLYMARKET_CHAINLINK")
+    client._polymarket_stream = stream
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="stream unavailable"):
+            client.btc_usd()
+
+    assert stream.closed
+    assert client._polymarket_stream is None
+
+
 def test_paper_position_fee_is_deducted_from_bankroll_and_profit(monkeypatch) -> None:
     positions = []
     signal = AutoTradeSignal(side="UP", token_id="up", price=Decimal("0.75"), reason="late")
@@ -548,6 +879,46 @@ def test_live_fak_order_uses_v2_order_type(monkeypatch) -> None:
 
     assert response["takingAmount"] == "2.5"
     assert calls[-1][2] == "FAK"
+
+
+def test_live_post_only_order_uses_v2_flag(monkeypatch) -> None:
+    calls = []
+
+    class OrderArgs:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class OrderType:
+        GTC = "GTC"
+
+    class Options:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class Client:
+        def create_and_post_order(self, order_args, options=None, order_type=None, post_only=False):
+            calls.append((order_args.kwargs, order_type, post_only))
+            return {"success": True, "status": "live", "orderID": "maker-1"}
+
+    monkeypatch.setattr(
+        "src.polymarket._import_order_types",
+        lambda: (OrderArgs, OrderType, Options, "BUY"),
+    )
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+    trader._client_v2 = True
+
+    response = trader.buy_limit(
+        token_id="up",
+        price=Decimal("0.45"),
+        size=Decimal("5"),
+        tick_size="0.01",
+        neg_risk=False,
+        post_only=True,
+    )
+
+    assert response["orderID"] == "maker-1"
+    assert calls == [({"token_id": "up", "price": 0.45, "size": 5.0, "side": "BUY"}, "GTC", True)]
 
 
 def test_live_v2_order_blocks_post_when_final_quote_expires(monkeypatch) -> None:
@@ -1948,12 +2319,10 @@ def test_fair_value_reserves_one_extra_protection_slot() -> None:
     assert strategy_trade_limit("late_070", 5) == 6
     assert strategy_trade_limit("smart_score", 5) == 1
     assert strategy_trade_limit("open_060", 5) == 1
-    assert strategy_trade_limit("open_060_late_070", 5) == 1
 
 
 def test_late_070_uses_first_primary_confirmation_only() -> None:
     assert primary_signal_confirmation_count("late_070", 2) == 1
-    assert primary_signal_confirmation_count("open_060_late_070", 2) == 1
     assert primary_signal_confirmation_count("fair_value_edge", 2) == 2
 
 

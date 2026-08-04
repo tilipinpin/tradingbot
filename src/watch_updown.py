@@ -9,7 +9,8 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
@@ -22,6 +23,7 @@ from requests import RequestException
 from src import __version__
 from src.fair_value import btc_up_probability, choose_theoretical_action, estimate_sigma_per_sqrt_second
 from src.market_recorder import JsonlSnapshotWriter, build_snapshot
+from src.manual_trading import ManualTradeExecutor
 from src.polymarket import (
     ClobDataClient,
     ClobTradingClient,
@@ -35,17 +37,29 @@ from src.price_alignment import PolymarketPriceToBeatClient, StableOpenPriceTrac
 from src.price_signal import SpotPriceClient
 from src.polygon_split import splitter_from_config
 from src.reversal_runtime import (
+    GammaResultMismatch,
     ReversalRuntime,
     market_health_from_books,
+    previous_5m_slug,
     reversal_startup_self_check,
 )
 from src.reversal_v11 import Direction, ReversalV11
-from src.telegram_commands import DEFAULT_LAUNCH_STRATEGY, LIVE_STRATEGIES, STRATEGY_LABELS
+from src.spread_maker_runtime import SpreadMakerRuntime
+from src.spread_market_maker import BookSide, OutcomeSide, SpreadMarketMaker, SpreadSnapshot
+from src.telegram_commands import (
+    DEFAULT_LAUNCH_STRATEGY,
+    LIVE_STRATEGIES,
+    REVERSAL_STRATEGIES,
+    REVERSAL_TRIGGER_STREAKS,
+    STRATEGY_LABELS,
+)
 from src.telegram_notify import TradingNotificationService
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("btc-updown-watch")
+
+REVERSAL_COMPLETED_FAST_ATTEMPTS = 1
 
 
 SLUG_PATTERN = re.compile(r"^(btc-updown-5m-)(\d+)$")
@@ -325,6 +339,27 @@ def parse_args() -> argparse.Namespace:
         default="data/reversal_v11_state.json",
         help="Crash-safe persistent state for reversal_v11.",
     )
+    parser.add_argument(
+        "--reversal-first-stage-max-rv60",
+        default=None,
+        help=(
+            "When set, block only a new reversal round's first stage when BTC "
+            "60-second realized volatility is at or above this decimal threshold."
+        ),
+    )
+    parser.add_argument(
+        "--reversal-first-stage-max-rv300",
+        default=None,
+        help=(
+            "When set, block only a new reversal round's first stage when BTC "
+            "five-minute realized volatility is at or above this decimal threshold."
+        ),
+    )
+    parser.add_argument(
+        "--spread-maker-state-json",
+        default="data/spread_market_maker_state.json",
+        help="Crash-safe persistent state for spread_market_maker.",
+    )
     parser.add_argument("--late-entry-start-seconds", type=int, default=55)
     parser.add_argument("--late-entry-cutoff-seconds", type=int, default=8)
     parser.add_argument("--late-min-entry", default="0.65")
@@ -410,6 +445,76 @@ def fetch_winner(slug: str) -> str | None:
     if Decimal(str(prices[1])) == Decimal("1"):
         return "DOWN"
     return None
+
+
+def fetch_reversal_chainlink_open_prices(
+    client: PolymarketPriceToBeatClient,
+    market: Market,
+    current_open_price: Decimal,
+    known_prices: dict[str, Decimal] | None = None,
+    lookback_windows: int = 2,
+) -> dict[str, Decimal]:
+    """Load consecutive Price-to-Beat boundaries for the configured result streak."""
+    known = known_prices or {}
+    prices: dict[str, Decimal] = {}
+    for offset in range(lookback_windows, 0, -1):
+        slug = previous_5m_slug(market.slug, offset)
+        if slug in known:
+            prices[slug] = known[slug]
+            continue
+        start_time = market.event_start_time - timedelta(seconds=300 * offset)
+        prices[slug] = client.fetch(
+            start_time,
+            start_time + timedelta(seconds=300),
+        ).open_price
+    prices[market.slug] = current_open_price
+    return prices
+
+
+def fetch_reversal_completed_window_prices(
+    client: PolymarketPriceToBeatClient,
+    market: Market,
+    last_settled_slug: str | None,
+    lookback_windows: int = 2,
+) -> dict[str, tuple[Decimal, Decimal]]:
+    """Fetch only missing predecessor windows with finalized open/close prices."""
+    last_settled_epoch = (
+        int(last_settled_slug.rpartition("-")[2]) if last_settled_slug else None
+    )
+    completed: dict[str, tuple[Decimal, Decimal]] = {}
+    for offset in range(lookback_windows, 0, -1):
+        slug = previous_5m_slug(market.slug, offset)
+        epoch = int(slug.rpartition("-")[2])
+        if last_settled_epoch is not None and epoch <= last_settled_epoch:
+            continue
+        start_time = market.event_start_time - timedelta(seconds=300 * offset)
+        result = client.fetch(start_time, start_time + timedelta(seconds=300))
+        if not result.completed or result.incomplete or result.close_price is None:
+            raise RuntimeError(
+                f"completed price pending for {slug}: completed={result.completed} "
+                f"incomplete={result.incomplete} close={result.close_price}"
+            )
+        completed[slug] = (result.open_price, result.close_price)
+    return completed
+
+
+def is_http_rate_limit(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 429
+
+
+def accept_open_price(
+    strategy: str,
+    tracker: StableOpenPriceTracker,
+    price: Decimal,
+    observed_at: float,
+) -> Decimal | None:
+    """Use the first valid Price to Beat for the latency-sensitive reversal path."""
+    if price <= 0:
+        return None
+    if strategy in REVERSAL_STRATEGIES:
+        return price
+    return tracker.observe(price, observed_at)
 
 
 def quote_outcomes(clob: ClobDataClient, market: Market) -> tuple[OrderBookQuote | None, OrderBookQuote | None]:
@@ -662,7 +767,7 @@ def late_spot_safety_metrics(
 def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
     if strategy == "late_one_way":
         return min(2, configured_limit)
-    if strategy in {"smart_score", "open_060", "open_060_late_070"}:
+    if strategy in {"smart_score", "open_060"}:
         return min(1, configured_limit)
     if is_fair_value_strategy(strategy):
         # --max-trades remains the primary-entry allowance. Aggregate protection
@@ -672,12 +777,12 @@ def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
 
 
 def is_fair_value_strategy(strategy: str) -> bool:
-    return strategy in {"fair_value_edge", "late_070", "open_060_late_070"}
+    return strategy in {"fair_value_edge", "late_070"}
 
 
 def primary_signal_confirmation_count(strategy: str, configured_count: int) -> int:
     """Return the confirmation count for non-protective primary signals."""
-    if strategy in {"late_070", "open_060_late_070"}:
+    if strategy == "late_070":
         return 1
     return configured_count
 
@@ -1837,6 +1942,69 @@ def _seconds_to_end(market: Market, now: datetime) -> Decimal:
     return Decimal(str((market.end_time - now).total_seconds()))
 
 
+def window_priority_initialization_complete(
+    market: Market | None,
+    now: datetime,
+    start_price: Decimal | None,
+    strategy: str,
+    reversal_boundary_seeded_slug: str | None,
+) -> bool:
+    """Allow slow maintenance only after the current window decision path is ready."""
+    if market is None or _seconds_to_start(market, now) > 0 or _seconds_to_end(market, now) <= 0:
+        return False
+    if start_price is None:
+        return False
+    if strategy in REVERSAL_STRATEGIES and reversal_boundary_seeded_slug != market.slug:
+        return False
+    return True
+
+
+def rolling_realized_volatility(
+    samples: list[tuple[float, Decimal]],
+    *,
+    observed_at: float,
+    lookback_seconds: float = 60.0,
+) -> Decimal | None:
+    """Return unannualized realized volatility from timestamped BTC samples."""
+    recent = [
+        price
+        for timestamp, price in samples
+        if observed_at - lookback_seconds <= timestamp <= observed_at and price > 0
+    ]
+    if len(recent) < 3:
+        return None
+    squared_log_returns = [
+        math.log(float(current / previous)) ** 2
+        for previous, current in zip(recent, recent[1:])
+    ]
+    return Decimal(str(math.sqrt(sum(squared_log_returns))))
+
+
+REVERSAL_NOTIFICATION_SAFE_STATUSES = frozenset(
+    {
+        "entry_complete",
+        "entry_reconciled",
+        "exit_complete",
+        "exit_reconciled",
+        "awaiting_settlement",
+        "no_trigger_no_split",
+        "opening_already_processed",
+        "trigger_filtered_no_split",
+        "first_stage_extreme_volatility_no_split",
+        "unused_split_merged",
+        "paper_complete",
+        "dynamic_recovery_skipped",
+        "profit_target_unfunded",
+        "paper_unused_split_merged",
+    }
+)
+
+
+def reversal_notifications_may_run(status: str | None) -> bool:
+    """Keep slow notification I/O off every order submission and retry path."""
+    return status in REVERSAL_NOTIFICATION_SAFE_STATUSES
+
+
 def polling_interval_for_seconds_left(
     seconds_to_end: Decimal,
     normal_interval: float,
@@ -1888,6 +2056,9 @@ def watch() -> None:
     last_spot_fetched_at: float | None = None
     prices: list[Decimal] = []
     price_sample_times: list[float] = []
+    btc_volatility_samples: deque[tuple[float, Decimal]] = deque()
+    reversal_entry_rv60: Decimal | None = None
+    reversal_entry_rv300: Decimal | None = None
     up_ask_prices: list[Decimal] = []
     down_ask_prices: list[Decimal] = []
     open_060_previous_up_ask = Decimal("0.50")
@@ -1992,7 +2163,13 @@ def watch() -> None:
     live_orders_submitted = 0
     live_orders_matched = 0
     reversal_runtime: ReversalRuntime | None = None
+    spread_runtime: SpreadMakerRuntime | None = None
+    manual_executor: ManualTradeExecutor | None = None
+    reversal_boundary_seeded_slug: str | None = None
+    reversal_completed_attempts = 0
+    reversal_pause_slug: str | None = None
     reversal_daily_restart_pending = False
+    maintenance_deferred_slug: str | None = None
     live_summary = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
@@ -2256,9 +2433,29 @@ def watch() -> None:
             raise ValueError("late_favorite confirmations must be positive and pause must not be negative")
         trader = build_live_trader(args)
         notifications.trader = trader
-        if args.live_trading or args.strategy == "reversal_v11":
+        if args.live_trading or args.strategy in REVERSAL_STRATEGIES:
             reversal_state_path = Path(args.reversal_state_json)
             reversal_strategy = ReversalV11.load(reversal_state_path)
+            reversal_setting_overrides: dict[str, object] = {}
+            reversal_setting_overrides["trigger_streak"] = REVERSAL_TRIGGER_STREAKS.get(
+                args.strategy, 2
+            )
+            if args.reversal_first_stage_max_rv60 is not None:
+                reversal_setting_overrides.update(
+                    first_stage_rv60_filter_enabled=True,
+                    first_stage_max_rv60=Decimal(args.reversal_first_stage_max_rv60),
+                )
+            if args.reversal_first_stage_max_rv300 is not None:
+                reversal_setting_overrides.update(
+                    first_stage_rv300_filter_enabled=True,
+                    first_stage_max_rv300=Decimal(args.reversal_first_stage_max_rv300),
+                )
+            if reversal_setting_overrides:
+                reversal_strategy.settings = replace(
+                    reversal_strategy.settings,
+                    **reversal_setting_overrides,
+                )
+            reversal_strategy.dump(reversal_state_path)
             active_reversal = reversal_strategy.state.active_round
             prepared_reversal = reversal_strategy.state.prepared_split
             if (
@@ -2270,9 +2467,9 @@ def watch() -> None:
                             active_reversal.execution_phase
                             in {"split_submitting", "split_uncertain"}
                             or (
-                                active_reversal.awaiting_window != current_market.slug
+                                active_reversal.awaiting_window != slug
                                 and active_reversal.execution_phase
-                                != "trend_exit_complete"
+                                not in {"trend_exit_complete", "direct_entry_complete"}
                             )
                         )
                     )
@@ -2304,12 +2501,31 @@ def watch() -> None:
                 ):
                     required_reversal_collateral = Decimal("0")
                 elif active_reversal is None:
-                    required_reversal_collateral = Decimal("30")
+                    # Later recovery stages are sized from live fills and asks, so a
+                    # fixed whole-round capital threshold cannot prove affordability.
+                    # At startup, require enough collateral for the next executable
+                    # stage; each later order remains constrained by actual balance.
+                    required_reversal_collateral = reversal_strategy.settings.stakes[0]
+                elif (
+                    active_reversal.awaiting_window is not None
+                    and active_reversal.awaiting_window != slug
+                    and active_reversal.execution_phase
+                    in {"trend_exit_complete", "direct_entry_complete"}
+                    and active_reversal.failures + 1
+                    < len(reversal_strategy.settings.stakes)
+                ):
+                    required_reversal_collateral = reversal_strategy.settings.stakes[
+                        active_reversal.failures + 1
+                    ]
                 elif active_reversal.awaiting_window is not None and active_reversal.execution_phase in {
                     "split_confirmed",
                     "trend_exit_partial",
                     "trend_exit_submitting",
                     "trend_exit_complete",
+                    "direct_entry_ready",
+                    "direct_entry_partial",
+                    "direct_entry_submitting",
+                    "direct_entry_complete",
                 }:
                     required_reversal_collateral = Decimal("0")
                 else:
@@ -2322,6 +2538,8 @@ def watch() -> None:
                     trader=trader,
                     signature_type=args.signature_type,
                     required_collateral=required_reversal_collateral,
+                    execution_mode="direct_buy",
+                    wallet=os.getenv(args.funder_address_env) or "CLOB funder",
                 )
                 live_summary["reversal_startup_self_check"] = {
                     "wallet": startup_report.wallet,
@@ -2331,6 +2549,21 @@ def watch() -> None:
                     "down_balance": str(startup_report.down_balance),
                     "relayer_deployed": startup_report.relayer_deployed,
                 }
+                startup_spot = price_client.btc_usd()
+                if startup_spot.observed_at is None:
+                    raise ValueError("Chainlink startup self-check returned no timestamp")
+                startup_spot_age = abs(int(time.time()) - startup_spot.observed_at)
+                if startup_spot_age > args.max_spot_age:
+                    raise ValueError(
+                        f"Chainlink startup self-check price is stale by {startup_spot_age}s"
+                    )
+                live_summary["reversal_startup_self_check"].update(
+                    {
+                        "spot_source": startup_spot.source,
+                        "spot_price": str(startup_spot.price),
+                        "spot_age_seconds": startup_spot_age,
+                    }
+                )
             reversal_runtime = ReversalRuntime(
                 strategy=reversal_strategy,
                 state_path=reversal_state_path,
@@ -2339,8 +2572,39 @@ def watch() -> None:
                 trader=trader,
                 signature_type=args.signature_type,
                 live=args.live_trading,
+                execution_mode="direct_buy",
                 order_callback=notifications.record_reversal_exit,
             )
+        if args.live_trading:
+            assert trader is not None
+            startup_market = load_updown_market(gamma, slug)
+            if startup_market is None:
+                raise ValueError("spread_market_maker startup could not load the current market")
+            spread_runtime = SpreadMakerRuntime(
+                strategy=SpreadMarketMaker(),
+                trader=trader,
+                state_path=Path(args.spread_maker_state_json),
+                signature_type=args.signature_type,
+                live=True,
+            )
+            if args.strategy == "spread_market_maker":
+                live_summary["spread_startup_self_check"] = spread_runtime.startup_self_check(
+                    startup_market
+                )
+            manual_trader = build_live_trader(args)
+            manual_executor = ManualTradeExecutor(
+                trader=manual_trader,
+                signature_type=args.signature_type,
+                market_loader=gamma.market_by_slug,
+                book_loader=clob.books,
+                on_submitting=notifications.mark_manual_submitting,
+                on_result=notifications.record_manual_result,
+                buy_slippage=live_buy_slippage,
+                sell_slippage=live_buy_slippage,
+            )
+            manual_executor.start()
+            notifications.attach_manual_executor(manual_executor.submit)
+            atexit.register(manual_executor.stop)
     except Exception as exc:
         live_summary["error"] = f"{type(exc).__name__}: {exc}"
         notifications.notify_exception("启动检查或钱包签名", exc, key="startup", cooldown=0)
@@ -2361,12 +2625,41 @@ def watch() -> None:
     else:
         logger.info("DRY RUN mode. No orders will be submitted.")
 
+    def run_slow_notification_maintenance(maintenance_slug: str) -> None:
+        nonlocal maintenance_deferred_slug, reversal_daily_restart_pending
+
+        if maintenance_deferred_slug is not None:
+            logger.info(
+                "WINDOW_PRIORITY_READY slug=%s; running deferred settlements and reports",
+                maintenance_slug,
+            )
+            maintenance_deferred_slug = None
+        try:
+            notifications.maybe_delete_expired_discord_messages()
+            notifications.maybe_send_settlements(fetch_winner)
+            notifications.maybe_send_daily(fetch_winner)
+            if reversal_runtime is not None and args.strategy in REVERSAL_STRATEGIES:
+                report_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+                if reversal_runtime.send_daily_report_once(
+                    report_day,
+                    notifications.send_strategy_report,
+                ):
+                    reversal_daily_restart_pending = True
+        except Exception as exc:
+            # Notification maintenance must never alter the trading state or
+            # interrupt the next order attempt.
+            logger.warning(
+                "NOTIFICATION_MAINTENANCE_FAILED slug=%s error=%s",
+                maintenance_slug,
+                exc,
+                exc_info=True,
+            )
+
     while time.time() < stop_at:
         iteration_started_at = time.monotonic()
         poll_interval = float(args.interval)
         now = datetime.now(timezone.utc)
         notifications.update_runtime()
-        notifications.maybe_delete_expired_discord_messages()
         if notifications.process_commands():
             live_summary["status"] = "restarting"
             write_live_summary()
@@ -2375,15 +2668,22 @@ def watch() -> None:
                 sys.executable,
                 [sys.executable, "-m", "src.watch_updown", *sys.argv[1:]],
             )
-        notifications.maybe_send_settlements(fetch_winner)
-        notifications.maybe_send_daily(fetch_winner)
-        if reversal_runtime is not None and args.strategy == "reversal_v11":
-            report_day = datetime.now(timezone.utc).date() - timedelta(days=1)
-            if reversal_runtime.send_daily_report_once(
-                report_day,
-                notifications.send_strategy_report,
-            ):
-                reversal_daily_restart_pending = True
+        maintenance_ready = window_priority_initialization_complete(
+            current_market,
+            now,
+            start_price,
+            args.strategy,
+            reversal_boundary_seeded_slug,
+        )
+        maintenance_slug = current_market.slug if current_market is not None else slug
+        if maintenance_ready and args.strategy not in REVERSAL_STRATEGIES:
+            run_slow_notification_maintenance(maintenance_slug)
+        elif maintenance_deferred_slug != maintenance_slug:
+            maintenance_deferred_slug = maintenance_slug
+            logger.info(
+                "WINDOW_PRIORITY_DEFERRED slug=%s; settlements and reports wait for the order path",
+                maintenance_slug,
+            )
         if args.paper_trading:
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
             if args.strategy == "late_favorite":
@@ -2409,10 +2709,30 @@ def watch() -> None:
 
         if current_market is None or _seconds_to_end(current_market, now) <= 0:
             if current_market is not None:
+                reversal_entry_rv60 = rolling_realized_volatility(
+                    list(btc_volatility_samples),
+                    observed_at=time.time(),
+                )
+                reversal_entry_rv300 = rolling_realized_volatility(
+                    list(btc_volatility_samples),
+                    observed_at=time.time(),
+                    lookback_seconds=300.0,
+                )
+                logger.info(
+                    "REVERSAL_VOLATILITY_PRECOMPUTED completed_slug=%s "
+                    "rv60=%s rv60_threshold=%s rv300=%s rv300_threshold=%s",
+                    current_market.slug,
+                    reversal_entry_rv60,
+                    args.reversal_first_stage_max_rv60,
+                    reversal_entry_rv300,
+                    args.reversal_first_stage_max_rv300,
+                )
                 slug = next_5m_slug(current_market.slug)
                 logger.info("Window ended. Looking for next slug: %s", slug)
             current_market = load_updown_market(gamma, slug)
             start_price = None
+            reversal_boundary_seeded_slug = None
+            reversal_completed_attempts = 0
             open_price_tracker.reset()
             prices = []
             price_sample_times = []
@@ -2451,13 +2771,18 @@ def watch() -> None:
                     pause_windows_remaining,
                 )
             reversal_round_active = False
-            if reversal_runtime is not None and args.strategy == "reversal_v11":
+            if reversal_runtime is not None and args.strategy in REVERSAL_STRATEGIES:
                 reversal_round_active = (
                     reversal_runtime.strategy.state.active_round is not None
                 )
+            spread_inventory_active = (
+                spread_runtime is not None
+                and args.strategy == "spread_market_maker"
+                and not spread_runtime.flat()
+            )
             activated_strategy = (
                 None
-                if reversal_round_active
+                if reversal_round_active or spread_inventory_active
                 else notifications.activate_pending_strategy(current_market.slug)
             )
             if reversal_round_active and notifications.pending_strategy is not None:
@@ -2466,9 +2791,41 @@ def watch() -> None:
                     reversal_runtime.strategy.state.active_round.round_id,
                     notifications.pending_strategy,
                 )
+            if spread_inventory_active and notifications.pending_strategy is not None:
+                logger.info(
+                    "SPREAD_SWITCH_DEFERRED pending=%s; maker orders/inventory remain",
+                    notifications.pending_strategy,
+                )
             if activated_strategy is not None:
                 args.strategy = activated_strategy
                 live_summary["strategy"] = activated_strategy
+                if (
+                    reversal_runtime is not None
+                    and activated_strategy in REVERSAL_STRATEGIES
+                ):
+                    activated_settings = ReversalV11().settings
+                    activated_setting_overrides: dict[str, object] = {}
+                    activated_setting_overrides["trigger_streak"] = (
+                        REVERSAL_TRIGGER_STREAKS.get(activated_strategy, 2)
+                    )
+                    if args.reversal_first_stage_max_rv60 is not None:
+                        activated_setting_overrides.update(
+                            first_stage_rv60_filter_enabled=True,
+                            first_stage_max_rv60=Decimal(
+                                args.reversal_first_stage_max_rv60
+                            ),
+                        )
+                    if args.reversal_first_stage_max_rv300 is not None:
+                        activated_setting_overrides.update(
+                            first_stage_rv300_filter_enabled=True,
+                            first_stage_max_rv300=Decimal(
+                                args.reversal_first_stage_max_rv300
+                            ),
+                        )
+                    reversal_runtime.strategy.settings = replace(
+                        activated_settings,
+                        **activated_setting_overrides,
+                    )
             logger.info(
                 "Watching %s | start=%s end=%s liquidity=%s outcomes=%s",
                 current_market.slug,
@@ -2486,8 +2843,61 @@ def watch() -> None:
             args.final_poll_seconds,
             args.final_poll_interval,
         )
+        if args.strategy == "spread_market_maker":
+            poll_interval = min(poll_interval, 2.0)
+        if (
+            args.strategy in REVERSAL_STRATEGIES
+            and reversal_boundary_seeded_slug != current_market.slug
+            and reversal_completed_attempts < REVERSAL_COMPLETED_FAST_ATTEMPTS
+            and seconds_to_start <= 0
+        ):
+            poll_interval = min(poll_interval, 1.0)
         if primary_side_this_window is not None:
             poll_interval = min(poll_interval, args.post_fill_poll_interval)
+        if (
+            args.strategy in REVERSAL_STRATEGIES
+            and reversal_runtime is not None
+            and seconds_to_start <= 0
+            and reversal_boundary_seeded_slug != current_market.slug
+            and reversal_runtime.strategy.state.prepared_split is None
+            and reversal_runtime.execution_mode == "split_sell"
+            and not notifications.trading_paused
+            and reversal_pause_slug != current_market.slug
+        ):
+            try:
+                presplit_result = (
+                    reversal_runtime.prepare_active_round_opening_split(
+                        current_market
+                    )
+                )
+                if presplit_result is not None:
+                    logger.info(
+                        "REVERSAL_OPENING_PRESPLIT slug=%s status=%s detail=%s",
+                        current_market.slug,
+                        presplit_result.status,
+                        presplit_result.detail,
+                    )
+            except Exception as exc:
+                notifications.notify_exception(
+                    f"反转策略开盘预拆 {current_market.slug}",
+                    exc,
+                    key=f"reversal-presplit:{current_market.slug}",
+                    cooldown=0,
+                )
+                prepared_reversal = reversal_runtime.strategy.state.prepared_split
+                if (
+                    prepared_reversal is not None
+                    and prepared_reversal.execution_phase
+                    in {"split_submitting", "split_uncertain"}
+                ):
+                    reversal_pause_slug = current_market.slug
+                    logger.error(
+                        "REVERSAL_PRESPLIT_WINDOW_PAUSE_SET slug=%s; "
+                        "global trading remains enabled",
+                        current_market.slug,
+                    )
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
         try:
             spot = price_client.btc_usd()
             if spot.observed_at is not None:
@@ -2512,6 +2922,14 @@ def watch() -> None:
             spot=spot.price,
             spot_source=spot.source,
         )
+        volatility_observed_at = time.time()
+        if spot.source != "CACHE":
+            btc_volatility_samples.append((volatility_observed_at, spot.price))
+            while (
+                btc_volatility_samples
+                and volatility_observed_at - btc_volatility_samples[0][0] > 300
+            ):
+                btc_volatility_samples.popleft()
 
         if seconds_to_start > 0:
             logger.info(
@@ -2524,12 +2942,85 @@ def watch() -> None:
             continue
 
         if (
-            args.strategy == "open_060"
-            or (
-                args.strategy == "open_060_late_070"
-                and seconds_to_end >= open_060_cutoff_seconds
-            )
+            args.strategy in REVERSAL_STRATEGIES
+            and reversal_runtime is not None
+            and reversal_boundary_seeded_slug != current_market.slug
+            and not notifications.trading_paused
+            and reversal_completed_attempts < REVERSAL_COMPLETED_FAST_ATTEMPTS
         ):
+            reversal_completed_attempts += 1
+            try:
+                completed_prices = fetch_reversal_completed_window_prices(
+                    price_to_beat_client,
+                    current_market,
+                    reversal_runtime.strategy.state.last_settled_slug,
+                    reversal_runtime.strategy.settings.trigger_streak,
+                )
+                completed_outcomes = (
+                    reversal_runtime.observe_completed_window_prices(completed_prices)
+                )
+                latest_completed_slug = previous_5m_slug(current_market.slug)
+                if (
+                    reversal_runtime.strategy.state.last_settled_slug
+                    == latest_completed_slug
+                ):
+                    reversal_boundary_seeded_slug = current_market.slug
+                    logger.info(
+                        "REVERSAL_RESULT_READY slug=%s source=completed_open_close",
+                        latest_completed_slug,
+                    )
+                for result_slug, settlement_status in completed_outcomes:
+                    result = reversal_runtime.strategy.state.pending_gamma_results.get(
+                        result_slug
+                    )
+                    logger.info(
+                        "REVERSAL_COMPLETED_RESULT slug=%s result=%s status=%s "
+                        "source=completed_open_close",
+                        result_slug,
+                        result.value if result is not None else "already_settled",
+                        settlement_status,
+                    )
+            except GammaResultMismatch as exc:
+                reversal_runtime.quarantine_gamma_mismatch(exc)
+                reversal_pause_slug = current_market.slug
+                notifications.notify_exception(
+                    f"反转策略完成态冲突 {current_market.slug}",
+                    exc,
+                    key=f"reversal-completed-mismatch:{current_market.slug}",
+                    cooldown=0,
+                )
+                logger.error(
+                    "REVERSAL_COMPLETED_MISMATCH slug=%s result_slug=%s error=%s; "
+                    "current window paused",
+                    current_market.slug,
+                    exc.slug,
+                    exc,
+                )
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "REVERSAL_COMPLETED_PENDING slug=%s attempt=%s/%s error=%s; "
+                    "Price-to-Beat boundary fallback follows immediately",
+                    current_market.slug,
+                    reversal_completed_attempts,
+                    REVERSAL_COMPLETED_FAST_ATTEMPTS,
+                    exc,
+                )
+            if reversal_boundary_seeded_slug != current_market.slug:
+                if (
+                    reversal_completed_attempts
+                    >= REVERSAL_COMPLETED_FAST_ATTEMPTS
+                ):
+                    logger.warning(
+                        "REVERSAL_COMPLETED_FAST_PATH_EXHAUSTED slug=%s; "
+                        "switching to Price-to-Beat boundary fallback",
+                        current_market.slug,
+                    )
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+
+        if args.strategy == "open_060":
             if open_060_reference_spot is None:
                 open_060_reference_spot = spot.price
             up_quote, down_quote = quote_outcomes(clob, current_market)
@@ -2874,7 +3365,9 @@ def watch() -> None:
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
             else:
-                confirmed_open_price = open_price_tracker.observe(
+                confirmed_open_price = accept_open_price(
+                    args.strategy,
+                    open_price_tracker,
                     price_to_beat.price_to_beat,
                     time.monotonic(),
                 )
@@ -2979,6 +3472,60 @@ def watch() -> None:
             prices.append(spot.price)
             price_sample_times.append(time.monotonic())
 
+        if (
+            args.strategy in REVERSAL_STRATEGIES
+            and reversal_runtime is not None
+            and reversal_boundary_seeded_slug != current_market.slug
+        ):
+            if reversal_pause_slug == current_market.slug:
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            if notifications.trading_paused:
+                logger.warning(
+                    "REVERSAL_PAUSED slug=%s; Chainlink result processing and trading are paused",
+                    current_market.slug,
+                )
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            try:
+                chainlink_open_prices = fetch_reversal_chainlink_open_prices(
+                    price_to_beat_client,
+                    current_market,
+                    start_price,
+                    reversal_runtime.strategy.state.chainlink_open_prices,
+                    reversal_runtime.strategy.settings.trigger_streak,
+                )
+                boundary_outcomes = reversal_runtime.observe_chainlink_open_prices(
+                    chainlink_open_prices
+                )
+            except Exception as exc:
+                if not is_http_rate_limit(exc):
+                    notifications.notify_exception(
+                        f"反转策略 Chainlink 边界结果 {current_market.slug}",
+                        exc,
+                        key=f"reversal-boundary:{current_market.slug}",
+                    )
+                logger.warning(
+                    "REVERSAL_CHAINLINK_PENDING slug=%s rate_limited=%s error=%s; "
+                    "no split submitted and retry follows",
+                    current_market.slug,
+                    is_http_rate_limit(exc),
+                    exc,
+                )
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            reversal_boundary_seeded_slug = current_market.slug
+            for result_slug, settlement_status in boundary_outcomes:
+                result = reversal_runtime.strategy.state.pending_gamma_results.get(
+                    result_slug
+                )
+                logger.info(
+                    "REVERSAL_CHAINLINK_RESULT slug=%s result=%s status=%s source=official_open_boundary",
+                    result_slug,
+                    result.value if result is not None else "already_settled",
+                    settlement_status,
+                )
+
         sigma = estimate_sigma_per_sqrt_second(
             prices,
             Decimal(str(poll_interval)),
@@ -3024,7 +3571,95 @@ def watch() -> None:
             action,
         )
 
-        if args.strategy == "reversal_v11":
+        if args.strategy == "spread_market_maker":
+            if spread_runtime is None:
+                error = RuntimeError("spread_market_maker runtime was not initialized")
+                notifications.notify_exception(
+                    "盘口价差做市运行时",
+                    error,
+                    key="spread-runtime-missing",
+                    cooldown=0,
+                )
+                notifications._set_trading_paused(True)
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            if notifications.trading_paused:
+                logger.warning("SPREAD_MAKER_PAUSED slug=%s", current_market.slug)
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            try:
+                up_book, down_book = clob.books(current_market.token_ids)
+
+                def maker_book_side(book: OrderBookSnapshot) -> BookSide:
+                    quote = book.quote
+                    depth = sum(
+                        level.size
+                        for level in book.bids
+                        if quote.bid is not None and level.price == quote.bid
+                    )
+                    return BookSide(quote.bid, quote.ask, depth)
+
+                timestamps = []
+                for book in (up_book, down_book):
+                    try:
+                        raw = Decimal(book.timestamp)
+                        timestamps.append(raw / Decimal("1000") if raw > Decimal("100000000000") else raw)
+                    except (ArithmeticError, ValueError):
+                        pass
+                quote_age = (
+                    max(Decimal("0"), Decimal(str(now.timestamp())) - min(timestamps))
+                    if timestamps
+                    else Decimal("999")
+                )
+                absolute_move = (
+                    abs(spot.price - start_price) / start_price
+                    if start_price > 0
+                    else Decimal("1")
+                )
+                spread_result = spread_runtime.tick(
+                    current_market,
+                    SpreadSnapshot(
+                        seconds_left=int(seconds_to_end),
+                        observed_at=Decimal(str(now.timestamp())),
+                        quote_age_seconds=quote_age,
+                        up=maker_book_side(up_book),
+                        down=maker_book_side(down_book),
+                        absolute_window_move=absolute_move,
+                        short_volatility=sigma,
+                        tick_size=Decimal(current_market.minimum_tick_size),
+                    ),
+                )
+                logger.info(
+                    "SPREAD_MAKER slug=%s status=%s actions=%s detail=%s balances=%s realized_pnl=%s",
+                    current_market.slug,
+                    spread_result.status,
+                    len(spread_result.actions),
+                    spread_result.detail,
+                    spread_runtime.state.balances,
+                    spread_runtime.state.realized_pnl,
+                )
+                if spread_result.responses:
+                    live_orders_submitted += len(spread_result.responses)
+                    live_summary["order_attempts"] = live_orders_submitted
+                    live_summary["spread_state"] = {
+                        "window": spread_runtime.state.window_slug,
+                        "balances": spread_runtime.state.balances,
+                        "working_orders": len(spread_runtime.state.orders),
+                        "realized_pnl": spread_runtime.state.realized_pnl,
+                    }
+                    write_live_summary(finalize=False)
+            except Exception as exc:
+                live_summary["error"] = f"{type(exc).__name__}: {exc}"
+                notifications.notify_exception(
+                    f"盘口价差做市 {current_market.slug}",
+                    exc,
+                    key=f"spread:{current_market.slug}",
+                    cooldown=0,
+                )
+            sleep_until_next_poll(poll_interval, iteration_started_at)
+            continue
+
+        if args.strategy in REVERSAL_STRATEGIES:
             if reversal_runtime is None:
                 error = RuntimeError("reversal_v11 runtime was not initialized")
                 notifications.notify_exception(
@@ -3036,7 +3671,30 @@ def watch() -> None:
                 notifications._set_trading_paused(True)
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
+            if notifications.trading_paused:
+                logger.warning(
+                    "REVERSAL_PAUSED slug=%s; no chain transaction or order submitted",
+                    current_market.slug,
+                )
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            if reversal_pause_slug == current_market.slug:
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
             try:
+                abandoned_slug = (
+                    reversal_runtime.strategy.roll_forward_uncertain_opening(
+                        current_market.slug
+                    )
+                )
+                if abandoned_slug is not None:
+                    reversal_runtime.save()
+                    logger.warning(
+                        "REVERSAL_UNCERTAIN_ROLLED_FORWARD old_slug=%s current_slug=%s; "
+                        "new-window trading may resume",
+                        abandoned_slug,
+                        current_market.slug,
+                    )
                 reversal_state = reversal_runtime.strategy.state
                 next_amount = reversal_runtime.strategy.opening_split_amount(
                     current_market.slug
@@ -3050,6 +3708,16 @@ def watch() -> None:
                         making_amount=next_amount,
                         spot_prices=prices,
                         open_price=start_price,
+                        short_volatility_override=(
+                            reversal_entry_rv60
+                            if reversal_entry_rv60 is not None
+                            else Decimal("0")
+                        ),
+                        five_minute_volatility_override=(
+                            reversal_entry_rv300
+                            if reversal_entry_rv300 is not None
+                            else Decimal("0")
+                        ),
                     )
                     for side in (Direction.UP, Direction.DOWN)
                 }
@@ -3059,6 +3727,9 @@ def watch() -> None:
                     down_book=down_book,
                     health_by_side=reversal_health_by_side,
                     book_refresh=lambda: clob.books(current_market.token_ids),
+                    spot_price=spot.price,
+                    open_price=start_price,
+                    probability_up=fair.probability_up,
                 )
                 logger.info(
                     "REVERSAL_V11 slug=%s status=%s plan=%s detail=%s",
@@ -3077,7 +3748,37 @@ def watch() -> None:
                     ):
                         live_orders_matched += 1
                         live_summary["matched_orders"] = live_orders_matched
+                        live_summary["error"] = None
                     write_live_summary(finalize=False)
+                if reversal_result.status in {
+                    "entry_complete",
+                    "entry_reconciled",
+                    "exit_complete",
+                    "awaiting_settlement",
+                    "exit_reconciled",
+                    "no_trigger_no_split",
+                    "opening_already_processed",
+                    "trigger_filtered_no_split",
+                    "first_stage_extreme_volatility_no_split",
+                    "unused_split_merged",
+                    "paper_complete",
+                    "dynamic_recovery_skipped",
+                    "profit_target_unfunded",
+                    "paper_unused_split_merged",
+                }:
+                    for verified_slug, verified_result in (
+                        reversal_runtime.verify_gamma_results()
+                    ):
+                        logger.info(
+                            "REVERSAL_GAMMA_VERIFIED slug=%s result=%s "
+                            "phase=post_window_action",
+                            verified_slug,
+                            verified_result,
+                        )
+                if maintenance_ready and reversal_notifications_may_run(
+                    reversal_result.status
+                ):
+                    run_slow_notification_maintenance(maintenance_slug)
                 if (
                     reversal_daily_restart_pending
                     and reversal_runtime.strategy.state.active_round is None
@@ -3100,6 +3801,15 @@ def watch() -> None:
                 )
                 active_reversal = reversal_runtime.strategy.state.active_round
                 prepared_reversal = reversal_runtime.strategy.state.prepared_split
+                if isinstance(exc, GammaResultMismatch):
+                    reversal_runtime.quarantine_gamma_mismatch(exc)
+                    reversal_pause_slug = current_market.slug
+                    logger.error(
+                        "REVERSAL_GAMMA_WINDOW_PAUSE_SET slug=%s result_slug=%s; "
+                        "global trading remains enabled",
+                        current_market.slug,
+                        exc.slug,
+                    )
                 if (
                     (
                         active_reversal is not None
@@ -3117,7 +3827,11 @@ def watch() -> None:
                         }
                     )
                 ):
-                    notifications._set_trading_paused(True)
+                    reversal_pause_slug = current_market.slug
+                    logger.warning(
+                        "REVERSAL_WINDOW_PAUSE_SET slug=%s; global trading remains enabled",
+                        current_market.slug,
+                    )
             sleep_until_next_poll(poll_interval, iteration_started_at)
             continue
 

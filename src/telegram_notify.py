@@ -7,7 +7,7 @@ import re
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -23,9 +23,16 @@ from src.telegram_commands import (
     PAPER_ONLY_STRATEGIES,
     STRATEGY_LABELS,
     TelegramCommandPoller,
+    manual_confirmation_markup,
+    manual_trade_markup,
     reply_keyboard_markup,
     strategy_confirmation_markup,
     strategy_selection_markup,
+)
+from src.manual_trading import (
+    ManualTradeRequest,
+    ManualTradeResult,
+    next_window_slug,
 )
 
 
@@ -488,10 +495,35 @@ def format_window_settlement_message(
     )
     return_text = "N/A" if net_return_rate is None else f"{net_return_rate:+.2%}"
     first = window_settlements[0]
+    reversal = next(
+        (
+            item
+            for item in window_settlements
+            if order_role(item) == "reversal_retained"
+        ),
+        None,
+    )
+    reversal_summary: list[str] = []
+    if reversal is not None:
+        reversal_round_id = reversal.get("round_id")
+        round_net_pnl = sum(
+            (
+                _as_decimal(item.get("gross_pnl")) - settlement_estimated_fee(item)
+                for item in all_settlements
+                if order_role(item) == "reversal_retained"
+                and item.get("round_id") == reversal_round_id
+            ),
+            Decimal("0"),
+        )
+        reversal_summary = [
+            f"轮次/阶段: {reversal.get('round_id', 'N/A')}/{reversal.get('attempt', 'N/A')}",
+            f"本轮累计净盈亏估算: {round_net_pnl:+.4f} pUSD",
+        ]
     lines = [
         "🏁 Polymarket 交易已结算",
         f"结果: {result}",
         f"本窗口净盈亏估算: {net_pnl:+.4f} pUSD",
+        *reversal_summary,
         f"市场: {first.get('slug', 'N/A')}",
         f"本窗口成交: {len(window_settlements)} 单",
         f"反向保护单: {reverse_orders} 单",
@@ -504,24 +536,24 @@ def format_window_settlement_message(
         f"Taker 手续费估算: {_money(estimated_fee)}",
         f"本窗口净收益率估算: {return_text}",
     ]
-    reversal = next(
-        (
-            item
-            for item in window_settlements
-            if order_role(item) == "reversal_retained"
-        ),
-        None,
-    )
     if reversal is not None:
-        lines.extend(
-            [
-                f"反转仓位: 卖出 {reversal.get('reversal_trend_side', 'N/A')} / "
-                f"保留 {reversal.get('side', 'N/A')}",
-                f"拆分金额: {_money(_as_decimal(reversal.get('reversal_split_amount')))}",
-                f"趋势仓卖出回款: {_money(_as_decimal(reversal.get('reversal_exit_proceeds')))}",
-                f"轮次/阶段: {reversal.get('round_id', 'N/A')}/{reversal.get('attempt', 'N/A')}",
-            ]
-        )
+        if reversal.get("reversal_execution") == "direct_buy":
+            lines.extend(
+                [
+                    f"反转仓位: 直接买入 {reversal.get('side', 'N/A')}",
+                    f"计划份数: {_as_decimal(reversal.get('reversal_planned_shares')):.4f}",
+                    f"实际买入成本: {_money(_as_decimal(reversal.get('reversal_entry_cost')))}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"反转仓位: 卖出 {reversal.get('reversal_trend_side', 'N/A')} / "
+                    f"保留 {reversal.get('side', 'N/A')}",
+                    f"拆分金额: {_money(_as_decimal(reversal.get('reversal_split_amount')))}",
+                    f"趋势仓卖出回款: {_money(_as_decimal(reversal.get('reversal_exit_proceeds')))}",
+                ]
+            )
     for index, item in enumerate(window_settlements, start=1):
         item_gross = _as_decimal(item.get("gross_pnl"))
         item_net = item_gross - settlement_estimated_fee(item)
@@ -857,6 +889,7 @@ class TradingNotificationService:
             logger.warning("Unknown Telegram timezone %s; using Asia/Shanghai", timezone_name)
             self.local_timezone = ZoneInfo("Asia/Shanghai")
         self.state = self._load_state()
+        self._state_lock = threading.RLock()
         self._next_discord_deletion_at = self._discord_next_deletion_at()
         self._pause_event = threading.Event()
         if bool(self.state.get("control", {}).get("paused")):
@@ -870,6 +903,7 @@ class TradingNotificationService:
             "spot": None,
             "spot_source": None,
         }
+        self._manual_submitter: Callable[[ManualTradeRequest], None] | None = None
 
     @classmethod
     def from_env(
@@ -1255,6 +1289,8 @@ class TradingNotificationService:
                 self._send_status()
             elif item.command == "/strategy":
                 self._send_strategy_menu()
+            elif item.command == "/manual":
+                self._send_manual_menu()
             elif item.command == "/strategy_select" and item.argument is not None:
                 self._send_strategy_confirmation(item.argument)
             elif item.command == "/strategy_confirm" and item.argument is not None:
@@ -1265,6 +1301,16 @@ class TradingNotificationService:
                 )
             elif item.command == "/strategy_cancel":
                 self._send_command_reply("已取消策略选择。")
+            elif item.command == "/manual_select" and item.argument is not None:
+                self._send_manual_confirmation(item.argument)
+            elif item.command == "/manual_confirm" and item.argument is not None:
+                self._queue_manual_trade(item.argument, str(item.update_id))
+            elif item.command == "/manual_cancel":
+                self.state.setdefault("control", {}).pop(
+                    "pending_manual_confirmation", None
+                )
+                self._save_state()
+                self._send_command_reply("已取消手动交易。")
             elif item.command == "/stop":
                 self._set_trading_paused(True)
                 self._send_command_reply(
@@ -1293,6 +1339,102 @@ class TradingNotificationService:
         if self.notify_on_matched:
             self.notifier.send(format_fill_message(order))
 
+    def attach_manual_executor(
+        self,
+        submitter: Callable[[ManualTradeRequest], None],
+    ) -> None:
+        self._manual_submitter = submitter
+        for item in self.state.get("manual_orders", []):
+            if not isinstance(item, dict) or item.get("status") != "queued":
+                continue
+            try:
+                submitter(
+                    ManualTradeRequest(
+                        request_id=str(item["request_id"]),
+                        target_slug=str(item["target_slug"]),
+                        action=str(item["action"]),
+                        side=str(item["side"]),
+                        requested_at=str(item["requested_at"]),
+                        sell_size=(
+                            _as_decimal(item["sell_size"])
+                            if item.get("sell_size") not in (None, "")
+                            else None
+                        ),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                item["status"] = "failed"
+                item["error"] = f"invalid persisted manual request: {exc}"
+        self._save_state()
+
+    def mark_manual_submitting(self, request: ManualTradeRequest) -> None:
+        item = self._manual_order_state(request.request_id)
+        if item is None or item.get("status") != "queued":
+            return
+        item["status"] = "submitting"
+        item["submitting_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_state()
+
+    def record_manual_result(self, result: ManualTradeResult) -> None:
+        item = self._manual_order_state(result.request.request_id)
+        if item is not None:
+            item.update(
+                {
+                    "status": result.status,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "price": str(result.price) if result.price is not None else None,
+                    "requested_size": str(result.requested_size),
+                    "filled_size": str(result.filled_size),
+                    "cash_amount": str(result.cash_amount),
+                    "remaining_size": str(result.remaining_size),
+                    "error": result.error,
+                }
+            )
+            self._save_state()
+        record = result.ledger_record()
+        record["slug"] = result.request.target_slug
+        record["side"] = result.request.side
+        record["matched_at"] = datetime.now(timezone.utc).isoformat()
+        if result.status == "matched" and result.request.action == "buy":
+            self._append_trade_ledger(record)
+        action_label = "买入" if result.request.action == "buy" else "卖出"
+        status_label = {
+            "matched": "✅ 已成交",
+            "unmatched": "⚪ 未成交",
+            "expired": "⌛ 已过期",
+            "not_ready": "⏳ 尚未执行",
+            "failed": "❌ 执行失败",
+        }.get(result.status, result.status)
+        lines = [
+            "🎛 手动交易结果",
+            f"状态: {status_label}",
+            f"市场: {result.request.target_slug}",
+            f"操作: {action_label} {result.request.side}",
+        ]
+        if result.price is not None:
+            lines.append(f"限价: {result.price}")
+        if result.requested_size > 0:
+            lines.append(f"计划数量: {result.requested_size}份")
+        if result.filled_size > 0:
+            lines.extend(
+                [
+                    f"实际成交: {result.filled_size}份",
+                    f"成交金额: {_money(result.cash_amount)}",
+                ]
+            )
+        if result.remaining_size > 0:
+            lines.append(f"剩余未成交/未卖出: {result.remaining_size}份")
+        if result.error:
+            lines.append(f"详情: {sanitize_sensitive_text(result.error)}")
+        lines.append("注: 手动订单不改变自动策略轮次、阶段或信号计数。")
+        self._broadcast("\n".join(lines))
+
+    def _manual_order_state(self, request_id: str) -> dict[str, Any] | None:
+        for item in self.state.get("manual_orders", []):
+            if isinstance(item, dict) and str(item.get("request_id")) == request_id:
+                return item
+        return None
+
     def _append_trade_ledger(self, order: dict[str, Any]) -> None:
         if self.enabled:
             try:
@@ -1306,6 +1448,46 @@ class TradingNotificationService:
         """Record the retained reversal position and optionally broadcast the SELL fill."""
         order["matched_at"] = order.get("matched_at") or datetime.now(timezone.utc).isoformat()
         response = order.get("response") if isinstance(order.get("response"), dict) else {}
+        if order.get("order_role") == "reversal_direct_entry":
+            cost = _as_decimal(response.get("makingAmount"))
+            shares = _as_decimal(response.get("takingAmount"))
+            price = cost / shares if shares > 0 else _as_decimal(order.get("price"))
+            retained_order = dict(order)
+            retained_order.update(
+                {
+                    "order_role": "reversal_retained",
+                    "notional": str(cost),
+                    "size": str(shares),
+                    "price": str(price),
+                    "reason": (
+                        "reversal_v11 direct_buy "
+                        f"trend_side={str(order.get('trend_side') or 'N/A').upper()}"
+                    ),
+                    "reversal_execution": "direct_buy",
+                    "reversal_trend_side": str(
+                        order.get("trend_side") or "N/A"
+                    ).upper(),
+                    "reversal_planned_shares": str(order.get("planned_shares") or shares),
+                    "reversal_entry_cost": str(cost),
+                }
+            )
+            self._append_trade_ledger(retained_order)
+            if self.notify_on_matched:
+                self._broadcast(
+                    "\n".join(
+                        [
+                            "⚡ 反转策略直接买入",
+                            f"市场: {order.get('slug', 'N/A')}",
+                            f"原趋势方向: {str(order.get('trend_side', 'N/A')).upper()}",
+                            f"买入方向: {str(order.get('side', 'N/A')).upper()}",
+                            f"成交均价: {price.quantize(Decimal('0.0001'))}",
+                            f"买入数量: {shares.quantize(Decimal('0.0001'))} 份",
+                            f"实际成本: {_money(cost)}",
+                            f"轮次/阶段: {order.get('round_id', 'N/A')}/{order.get('attempt', 'N/A')}",
+                        ]
+                    )
+                )
+            return
         shares = _as_decimal(response.get("makingAmount"))
         proceeds = _as_decimal(response.get("takingAmount"))
         price = proceeds / shares if shares > 0 else _as_decimal(order.get("price"))
@@ -1576,6 +1758,7 @@ class TradingNotificationService:
                 "settlement_windows": {},
                 "control": {},
                 "telegram": {},
+                "manual_orders": [],
                 "discord_message_deletions": [],
             }
         try:
@@ -1585,6 +1768,7 @@ class TradingNotificationService:
                 payload.setdefault("settlement_windows", {})
                 payload.setdefault("control", {})
                 payload.setdefault("telegram", {})
+                payload.setdefault("manual_orders", [])
                 payload.setdefault("discord_message_deletions", [])
                 return payload
             return {
@@ -1593,6 +1777,7 @@ class TradingNotificationService:
                 "settlement_windows": {},
                 "control": {},
                 "telegram": {},
+                "manual_orders": [],
                 "discord_message_deletions": [],
             }
         except (OSError, json.JSONDecodeError):
@@ -1602,6 +1787,7 @@ class TradingNotificationService:
                 "settlement_windows": {},
                 "control": {},
                 "telegram": {},
+                "manual_orders": [],
                 "discord_message_deletions": [],
             }
 
@@ -1637,6 +1823,7 @@ class TradingNotificationService:
                     {"command": "positions", "description": "查看当前持仓"},
                     {"command": "status", "description": "查看机器人状态"},
                     {"command": "strategy", "description": "查看或切换交易策略"},
+                    {"command": "manual", "description": "手动买卖当前或下一窗口"},
                     {"command": "stop", "description": "紧急暂停新交易"},
                     {"command": "start", "description": "恢复自动交易"},
                     {"command": "restart", "description": "重启机器人"},
@@ -1817,6 +2004,165 @@ class TradingNotificationService:
             reply_markup=strategy_selection_markup(self.mode, self.strategy, pending),
         )
 
+    def _send_manual_menu(self) -> None:
+        if self.mode != "live":
+            self._send_command_reply("⚠️ 手动交易按钮仅在实盘模式可用。")
+            return
+        slug = str(self._runtime.get("slug") or "")
+        if not slug:
+            self._send_command_reply("⚠️ 当前市场尚未加载，请稍后重试。")
+            return
+        self.notifier.send(
+            "\n".join(
+                [
+                    "🎛 手动交易",
+                    f"当前市场: {slug}",
+                    f"下一市场: {next_window_slug(slug)}",
+                    "买入每次2份，可重复点击；卖出为所选方向全部可用持仓。",
+                    "手动订单独立于自动策略，但共用钱包余额和实际持仓。",
+                ]
+            ),
+            reply_markup=manual_trade_markup(),
+        )
+
+    def _send_manual_confirmation(self, action: str) -> None:
+        if self.mode != "live" or self._manual_submitter is None:
+            self._send_command_reply("⚠️ 手动实盘执行器尚未就绪。")
+            return
+        current_slug = str(self._runtime.get("slug") or "")
+        if not current_slug:
+            self._send_command_reply("⚠️ 当前市场尚未加载，请稍后重试。")
+            return
+        parts = action.split("_")
+        if len(parts) != 3:
+            self._send_command_reply("⚠️ 无效的手动交易指令。")
+            return
+        window, trade_action, side = parts
+        if window not in {"current", "next"} or trade_action not in {"buy", "sell"}:
+            self._send_command_reply("⚠️ 无效的手动交易指令。")
+            return
+        if window == "next" and trade_action == "sell":
+            self._send_command_reply("⚠️ 下一窗口尚无手动持仓，不提供预设卖出。")
+            return
+        target_slug = current_slug if window == "current" else next_window_slug(current_slug)
+        sell_size = (
+            self._manual_inventory(target_slug, side.upper())
+            if trade_action == "sell"
+            else None
+        )
+        if trade_action == "sell" and (sell_size is None or sell_size <= 0):
+            self._send_command_reply(
+                f"⚠️ 本窗口 {side.upper()} 没有手动模式可卖持仓。"
+            )
+            return
+        pending = {
+            "action_key": action,
+            "target_slug": target_slug,
+            "trade_action": trade_action,
+            "side": side.upper(),
+            "sell_size": str(sell_size) if sell_size is not None else None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.state.setdefault("control", {})["pending_manual_confirmation"] = pending
+        self._save_state()
+        action_label = (
+            "买入2份"
+            if trade_action == "buy"
+            else f"卖出手动持仓全部（{sell_size}份）"
+        )
+        self.notifier.send(
+            "\n".join(
+                [
+                    "⚠️ 确认手动实盘订单",
+                    f"市场: {target_slug}",
+                    f"操作: {action_label} {side.upper()}",
+                    "订单类型: FAK，确认后按最新可成交盘口提交。",
+                    "该订单不会改变自动策略状态。",
+                ]
+            ),
+            reply_markup=manual_confirmation_markup(action),
+        )
+
+    def _queue_manual_trade(self, action: str, update_id: str) -> None:
+        pending = self.state.setdefault("control", {}).get(
+            "pending_manual_confirmation"
+        )
+        if not isinstance(pending, dict) or pending.get("action_key") != action:
+            self._send_command_reply("⚠️ 手动交易确认已失效，请重新选择。")
+            return
+        if self._manual_submitter is None:
+            self._send_command_reply("⚠️ 手动实盘执行器尚未就绪。")
+            return
+        target_slug = str(pending.get("target_slug") or "")
+        current_slug = str(self._runtime.get("slug") or "")
+        if action.startswith("current_") and target_slug != current_slug:
+            self.state["control"].pop("pending_manual_confirmation", None)
+            self._save_state()
+            self._send_command_reply("⌛ 本窗口已切换，手动订单未提交。")
+            return
+        request_id = f"telegram-{update_id}"
+        if self._manual_order_state(request_id) is not None:
+            self._send_command_reply("该手动订单已经接收，请勿重复确认。")
+            return
+        request = ManualTradeRequest(
+            request_id=request_id,
+            target_slug=target_slug,
+            action=str(pending["trade_action"]),
+            side=str(pending["side"]),
+            requested_at=datetime.now(timezone.utc).isoformat(),
+            sell_size=(
+                _as_decimal(pending["sell_size"])
+                if pending.get("sell_size") not in (None, "")
+                else None
+            ),
+        )
+        self.state.setdefault("manual_orders", []).append(
+            {
+                **{
+                    **asdict(request),
+                    "sell_size": (
+                        str(request.sell_size)
+                        if request.sell_size is not None
+                        else None
+                    ),
+                },
+                "status": "queued",
+            }
+        )
+        self.state["control"].pop("pending_manual_confirmation", None)
+        self._save_state()
+        self._manual_submitter(request)
+        timing = "立即执行" if action.startswith("current_") else "目标窗口开盘后执行"
+        self._send_command_reply(
+            "\n".join(
+                [
+                    "✅ 手动订单已进入独立队列",
+                    f"市场: {request.target_slug}",
+                    f"操作: {'买入2份' if request.action == 'buy' else '卖出全部'} {request.side}",
+                    f"时间: {timing}",
+                ]
+            )
+        )
+
+    def _manual_inventory(self, slug: str, side: str) -> Decimal:
+        inventory = Decimal("0")
+        for item in self.state.get("manual_orders", []):
+            if (
+                not isinstance(item, dict)
+                or str(item.get("target_slug")) != slug
+                or str(item.get("side")) != side
+            ):
+                continue
+            action = str(item.get("action") or "")
+            status = str(item.get("status") or "")
+            if action == "buy" and status == "matched":
+                inventory += _as_decimal(item.get("filled_size"))
+            elif action == "sell" and status == "matched":
+                inventory -= _as_decimal(item.get("filled_size"))
+            elif action == "sell" and status in {"queued", "submitting"}:
+                inventory -= _as_decimal(item.get("sell_size"))
+        return max(Decimal("0"), inventory)
+
     def _send_strategy_confirmation(self, strategy: str) -> None:
         target = self.launch_strategy if strategy == DEFAULT_STRATEGY else strategy
         if not self._strategy_available(target):
@@ -1877,11 +2223,15 @@ class TradingNotificationService:
         return self.notifier.send(message, reply_markup=reply_keyboard_markup())
 
     def _save_state(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        with self._state_lock:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.state_path)
 
     def _ensure_day(self, day: date, balance: Decimal | None) -> None:
         days = self.state.setdefault("days", {})

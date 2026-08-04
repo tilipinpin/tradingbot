@@ -23,9 +23,9 @@ exec "$PYTHON" -u -m src.watch_updown \
   --interval 5 \
   --auto-trade \
   --live-trading \
-  --strategy reversal_v11 \
+  --strategy reversal_v11_four_streak \
   --price-source POLYMARKET_CHAINLINK \
-  --ws-proxy socks5h://127.0.0.1:7898 \
+  --ws-proxy http://127.0.0.1:7897 \
   --price-to-beat-proxy socks5h://127.0.0.1:7898 \
   --price-alignment-jsonl "$DATA_DIR/live_price_alignment.jsonl" \
   --max-price-alignment-difference 0.50 \
@@ -34,6 +34,9 @@ exec "$PYTHON" -u -m src.watch_updown \
   --official-open-stable-seconds 5 \
   --env-file "$ENV_FILE" \
   --reversal-state-json "$DATA_DIR/reversal_v11_state.json" \
+  --reversal-first-stage-max-rv60 0.0010 \
+  --reversal-first-stage-max-rv300 0.0020 \
+  --spread-maker-state-json "$DATA_DIR/spread_market_maker_state.json" \
   --decision-seconds-before-end 120 \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \

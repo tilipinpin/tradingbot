@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN
+import time
 from typing import Any, Callable, Protocol
 
 import requests
@@ -179,6 +180,8 @@ class SecureRelayerSubmitter:
         clob_url: str = "https://clob.polymarket.com",
         client_factory: Callable[..., Any] | None = None,
         transaction_call_factory: Callable[..., Any] | None = None,
+        confirmation_recovery_attempts: int = 15,
+        confirmation_recovery_poll_seconds: float = 2.0,
     ) -> None:
         if signature_type not in {1, 2, 3}:
             raise ValueError("relayer supports signature types 1, 2, and 3")
@@ -198,6 +201,12 @@ class SecureRelayerSubmitter:
         self._transaction_call_factory = (
             transaction_call_factory or _create_sdk_transaction_call
         )
+        if confirmation_recovery_attempts < 1:
+            raise ValueError("confirmation recovery attempts must be positive")
+        if confirmation_recovery_poll_seconds < 0:
+            raise ValueError("confirmation recovery poll interval must not be negative")
+        self.confirmation_recovery_attempts = confirmation_recovery_attempts
+        self.confirmation_recovery_poll_seconds = confirmation_recovery_poll_seconds
         self._client: Any | None = None
 
     def read_only_self_check(self) -> dict[str, Any]:
@@ -264,6 +273,10 @@ class SecureRelayerSubmitter:
                 )
         return self._client
 
+    def prewarm(self) -> None:
+        """Build and authenticate the SDK client before a latency-sensitive split."""
+        self._get_client()
+
     def submit(self, calls: list[ContractCall], metadata: str) -> tuple[str | None, str, str]:
         client = self._get_client()
         handle = client.execute_transaction(
@@ -275,9 +288,18 @@ class SecureRelayerSubmitter:
             ],
             metadata=metadata,
         )
-        result = handle.wait()
+        try:
+            result = handle.wait()
+        except Exception:
+            recovered = self._recover_submitted_transaction(handle)
+            if recovered is None:
+                raise
+            return recovered
         if result is None:
-            raise SplitExecutionError("relayed split did not reach a confirmed state")
+            recovered = self._recover_submitted_transaction(handle)
+            if recovered is None:
+                raise SplitExecutionError("relayed split did not reach a confirmed state")
+            return recovered
         transaction_id = getattr(result, "transaction_id", None) or getattr(
             handle, "transaction_id", None
         )
@@ -289,6 +311,57 @@ class SecureRelayerSubmitter:
         if not tx_hash:
             raise SplitExecutionError("relayer returned no Polygon transaction hash")
         return transaction_id, tx_hash, "STATE_CONFIRMED"
+
+    def _recover_submitted_transaction(
+        self, handle: Any
+    ) -> tuple[str | None, str, str] | None:
+        """Resolve a submitted transaction after the SDK's short wait times out."""
+        transaction_id = str(getattr(handle, "transaction_id", None) or "")
+        if not transaction_id:
+            return None
+        headers = {
+            "RELAYER_API_KEY": self.relayer_api_key,
+            "RELAYER_API_KEY_ADDRESS": self.relayer_api_key_address,
+        }
+        endpoint = (
+            f"{self.relayer_url.rstrip('/')}/v1/account/transactions/{transaction_id}"
+        )
+        failure_states = {"STATE_FAILED", "STATE_INVALID"}
+        for attempt in range(self.confirmation_recovery_attempts):
+            try:
+                response = requests.get(endpoint, headers=headers, timeout=20)
+                response.raise_for_status()
+                payload = response.json()
+                state = str(payload.get("state") or "")
+                if state == "STATE_CONFIRMED":
+                    tx_hash = str(
+                        payload.get("transaction_hash")
+                        or payload.get("transactionHash")
+                        or getattr(handle, "transaction_hash", None)
+                        or ""
+                    )
+                    if not tx_hash:
+                        raise SplitExecutionError(
+                            "confirmed relayer transaction returned no Polygon hash"
+                        )
+                    return transaction_id, tx_hash, state
+                if state in failure_states:
+                    detail = str(
+                        payload.get("error_msg")
+                        or payload.get("errorMessage")
+                        or payload.get("error")
+                        or state
+                    )
+                    raise SplitExecutionError(
+                        f"relayer transaction {transaction_id} failed: {detail}"
+                    )
+            except SplitExecutionError:
+                raise
+            except Exception:
+                pass
+            if attempt + 1 < self.confirmation_recovery_attempts:
+                time.sleep(self.confirmation_recovery_poll_seconds)
+        return None
 
 
 def _create_secure_client(
@@ -340,6 +413,33 @@ class CompleteSetSplitter:
         self.rpc = rpc
         self.submitter = submitter
         self.wallet = to_checksum_address(wallet)
+        self._chain_validated = False
+        self._validated_contracts: set[str] = set()
+        self._allowance_by_adapter: dict[str, int] = {}
+
+    def _validate_static_configuration(
+        self,
+        adapter: str,
+        position_token: str,
+    ) -> None:
+        if not self._chain_validated:
+            if self.rpc.chain_id() != POLYGON_CHAIN_ID:
+                raise SplitExecutionError(
+                    "RPC is not connected to Polygon mainnet chain 137"
+                )
+            self._chain_validated = True
+        for address, name in (
+            (PUSD_ADDRESS, "pUSD"),
+            (CTF_ADDRESS, "CTF"),
+            (adapter, "CTF collateral adapter"),
+            (position_token, "position token"),
+        ):
+            cache_key = address.lower()
+            if cache_key in self._validated_contracts:
+                continue
+            if self.rpc.code(address) in {"0x", "0x0", ""}:
+                raise SplitExecutionError(f"{name} has no contract code on Polygon")
+            self._validated_contracts.add(cache_key)
 
     def preflight(
         self,
@@ -355,22 +455,22 @@ class CompleteSetSplitter:
         amount_units = to_token_units(amount)
         adapter = adapter_for_market(neg_risk)
         position_token = position_token_for_market(neg_risk)
-        if self.rpc.chain_id() != POLYGON_CHAIN_ID:
-            raise SplitExecutionError("RPC is not connected to Polygon mainnet chain 137")
-        for address, name in (
-            (PUSD_ADDRESS, "pUSD"),
-            (CTF_ADDRESS, "CTF"),
-            (adapter, "CTF collateral adapter"),
-            (position_token, "position token"),
-        ):
-            if self.rpc.code(address) in {"0x", "0x0", ""}:
-                raise SplitExecutionError(f"{name} has no contract code on Polygon")
+        self._validate_static_configuration(adapter, position_token)
         balance = erc20_balance(self.rpc, PUSD_ADDRESS, self.wallet)
         if balance < amount_units:
             raise SplitExecutionError(
                 f"insufficient pUSD: required {amount_units}, available {balance} base units"
             )
-        allowance = erc20_allowance(self.rpc, PUSD_ADDRESS, self.wallet, adapter)
+        allowance_key = adapter.lower()
+        allowance = self._allowance_by_adapter.get(allowance_key)
+        if allowance is None or allowance < amount_units:
+            allowance = erc20_allowance(
+                self.rpc,
+                PUSD_ADDRESS,
+                self.wallet,
+                adapter,
+            )
+            self._allowance_by_adapter[allowance_key] = allowance
         return SplitPreflight(
             wallet=self.wallet,
             adapter=adapter,
@@ -416,6 +516,15 @@ class CompleteSetSplitter:
         transaction_id, transaction_hash, state = self.submitter.submit(
             calls,
             f"reversal-v11 complete-set split {amount} pUSD",
+        )
+        allowance_key = preflight.adapter.lower()
+        self._allowance_by_adapter[allowance_key] = (
+            MAX_UINT256
+            if preflight.approval_required
+            else max(
+                0,
+                preflight.collateral_allowance_units - preflight.amount_units,
+            )
         )
         position_token = position_token_for_market(neg_risk)
         up_after = erc1155_balance(self.rpc, position_token, self.wallet, int(up_token_id))

@@ -1,3 +1,4 @@
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -36,6 +37,72 @@ def test_two_same_results_trigger_reversal_target() -> None:
     assert plan.making_amount == Decimal("2")
     assert plan.trend_side is Direction.UP
     assert plan.retained_side is Direction.DOWN
+    assert strategy.metrics().triggered_rounds == 1
+    assert strategy.metrics().executed_rounds == 0
+
+
+def test_four_streak_variant_requires_four_consecutive_same_results() -> None:
+    strategy = ReversalV11(ReversalSettings(trigger_streak=4))
+    for epoch in (100, 400, 700):
+        strategy.settle_window(f"btc-updown-5m-{epoch}", Direction.UP)
+
+    assert strategy.plan_window("btc-updown-5m-1000", HEALTHY) is None
+
+    strategy.settle_window("btc-updown-5m-1000", Direction.UP)
+    plan = strategy.plan_window("btc-updown-5m-1300", HEALTHY)
+
+    assert plan is not None
+    assert plan.attempt == 1
+    assert plan.making_amount == Decimal("2")
+    assert plan.trend_side is Direction.UP
+    assert plan.retained_side is Direction.DOWN
+
+
+def test_three_streak_variant_trades_one_window_before_four_streak() -> None:
+    strategy = ReversalV11(ReversalSettings(trigger_streak=3))
+    for epoch in (100, 400):
+        strategy.settle_window(f"btc-updown-5m-{epoch}", Direction.DOWN)
+
+    assert strategy.plan_window("btc-updown-5m-700", HEALTHY) is None
+
+    strategy.settle_window("btc-updown-5m-700", Direction.DOWN)
+    plan = strategy.plan_window("btc-updown-5m-1000", HEALTHY)
+
+    assert plan is not None
+    assert plan.attempt == 1
+    assert plan.making_amount == Decimal("2")
+    assert plan.trend_side is Direction.DOWN
+    assert plan.retained_side is Direction.UP
+
+
+def test_four_streak_variant_rejects_mixed_or_non_adjacent_windows() -> None:
+    mixed = ReversalV11(ReversalSettings(trigger_streak=4))
+    for epoch, result in zip(
+        (100, 400, 700, 1000),
+        (Direction.UP, Direction.UP, Direction.DOWN, Direction.UP),
+    ):
+        mixed.settle_window(f"btc-updown-5m-{epoch}", result)
+    assert mixed.plan_window("btc-updown-5m-1300", HEALTHY) is None
+
+    gapped = ReversalV11(ReversalSettings(trigger_streak=4))
+    for epoch in (100, 400, 1000, 1300):
+        gapped.settle_window(f"btc-updown-5m-{epoch}", Direction.DOWN)
+    assert gapped.plan_window("btc-updown-5m-1600", HEALTHY) is None
+
+
+def test_confirmed_first_split_counts_executed_round_once() -> None:
+    strategy = ReversalV11()
+    seed_two_up(strategy)
+    plan = strategy.plan_window("btc-updown-5m-700", HEALTHY)
+    assert plan is not None
+    strategy.prepare_opening_split(plan.window_slug)
+    strategy.mark_opening_split_submitting()
+    strategy.mark_opening_split_confirmed("0xconfirmed")
+
+    strategy.adopt_opening_split(plan)
+
+    assert strategy.metrics().triggered_rounds == 1
+    assert strategy.metrics().executed_rounds == 1
 
 
 def test_opening_split_is_prepared_before_results_and_persists(tmp_path) -> None:
@@ -51,6 +118,42 @@ def test_opening_split_is_prepared_before_results_and_persists(tmp_path) -> None
     assert restored.state.prepared_split is not None
     assert restored.state.prepared_split.window_slug == "btc-updown-5m-700"
     assert restored.state.prepared_split.execution_phase == "split_confirmed"
+
+
+def test_uncertain_opening_only_blocks_its_own_window() -> None:
+    strategy = ReversalV11()
+    seed_two_up(strategy)
+    plan = strategy.plan_window("btc-updown-5m-700", HEALTHY)
+    assert plan is not None
+    strategy.prepare_opening_split(plan.window_slug)
+    strategy.mark_opening_split_submitting()
+    strategy.mark_opening_split_uncertain()
+
+    assert strategy.roll_forward_uncertain_opening(plan.window_slug) is None
+    assert strategy.state.active_round is not None
+    assert strategy.state.prepared_split is not None
+
+    abandoned = strategy.roll_forward_uncertain_opening("btc-updown-5m-1000")
+
+    assert abandoned == plan.window_slug
+    assert strategy.state.active_round is None
+    assert strategy.state.prepared_split is None
+    assert strategy.state.last_opening_processed_slug == plan.window_slug
+    assert strategy.metrics().api_order_errors == 1
+
+
+def test_confirmed_opening_cannot_be_rolled_forward_as_uncertain() -> None:
+    strategy = ReversalV11()
+    seed_two_up(strategy)
+    plan = strategy.plan_window("btc-updown-5m-700", HEALTHY)
+    assert plan is not None
+    strategy.prepare_opening_split(plan.window_slug)
+    strategy.mark_opening_split_submitting()
+    strategy.mark_opening_split_confirmed("0xconfirmed")
+
+    assert strategy.roll_forward_uncertain_opening("btc-updown-5m-1000") is None
+    assert strategy.state.active_round is not None
+    assert strategy.state.prepared_split is not None
 
 
 def test_next_opening_split_prepares_next_martingale_stage_before_result() -> None:
@@ -81,23 +184,50 @@ def test_next_opening_split_is_blocked_until_prior_trend_exit_is_complete() -> N
         raise AssertionError("next opening split should be blocked")
 
 
-def test_progression_is_2_4_8_16_then_forced_exit_and_immediate_retrigger() -> None:
+def test_progression_has_fifteen_attempts_then_blocks_until_real_reversal() -> None:
     strategy = ReversalV11()
     seed_two_up(strategy)
     amounts = []
-    for index, slug in enumerate(("700", "1000", "1300", "1600"), start=1):
+    for index, slug in enumerate(
+        (
+            "700", "1000", "1300", "1600", "1900", "2200", "2500", "2800",
+            "3100", "3400", "3700", "4000", "4300", "4600", "4900",
+        ),
+        start=1,
+    ):
         plan = strategy.plan_window(f"btc-updown-5m-{slug}", HEALTHY)
         assert plan is not None
         amounts.append(plan.making_amount)
         status = strategy.settle_window(f"btc-updown-5m-{slug}", Direction.UP)
         assert status == (
-            "forced_exit_after_four_failures" if index == 4 else "trend_continued"
+            "forced_exit_after_fifteen_failures" if index == 15 else "trend_continued"
         )
 
-    assert amounts == [Decimal("2"), Decimal("4"), Decimal("8"), Decimal("16")]
-    assert strategy.metrics().total_making_amount == Decimal("30")
+    assert amounts == [
+        Decimal("2"),
+        Decimal("4"),
+        Decimal("8"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+        Decimal("16"),
+    ]
+    assert strategy.metrics().total_making_amount == Decimal("206")
     assert strategy.metrics().forced_exit_rounds == 1
-    restarted = strategy.plan_window("btc-updown-5m-1900", HEALTHY)
+    restarted = strategy.plan_window("btc-updown-5m-5200", HEALTHY)
+    assert restarted is None
+
+    strategy.settle_window("btc-updown-5m-5200", Direction.DOWN)
+    strategy.settle_window("btc-updown-5m-5500", Direction.DOWN)
+    restarted = strategy.plan_window("btc-updown-5m-5800", HEALTHY)
     assert restarted is not None
     assert restarted.making_amount == Decimal("2")
     assert restarted.round_id == 2
@@ -118,6 +248,30 @@ def test_reversal_success_ends_round_and_records_stage() -> None:
     assert strategy.metrics().settlement_payout == Decimal("2")
 
 
+def test_legacy_profit_pause_state_does_not_stop_new_rounds(tmp_path) -> None:
+    strategy = ReversalV11()
+    seed_two_up(strategy)
+    state_path = tmp_path / "profit-stop.json"
+    strategy.dump(state_path)
+    payload = json.loads(state_path.read_text())
+    payload.update(
+        {
+            "profit_baseline_net_profit": "0",
+            "profit_target_reached": True,
+            "profit_pause_windows_remaining": 7,
+            "last_profit_pause_slug": "btc-updown-5m-400",
+        }
+    )
+    state_path.write_text(json.dumps(payload))
+
+    restored = ReversalV11.load(state_path)
+    plan = restored.plan_window("btc-updown-5m-700", HEALTHY)
+
+    assert plan is not None
+    assert plan.attempt == 1
+    assert plan.making_amount == Decimal("2")
+
+
 def test_filter_pauses_without_consuming_attempt() -> None:
     strategy = ReversalV11(ReversalSettings(market_filters_enabled=True))
     seed_two_up(strategy)
@@ -136,6 +290,63 @@ def test_filter_pauses_without_consuming_attempt() -> None:
     assert resumed is not None
     assert resumed.attempt == 1
     assert resumed.making_amount == Decimal("2")
+    assert strategy.metrics().volatility_pauses == 1
+
+
+def test_extreme_rv60_blocks_only_first_stage() -> None:
+    settings = ReversalSettings(
+        first_stage_rv60_filter_enabled=True,
+        first_stage_max_rv60=Decimal("0.0010"),
+    )
+    strategy = ReversalV11(settings)
+    seed_two_up(strategy)
+    extreme = MarketHealth(
+        short_volatility=Decimal("0.0010"),
+        absolute_window_move=Decimal("0"),
+        trend_bid_depth=Decimal("20"),
+        trend_spread=Decimal("0.01"),
+        estimated_sellable=True,
+    )
+
+    assert strategy.plan_window("btc-updown-5m-700", extreme) is None
+    assert strategy.state.active_round is None
+    assert strategy.metrics().volatility_pauses == 1
+
+    normal = MarketHealth(
+        short_volatility=Decimal("0.0009"),
+        absolute_window_move=Decimal("0"),
+        trend_bid_depth=Decimal("20"),
+        trend_spread=Decimal("0.01"),
+        estimated_sellable=True,
+    )
+    plan = strategy.plan_window("btc-updown-5m-700", normal)
+    assert plan is not None
+    strategy.state.active_round.awaiting_window = "btc-updown-5m-700"
+    strategy.state.active_round.failures = 1
+
+    resumed = strategy.plan_window("btc-updown-5m-700", extreme)
+    assert resumed is not None
+    assert resumed.attempt == 2
+
+
+def test_extreme_rv300_blocks_first_stage() -> None:
+    settings = ReversalSettings(
+        first_stage_rv300_filter_enabled=True,
+        first_stage_max_rv300=Decimal("0.0020"),
+    )
+    strategy = ReversalV11(settings)
+    seed_two_up(strategy)
+    extreme = MarketHealth(
+        short_volatility=Decimal("0"),
+        absolute_window_move=Decimal("0"),
+        trend_bid_depth=Decimal("20"),
+        trend_spread=Decimal("0.01"),
+        estimated_sellable=True,
+        five_minute_volatility=Decimal("0.0020"),
+    )
+
+    assert strategy.plan_window("btc-updown-5m-700", extreme) is None
+    assert strategy.state.active_round is None
     assert strategy.metrics().volatility_pauses == 1
 
 
@@ -184,8 +395,9 @@ def test_daily_report_contains_required_v11_fields() -> None:
 
     for label in (
         "总结算窗口",
-        "触发轮数",
-        "四次失败退出",
+        "信号触发轮数",
+        "已确认拆分轮数",
+        "十五次失败退出",
         "各阶段成功",
         "最大连续同向窗口",
         "总做市金额",
@@ -217,6 +429,26 @@ def test_state_round_trip_preserves_active_attempt(tmp_path) -> None:
     assert second is not None
     assert second.attempt == 2
     assert second.making_amount == Decimal("4")
+
+
+def test_direct_entry_preserves_price_improvement_extra_shares() -> None:
+    strategy = ReversalV11()
+    seed_two_up(strategy)
+    plan = strategy.plan_window("btc-updown-5m-700", HEALTHY)
+    assert plan is not None
+    strategy.mark_direct_entry_ready(plan)
+
+    complete = strategy.record_direct_entry_fill(
+        plan,
+        shares=Decimal("2.07843"),
+        cost=Decimal("1.059999"),
+    )
+
+    assert complete is True
+    assert strategy.state.active_round is not None
+    assert strategy.state.active_round.exit_sold_shares == Decimal("2.07843")
+    assert strategy.state.active_round.exit_sell_proceeds == Decimal("1.059999")
+    assert strategy.metrics().total_making_amount == Decimal("1.059999")
 
 
 def test_execute_complete_set_passes_active_attempt_amount_to_splitter() -> None:
