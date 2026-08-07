@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 from src.polymarket import Market, OrderBookSnapshot
 from src.polygon_split import CompleteSetSplitter
 from src.reversal_v11 import (
+    ActiveRound,
     Direction,
     MarketHealth,
     ReversalSettings,
@@ -43,6 +44,8 @@ logger = logging.getLogger(__name__)
 MIN_MARKETABLE_BUY_NOTIONAL = Decimal("1.01")
 ORDER_SIZE_QUANTUM = Decimal("0.01")
 MAKER_AMOUNT_QUANTUM = Decimal("0.01")
+GAMMA_CORRECTION_MIN_SECONDS_LEFT = Decimal("30")
+GAMMA_CORRECTION_MAX_ASK = Decimal("0.80")
 
 
 class Splitter(Protocol):
@@ -413,9 +416,22 @@ class ReversalRuntime:
         self.execution_mode = execution_mode
         self.order_callback = order_callback
         self._next_gamma_verification_at = 0.0
+        self._next_gamma_backfill_at = 0.0
 
     def save(self) -> None:
         self.strategy.dump(self.state_path)
+
+    def set_boundary_price_mode(self, mode: str) -> bool:
+        """Switch boundary conventions without ever mixing cached price types."""
+        if mode not in {"legacy", "twap30"}:
+            raise ValueError("boundary price mode must be legacy or twap30")
+        state = self.strategy.state
+        if state.chainlink_price_mode == mode:
+            return False
+        state.chainlink_price_mode = mode
+        state.chainlink_open_prices = {}
+        self.save()
+        return True
 
     def send_daily_report_once(
         self,
@@ -571,10 +587,338 @@ class ReversalRuntime:
             self.save()
         return verified
 
+    def backfill_immediate_gamma_results(
+        self,
+        current_slug: str,
+    ) -> list[tuple[str, str]]:
+        """Fill only missing trigger history from finalized Gamma outcomes.
+
+        Chainlink TWAP remains the fast path.  Gamma is consulted only when the
+        exact predecessor sequence has a hole, and winner_lookup only returns a
+        side after Gamma publishes a final 1/0 outcome.
+        """
+        state = self.strategy.state
+        if state.active_round is not None or state.prepared_split is not None:
+            return []
+        count = self.strategy.settings.trigger_streak
+        expected = [
+            previous_5m_slug(current_slug, offset)
+            for offset in range(count, 0, -1)
+        ]
+        if state.recent_slugs[-count:] == expected:
+            return []
+
+        known = {
+            slug: result
+            for slug, result in zip(state.recent_slugs, state.recent_results)
+            if slug in expected
+        }
+        missing = [slug for slug in expected if slug not in known]
+        if not missing:
+            return []
+        now = time.monotonic()
+        if now < self._next_gamma_backfill_at:
+            return []
+        self._next_gamma_backfill_at = now + 2.0
+
+        backfilled: list[tuple[str, str]] = []
+        for slug in missing:
+            try:
+                published = self.winner_lookup(slug)
+            except Exception as exc:
+                logger.warning("Gamma history backfill pending for %s: %s", slug, exc)
+                return []
+            if published not in {Direction.UP.value, Direction.DOWN.value}:
+                return []
+            official = Direction(published)
+            known[slug] = official
+            backfilled.append((slug, official.value))
+
+        if any(slug not in known for slug in expected):
+            return []
+        state.recent_slugs = expected
+        state.recent_results = [known[slug] for slug in expected]
+        final_side = state.recent_results[-1]
+        streak = 0
+        for result in reversed(state.recent_results):
+            if result is not final_side:
+                break
+            streak += 1
+        state.current_streak_side = final_side
+        state.current_streak = streak
+        state.gamma_verified_slugs = (
+            state.gamma_verified_slugs + [slug for slug, _ in backfilled]
+        )[-100:]
+        self.save()
+        return backfilled
+
     def quarantine_gamma_mismatch(self, mismatch: GammaResultMismatch) -> None:
-        """Persist a conflict once so it cannot pause every following window."""
+        """Apply Gamma's final side and retain the provisional conflict for audit."""
+        state = self.strategy.state
+        if mismatch.slug in state.recent_slugs:
+            index = state.recent_slugs.index(mismatch.slug)
+            state.recent_results[index] = mismatch.official
+            final_side = state.recent_results[-1]
+            streak = 0
+            for result in reversed(state.recent_results):
+                if result is not final_side:
+                    break
+                streak += 1
+            state.current_streak_side = final_side
+            state.current_streak = streak
         self.strategy.quarantine_gamma_mismatch(mismatch.slug)
         self.save()
+
+    def correct_gamma_mismatch_position(
+        self,
+        *,
+        market: Market,
+        up_book: OrderBookSnapshot,
+        down_book: OrderBookSnapshot,
+        seconds_left: Decimal,
+    ) -> ReversalTickResult:
+        """Close a filled provisional order and replace it only without added loss.
+
+        The caller must apply ``quarantine_gamma_mismatch`` first so recent
+        history already reflects Gamma's final outcome.
+        """
+        state = self.strategy.state
+        active = state.active_round
+        if active is None or active.awaiting_window != market.slug:
+            return ReversalTickResult("gamma_state_corrected_no_active_order")
+        if self.execution_mode != "direct_buy" or self.trader is None:
+            return ReversalTickResult(
+                "gamma_correction_blocked",
+                detail="automatic correction supports direct-buy mode only",
+            )
+
+        count = self.strategy.settings.trigger_streak
+        immediate = (
+            state.recent_slugs[-count:]
+            == [previous_5m_slug(market.slug, offset) for offset in range(count, 0, -1)]
+        )
+        corrected_trend = (
+            state.recent_results[-1]
+            if immediate
+            and len(state.recent_results) >= count
+            and len(set(state.recent_results[-count:])) == 1
+            else None
+        )
+        if corrected_trend is active.trend_side:
+            return ReversalTickResult("gamma_state_corrected_order_unchanged")
+
+        # FAK has no live remainder to cancel.  Before any fill, change the
+        # persisted plan so the next retry uses Gamma's corrected direction.
+        if active.exit_sold_shares <= Decimal("0.000001"):
+            if corrected_trend is None:
+                state.active_round = None
+                state.last_opening_processed_slug = market.slug
+                self.save()
+                return ReversalTickResult("gamma_invalid_trigger_cancelled")
+            active.trend_side = corrected_trend
+            active.execution_phase = "direct_entry_ready"
+            active.entry_submitted_price = None
+            self.save()
+            return ReversalTickResult(
+                "gamma_unfilled_order_replaced",
+                detail=f"new_side={active.target_side.value}",
+            )
+
+        if seconds_left < GAMMA_CORRECTION_MIN_SECONDS_LEFT:
+            return ReversalTickResult(
+                "gamma_correction_blocked",
+                detail=f"seconds_left={seconds_left} below 30",
+            )
+
+        wrong_side = active.target_side
+        wrong_index = 0 if wrong_side is Direction.UP else 1
+        wrong_token = market.token_ids[wrong_index]
+        wrong_book = up_book if wrong_index == 0 else down_book
+        wrong_bid = wrong_book.quote.bid
+        available = self.trader.conditional_balance(wrong_token, self.signature_type)
+        wrong_shares = min(active.exit_sold_shares, available)
+        if (
+            wrong_bid is None
+            or wrong_bid <= 0
+            or wrong_shares <= Decimal("0.000001")
+            or bid_depth(wrong_book, wrong_bid) < wrong_shares
+        ):
+            return ReversalTickResult(
+                "gamma_correction_blocked",
+                detail="wrong-side position is not fully sellable at best bid",
+            )
+
+        corrected_side = corrected_trend.opposite if corrected_trend is not None else None
+        corrected_book = (
+            up_book if corrected_side is Direction.UP else down_book
+            if corrected_side is Direction.DOWN
+            else None
+        )
+        corrected_ask = corrected_book.quote.ask if corrected_book is not None else None
+        if corrected_side is not None and (
+            corrected_ask is None
+            or corrected_ask <= 0
+            or corrected_ask > GAMMA_CORRECTION_MAX_ASK
+        ):
+            return ReversalTickResult(
+                "gamma_correction_blocked",
+                detail=f"corrected ask {corrected_ask} exceeds 0.80 or is unavailable",
+            )
+
+        sell_response = self.trader.sell_limit(
+            wrong_token,
+            wrong_bid,
+            wrong_shares,
+            market.minimum_tick_size,
+            market.neg_risk,
+            "FAK",
+        )
+        sold_shares, sell_proceeds = _sell_fill_amounts(sell_response)
+        sell_fee = (
+            sold_shares
+            * Decimal("0.07")
+            * wrong_bid
+            * (Decimal("1") - wrong_bid)
+        )
+        sell_order = {
+            "slug": market.slug,
+            "side": wrong_side.value,
+            "token_id": wrong_token,
+            "price": str(wrong_bid),
+            "size": str(wrong_shares),
+            "order_type": "FAK",
+            "order_role": "gamma_correction_exit",
+            "round_id": active.round_id,
+            "response": sell_response,
+        }
+        if sold_shares <= Decimal("0.000001"):
+            return ReversalTickResult(
+                "gamma_correction_exit_unmatched",
+                order=sell_order,
+            )
+        if self.order_callback is not None:
+            self.order_callback(sell_order)
+        metrics = self.strategy.metrics()
+        metrics.sell_proceeds += sell_proceeds
+        metrics.fees += sell_fee
+        metrics.net_profit = (
+            metrics.sell_proceeds
+            + metrics.settlement_payout
+            - metrics.total_making_amount
+            - metrics.fees
+            - metrics.slippage
+        )
+        remaining_wrong = max(Decimal("0"), active.exit_sold_shares - sold_shares)
+        if remaining_wrong > Decimal("0.000001"):
+            original_shares = active.exit_sold_shares
+            active.exit_sold_shares = remaining_wrong
+            active.exit_sell_proceeds *= remaining_wrong / original_shares
+            active.planned_shares = remaining_wrong
+            self.save()
+            return ReversalTickResult(
+                "gamma_correction_exit_partial",
+                order=sell_order,
+                detail=f"remaining_wrong_shares={remaining_wrong}",
+            )
+
+        original_round_id = active.round_id
+        original_failures = active.failures
+        original_committed = active.committed
+        original_cumulative_loss = active.cumulative_loss
+        state.active_round = None
+        state.last_opening_processed_slug = market.slug
+        if corrected_side is None:
+            self.save()
+            return ReversalTickResult(
+                "gamma_invalid_trigger_position_closed",
+                order=sell_order,
+            )
+
+        assert corrected_ask is not None
+        net_sell_budget = max(Decimal("0"), sell_proceeds - sell_fee)
+        buy_fee_per_share = (
+            Decimal("0.07") * corrected_ask * (Decimal("1") - corrected_ask)
+        )
+        replacement_shares = (
+            net_sell_budget / (corrected_ask + buy_fee_per_share)
+        ).quantize(ORDER_SIZE_QUANTUM, rounding=ROUND_DOWN)
+        if (
+            replacement_shares <= 0
+            or replacement_shares * corrected_ask < MIN_MARKETABLE_BUY_NOTIONAL
+        ):
+            self.save()
+            return ReversalTickResult(
+                "gamma_replacement_unfunded_position_closed",
+                order=sell_order,
+            )
+        corrected_index = 0 if corrected_side is Direction.UP else 1
+        corrected_token = market.token_ids[corrected_index]
+        buy_response = self.trader.buy_limit(
+            corrected_token,
+            corrected_ask,
+            replacement_shares,
+            market.minimum_tick_size,
+            market.neg_risk,
+            "FAK",
+        )
+        buy_cost, bought_shares = _buy_fill_amounts(buy_response)
+        buy_order = {
+            "slug": market.slug,
+            "side": corrected_side.value,
+            "token_id": corrected_token,
+            "price": str(corrected_ask),
+            "size": str(replacement_shares),
+            "order_type": "FAK",
+            "order_role": "gamma_correction_replacement",
+            "round_id": original_round_id,
+            "response": buy_response,
+        }
+        if bought_shares <= Decimal("0.000001"):
+            self.save()
+            return ReversalTickResult(
+                "gamma_replacement_unmatched_position_closed",
+                order=buy_order,
+            )
+        buy_fee = (
+            bought_shares
+            * Decimal("0.07")
+            * corrected_ask
+            * (Decimal("1") - corrected_ask)
+        )
+        state.active_round = ActiveRound(
+            round_id=original_round_id,
+            trend_side=corrected_trend,
+            failures=original_failures,
+            awaiting_window=market.slug,
+            committed=original_committed,
+            execution_phase="direct_entry_complete",
+            split_transaction_hash="direct-buy",
+            exit_sold_shares=bought_shares,
+            exit_sell_proceeds=buy_cost,
+            planned_shares=bought_shares,
+            entry_fees=buy_fee,
+            cumulative_loss=original_cumulative_loss,
+        )
+        metrics.total_making_amount += buy_cost
+        metrics.fees += buy_fee
+        metrics.net_profit = (
+            metrics.sell_proceeds
+            + metrics.settlement_payout
+            - metrics.total_making_amount
+            - metrics.fees
+            - metrics.slippage
+        )
+        self.save()
+        if self.order_callback is not None:
+            self.order_callback(buy_order)
+        return ReversalTickResult(
+            "gamma_order_replaced",
+            order=buy_order,
+            detail=(
+                f"closed={wrong_side.value} {sold_shares} replaced={corrected_side.value} "
+                f"{bought_shares} without increasing max-loss budget"
+            ),
+        )
 
     def sync_settlements(self, current_slug: str) -> list[tuple[str, str]]:
         current_epoch = slug_epoch(current_slug)

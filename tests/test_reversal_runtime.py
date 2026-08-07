@@ -435,6 +435,37 @@ def test_completed_prices_settle_immediately_and_queue_gamma_verification(tmp_pa
     }
 
 
+def test_boundary_mode_switch_clears_prices_but_preserves_active_round(tmp_path) -> None:
+    strategy = ReversalV11()
+    strategy.state.chainlink_open_prices = {
+        "btc-updown-5m-100": Decimal("100"),
+        "btc-updown-5m-400": Decimal("101"),
+    }
+    strategy.state.active_round = ActiveRound(
+        round_id=7,
+        trend_side=Direction.UP,
+        failures=3,
+        cumulative_loss=Decimal("9.25"),
+    )
+    runtime = ReversalRuntime(
+        strategy=strategy,
+        state_path=tmp_path / "state.json",
+        winner_lookup=winners,
+        splitter=None,
+        trader=None,
+        signature_type=3,
+        live=False,
+    )
+
+    assert runtime.set_boundary_price_mode("twap30")
+    assert strategy.state.chainlink_price_mode == "twap30"
+    assert strategy.state.chainlink_open_prices == {}
+    assert strategy.state.active_round is not None
+    assert strategy.state.active_round.failures == 3
+    assert strategy.state.active_round.cumulative_loss == Decimal("9.25")
+    assert not runtime.set_boundary_price_mode("twap30")
+
+
 def test_live_runtime_bootstraps_two_results_splits_once_and_exits_trend(tmp_path) -> None:
     splitter = FakeSplitter()
     trader = FakeTrader()
@@ -1077,6 +1108,86 @@ def test_runtime_three_streak_requires_all_three_immediate_results(tmp_path) -> 
     assert splitter.calls == 1
 
 
+def test_gamma_backfill_restores_missing_four_streak_before_order(tmp_path) -> None:
+    market = replace(
+        MARKET,
+        slug="btc-updown-5m-1300",
+        token_ids=("202", "101"),
+    )
+    gamma_calls: list[str] = []
+
+    def finalized_gamma(slug: str) -> str | None:
+        gamma_calls.append(slug)
+        return "DOWN" if slug == "btc-updown-5m-100" else None
+
+    splitter = FakeSplitter()
+    strategy = ReversalV11(ReversalSettings(trigger_streak=4))
+    strategy.settle_window("btc-updown-5m-400", Direction.DOWN)
+    strategy.settle_window("btc-updown-5m-700", Direction.DOWN)
+    strategy.settle_window("btc-updown-5m-1000", Direction.DOWN)
+    runtime = ReversalRuntime(
+        strategy=strategy,
+        state_path=tmp_path / "state.json",
+        winner_lookup=finalized_gamma,
+        splitter=splitter,
+        trader=FakeTrader(),
+        signature_type=3,
+        live=True,
+    )
+
+    backfilled = runtime.backfill_immediate_gamma_results(market.slug)
+
+    assert backfilled == [("btc-updown-5m-100", "DOWN")]
+    assert gamma_calls == ["btc-updown-5m-100"]
+    assert runtime.strategy.state.recent_slugs == [
+        "btc-updown-5m-100",
+        "btc-updown-5m-400",
+        "btc-updown-5m-700",
+        "btc-updown-5m-1000",
+    ]
+    result = runtime.tick(
+        market=market,
+        up_book=UP_BOOK,
+        down_book=DOWN_BOOK,
+        health=HEALTHY,
+    )
+    assert result.status == "exit_complete"
+    assert result.plan is not None
+    assert result.plan.trend_side is Direction.DOWN
+    assert result.plan.retained_side is Direction.UP
+    assert splitter.calls == 1
+
+
+def test_gamma_backfill_keeps_window_waiting_until_result_is_final(tmp_path) -> None:
+    strategy = ReversalV11(ReversalSettings(trigger_streak=4))
+    strategy.settle_window("btc-updown-5m-400", Direction.DOWN)
+    strategy.settle_window("btc-updown-5m-700", Direction.DOWN)
+    strategy.settle_window("btc-updown-5m-1000", Direction.DOWN)
+    runtime = ReversalRuntime(
+        strategy=strategy,
+        state_path=tmp_path / "state.json",
+        winner_lookup=lambda slug: None,
+        splitter=FakeSplitter(),
+        trader=FakeTrader(),
+        signature_type=3,
+        live=True,
+    )
+
+    assert runtime.backfill_immediate_gamma_results("btc-updown-5m-1300") == []
+    assert runtime.strategy.state.recent_slugs == [
+        "btc-updown-5m-400",
+        "btc-updown-5m-700",
+        "btc-updown-5m-1000",
+    ]
+    waiting = runtime.tick(
+        market=replace(MARKET, slug="btc-updown-5m-1300"),
+        up_book=UP_BOOK,
+        down_book=DOWN_BOOK,
+        health=HEALTHY,
+    )
+    assert waiting.status == "waiting_chainlink_boundary_no_split"
+
+
 def test_chainlink_results_trigger_before_gamma_is_final(tmp_path) -> None:
     splitter = FakeSplitter()
     runtime = ReversalRuntime(
@@ -1165,7 +1276,147 @@ def test_gamma_mismatch_raises_and_remains_pending_for_manual_review(tmp_path) -
 
     assert "btc-updown-5m-100" not in restored.state.pending_gamma_results
     assert restored.state.gamma_mismatch_slugs == ["btc-updown-5m-100"]
+    assert restored.state.recent_results == [Direction.DOWN, Direction.UP]
+    assert restored.state.current_streak_side is Direction.UP
+    assert restored.state.current_streak == 1
     assert restored.metrics().api_order_errors == 1
+
+
+def test_gamma_correction_replaces_filled_direct_order_without_extra_loss_budget(
+    tmp_path,
+) -> None:
+    class CorrectionTrader(FakeTrader):
+        def __init__(self) -> None:
+            super().__init__()
+            self.balance = Decimal("5")
+
+        def conditional_balance(self, token_id, signature_type):
+            assert token_id == "202"
+            assert signature_type == 3
+            return self.balance
+
+        def sell_limit(
+            self, token_id, price, size, tick_size, neg_risk, order_type="GTC", **kwargs
+        ):
+            self.orders.append(("SELL", token_id, price, size, order_type))
+            self.balance -= size
+            return {
+                "status": "matched",
+                "makingAmount": str(size),
+                "takingAmount": str(size * price),
+            }
+
+        def buy_limit(
+            self, token_id, price, size, tick_size, neg_risk, order_type="GTC", **kwargs
+        ):
+            self.orders.append(("BUY", token_id, price, size, order_type))
+            return {
+                "status": "matched",
+                "makingAmount": str(size * price),
+                "takingAmount": str(size),
+            }
+
+    strategy = ReversalV11(ReversalSettings(trigger_streak=4))
+    strategy.state.recent_slugs = [
+        "btc-updown-5m-100",
+        "btc-updown-5m-400",
+        "btc-updown-5m-700",
+        "btc-updown-5m-1000",
+    ]
+    strategy.state.recent_results = [Direction.DOWN] * 4
+    strategy.state.active_round = ActiveRound(
+        round_id=9,
+        trend_side=Direction.UP,
+        awaiting_window="btc-updown-5m-1300",
+        execution_phase="direct_entry_complete",
+        split_transaction_hash="direct-buy",
+        exit_sold_shares=Decimal("5"),
+        exit_sell_proceeds=Decimal("2.90"),
+        planned_shares=Decimal("5"),
+    )
+    trader = CorrectionTrader()
+    recorded_orders: list[dict] = []
+    runtime = ReversalRuntime(
+        strategy=strategy,
+        state_path=tmp_path / "state.json",
+        winner_lookup=lambda slug: None,
+        splitter=None,
+        trader=trader,
+        signature_type=3,
+        live=True,
+        execution_mode="direct_buy",
+        order_callback=recorded_orders.append,
+    )
+
+    result = runtime.correct_gamma_mismatch_position(
+        market=replace(MARKET, slug="btc-updown-5m-1300"),
+        up_book=UP_BOOK,
+        down_book=DOWN_BOOK,
+        seconds_left=Decimal("120"),
+    )
+
+    assert result.status == "gamma_order_replaced"
+    assert trader.orders[0][:2] == ("SELL", "202")
+    assert trader.orders[1][:2] == ("BUY", "101")
+    assert [order["order_role"] for order in recorded_orders] == [
+        "gamma_correction_exit",
+        "gamma_correction_replacement",
+    ]
+    active = runtime.strategy.state.active_round
+    assert active is not None
+    assert active.trend_side is Direction.DOWN
+    assert active.target_side is Direction.UP
+    sell_proceeds = Decimal(recorded_orders[0]["response"]["takingAmount"])
+    buy_cost = Decimal(recorded_orders[1]["response"]["makingAmount"])
+    assert buy_cost + active.entry_fees <= sell_proceeds
+
+
+def test_gamma_correction_blocks_expensive_replacement_before_selling(tmp_path) -> None:
+    strategy = ReversalV11(ReversalSettings(trigger_streak=4))
+    strategy.state.recent_slugs = [
+        "btc-updown-5m-100",
+        "btc-updown-5m-400",
+        "btc-updown-5m-700",
+        "btc-updown-5m-1000",
+    ]
+    strategy.state.recent_results = [Direction.DOWN] * 4
+    strategy.state.active_round = ActiveRound(
+        round_id=10,
+        trend_side=Direction.UP,
+        awaiting_window="btc-updown-5m-1300",
+        execution_phase="direct_entry_complete",
+        split_transaction_hash="direct-buy",
+        exit_sold_shares=Decimal("5"),
+        exit_sell_proceeds=Decimal("2.90"),
+        planned_shares=Decimal("5"),
+    )
+
+    class NoOrderTrader(FakeTrader):
+        def conditional_balance(self, token_id, signature_type):
+            return Decimal("5")
+
+    trader = NoOrderTrader()
+    runtime = ReversalRuntime(
+        strategy=strategy,
+        state_path=tmp_path / "state.json",
+        winner_lookup=lambda slug: None,
+        splitter=None,
+        trader=trader,
+        signature_type=3,
+        live=True,
+        execution_mode="direct_buy",
+    )
+
+    result = runtime.correct_gamma_mismatch_position(
+        market=replace(MARKET, slug="btc-updown-5m-1300"),
+        up_book=book("101", "0.18", "0.81", "20"),
+        down_book=DOWN_BOOK,
+        seconds_left=Decimal("120"),
+    )
+
+    assert result.status == "gamma_correction_blocked"
+    assert "0.80" in (result.detail or "")
+    assert trader.orders == []
 
 
 def test_confirmed_legacy_unused_split_is_merged_for_recovery(tmp_path) -> None:

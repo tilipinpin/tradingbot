@@ -90,6 +90,46 @@ def test_four_streak_variant_rejects_mixed_or_non_adjacent_windows() -> None:
     assert gapped.plan_window("btc-updown-5m-1600", HEALTHY) is None
 
 
+def test_missing_window_resets_recent_results_and_streak() -> None:
+    strategy = ReversalV11(ReversalSettings(trigger_streak=4))
+    for epoch in (100, 400, 700):
+        strategy.settle_window(f"btc-updown-5m-{epoch}", Direction.UP)
+
+    strategy.settle_window("btc-updown-5m-1300", Direction.UP)
+
+    assert strategy.state.recent_slugs == ["btc-updown-5m-1300"]
+    assert strategy.state.recent_results == [Direction.UP]
+    assert strategy.state.current_streak == 1
+    assert strategy.plan_window("btc-updown-5m-1600", HEALTHY) is None
+
+
+def test_load_repairs_persisted_history_that_crosses_missing_windows(tmp_path) -> None:
+    state_path = tmp_path / "gapped.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "recent_slugs": [
+                    "btc-updown-5m-100",
+                    "btc-updown-5m-400",
+                    "btc-updown-5m-700",
+                    "btc-updown-5m-1300",
+                ],
+                "recent_results": ["UP", "UP", "UP", "UP"],
+                "last_settled_slug": "btc-updown-5m-1300",
+                "current_streak_side": "UP",
+                "current_streak": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = ReversalV11.load(state_path)
+
+    assert restored.state.recent_slugs == ["btc-updown-5m-1300"]
+    assert restored.state.recent_results == [Direction.UP]
+    assert restored.state.current_streak == 1
+
+
 def test_confirmed_first_split_counts_executed_round_once() -> None:
     strategy = ReversalV11()
     seed_two_up(strategy)

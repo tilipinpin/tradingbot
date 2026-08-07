@@ -143,6 +143,31 @@ def test_discord_notifier_sends_configured_mention() -> None:
     assert payload["allowed_mentions"] == {"parse": ["users", "roles"]}
 
 
+def test_discord_plain_text_preserves_telegram_settlement_format() -> None:
+    session = FakeSession()
+    notifier = DiscordNotifier(
+        "https://discord.com/api/webhooks/123456/secret_webhook_token",
+        session=session,
+    )
+    message = (
+        "🏁 Polymarket 交易已结算\n"
+        "结果: ✅ 盈利\n"
+        "本窗口净盈亏估算: +1.2500 pUSD\n"
+        "市场: btc-updown-5m-1"
+    )
+
+    sent, message_id = notifier.send_with_message_id(
+        message,
+        preserve_text_format=True,
+    )
+
+    assert sent is True
+    assert message_id == "discord-message-1"
+    payload = session.calls[0][1]
+    assert payload["content"] == message
+    assert "embeds" not in payload
+
+
 def test_discord_notifier_deletes_own_webhook_message() -> None:
     session = FakeSession()
     webhook = "https://discord.com/api/webhooks/123456/secret_webhook_token"
@@ -433,8 +458,9 @@ def test_reversal_retained_position_uses_window_pnl_notification_on_both_channel
     assert "轮次/阶段: 3/2" in telegram_text
     assert "本轮累计净盈亏估算: +1.1664 pUSD" in telegram_text
     assert len(discord_session.calls) == 1
-    discord_embed = discord_session.calls[0][1]["embeds"][0]
-    assert "✅ 盈利" in json.dumps(discord_embed, ensure_ascii=False)
+    discord_payload = discord_session.calls[0][1]
+    assert discord_payload["content"] == telegram_text
+    assert "embeds" not in discord_payload
     saved = json.loads(state.read_text())
     assert saved["settlement_windows"]["btc-updown-5m-700"][
         "notified_channels"

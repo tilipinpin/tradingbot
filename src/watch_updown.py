@@ -11,7 +11,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from requests import RequestException
 
 from src import __version__
+from src.crypto_resolution import CryptoResolutionMode, detect_crypto_resolution_mode
 from src.fair_value import btc_up_probability, choose_theoretical_action, estimate_sigma_per_sqrt_second
 from src.market_recorder import JsonlSnapshotWriter, build_snapshot
 from src.manual_trading import ManualTradeExecutor
@@ -260,6 +261,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum timestamp distance between a cached Chainlink sample and the exact market boundary.",
     )
     parser.add_argument(
+        "--crypto-resolution-mode",
+        choices=[mode.value for mode in CryptoResolutionMode],
+        default="auto",
+        help="Resolution source: auto from market rules, legacy boundary price, or Chainlink 30-second TWAP.",
+    )
+    parser.add_argument(
         "--official-open-confirmations",
         type=int,
         default=2,
@@ -412,6 +419,39 @@ def next_5m_slug(slug: str) -> str:
     return f"{match.group(1)}{int(match.group(2)) + 300}"
 
 
+def current_5m_slug(slug: str, now: datetime | None = None) -> str:
+    """Return the current wall-clock window while preserving the slug prefix."""
+    match = SLUG_PATTERN.match(slug)
+    if not match:
+        raise ValueError(f"Cannot derive current 5m slug from: {slug}")
+    observed_at = now or datetime.now(timezone.utc)
+    epoch = int(observed_at.timestamp()) // 300 * 300
+    return f"{match.group(1)}{epoch}"
+
+
+def argv_with_current_slug(argv: list[str], slug: str) -> list[str]:
+    """Replace the original --slug so an exec restart never replays stale windows."""
+    updated = list(argv)
+    for index, value in enumerate(updated):
+        if value == "--slug" and index + 1 < len(updated):
+            updated[index + 1] = slug
+            return updated
+        if value.startswith("--slug="):
+            updated[index] = f"--slug={slug}"
+            return updated
+    return ["--slug", slug, *updated]
+
+
+def weekly_restart_report_day(report_day: date) -> bool:
+    """Schedule the weekly restart after Sunday's UTC report (Monday 08:00 CST)."""
+    return report_day.weekday() == 6
+
+
+def weekly_restart_is_safe(state: Any) -> bool:
+    """Never restart after stage one has begun until the entire round is over."""
+    return state.active_round is None and state.prepared_split is None
+
+
 def load_updown_market(gamma: GammaClient, slug: str) -> Market | None:
     try:
         event = gamma.event_by_slug(slug)
@@ -468,6 +508,33 @@ def fetch_reversal_chainlink_open_prices(
             start_time + timedelta(seconds=300),
         ).open_price
     prices[market.slug] = current_open_price
+    return prices
+
+
+def fetch_reversal_twap_open_prices(
+    client: SpotPriceClient,
+    market: Market,
+    known_prices: dict[str, Decimal] | None = None,
+    lookback_windows: int = 2,
+    max_distance_ms: int = 1000,
+) -> dict[str, Decimal]:
+    """Read cached official TWAP observations nearest consecutive boundaries.
+
+    RTDS provides no history or replay. Missing boundary observations therefore
+    fail closed instead of falling back to the legacy spot boundary.
+    """
+    known = known_prices or {}
+    prices: dict[str, Decimal] = {}
+    for offset in range(lookback_windows, -1, -1):
+        slug = previous_5m_slug(market.slug, offset) if offset else market.slug
+        if slug in known:
+            prices[slug] = known[slug]
+            continue
+        boundary = market.event_start_time - timedelta(seconds=300 * offset)
+        prices[slug] = client.polymarket_chainlink_twap_near(
+            int(boundary.timestamp() * 1000),
+            max_distance_ms,
+        ).price
     return prices
 
 
@@ -2039,6 +2106,10 @@ def watch() -> None:
     clob = ClobDataClient(args.clob_host, timeout=args.market_data_timeout)
     trader: ClobTradingClient | None = None
     price_client = SpotPriceClient(args.price_source, timeout=args.market_data_timeout, ws_proxy=args.ws_proxy)
+    if args.crypto_resolution_mode != CryptoResolutionMode.LEGACY.value:
+        # RTDS has no snapshot or replay. Keep the TWAP stream hot before the
+        # first upgraded window so its exact opening boundary is already cached.
+        price_client.warm_polymarket_chainlink_twap()
     price_to_beat_client = PolymarketPriceToBeatClient(
         timeout=args.market_data_timeout,
         proxy_url=args.price_to_beat_proxy or args.ws_proxy,
@@ -2047,6 +2118,7 @@ def watch() -> None:
     slug = slug_from_value(args.slug)
     stop_at = float("inf") if args.duration == 0 else time.time() + args.duration
     current_market: Market | None = None
+    current_resolution_mode = CryptoResolutionMode.LEGACY
     start_price: Decimal | None = None
     open_price_tracker = StableOpenPriceTracker(
         required_confirmations=args.official_open_confirmations,
@@ -2168,8 +2240,10 @@ def watch() -> None:
     reversal_boundary_seeded_slug: str | None = None
     reversal_completed_attempts = 0
     reversal_pause_slug: str | None = None
-    reversal_daily_restart_pending = False
+    reversal_weekly_restart_pending = False
     maintenance_deferred_slug: str | None = None
+    next_gamma_open_retry_at = 0.0
+    reversal_execution_prewarm_slug: str | None = None
     live_summary = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
@@ -2626,7 +2700,7 @@ def watch() -> None:
         logger.info("DRY RUN mode. No orders will be submitted.")
 
     def run_slow_notification_maintenance(maintenance_slug: str) -> None:
-        nonlocal maintenance_deferred_slug, reversal_daily_restart_pending
+        nonlocal maintenance_deferred_slug, reversal_weekly_restart_pending
 
         if maintenance_deferred_slug is not None:
             logger.info(
@@ -2643,8 +2717,8 @@ def watch() -> None:
                 if reversal_runtime.send_daily_report_once(
                     report_day,
                     notifications.send_strategy_report,
-                ):
-                    reversal_daily_restart_pending = True
+                ) and weekly_restart_report_day(report_day):
+                    reversal_weekly_restart_pending = True
         except Exception as exc:
             # Notification maintenance must never alter the trading state or
             # interrupt the next order attempt.
@@ -2655,19 +2729,37 @@ def watch() -> None:
                 exc_info=True,
             )
 
+    def restart_with_current_window(status: str, reason: str) -> None:
+        restart_slug = current_5m_slug(slug)
+        live_summary["status"] = status
+        live_summary["restart_slug"] = restart_slug
+        write_live_summary()
+        notifications.stop(reason)
+        restart_argv = argv_with_current_slug(sys.argv[1:], restart_slug)
+        os.execv(
+            sys.executable,
+            [sys.executable, "-m", "src.watch_updown", *restart_argv],
+        )
+
+    def maybe_execute_weekly_restart() -> None:
+        if not reversal_weekly_restart_pending or reversal_runtime is None:
+            return
+        state = reversal_runtime.strategy.state
+        if not weekly_restart_is_safe(state):
+            return
+        restart_with_current_window(
+            "weekly_safe_restart",
+            "反转策略每周安全重启",
+        )
+
     while time.time() < stop_at:
         iteration_started_at = time.monotonic()
         poll_interval = float(args.interval)
         now = datetime.now(timezone.utc)
         notifications.update_runtime()
         if notifications.process_commands():
-            live_summary["status"] = "restarting"
-            write_live_summary()
             notifications.prepare_restart()
-            os.execv(
-                sys.executable,
-                [sys.executable, "-m", "src.watch_updown", *sys.argv[1:]],
-            )
+            restart_with_current_window("restarting", "手动重启")
         maintenance_ready = window_priority_initialization_complete(
             current_market,
             now,
@@ -2684,6 +2776,7 @@ def watch() -> None:
                 "WINDOW_PRIORITY_DEFERRED slug=%s; settlements and reports wait for the order path",
                 maintenance_slug,
             )
+        maybe_execute_weekly_restart()
         if args.paper_trading:
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
             if args.strategy == "late_favorite":
@@ -2729,8 +2822,18 @@ def watch() -> None:
                 )
                 slug = next_5m_slug(current_market.slug)
                 logger.info("Window ended. Looking for next slug: %s", slug)
+            wall_clock_slug = current_5m_slug(slug, now)
+            if int(slug.rpartition("-")[2]) < int(wall_clock_slug.rpartition("-")[2]):
+                logger.warning(
+                    "WINDOW_FAST_FORWARD stale_slug=%s current_slug=%s; "
+                    "missing windows will not be replayed as live windows",
+                    slug,
+                    wall_clock_slug,
+                )
+                slug = wall_clock_slug
             current_market = load_updown_market(gamma, slug)
             start_price = None
+            next_gamma_open_retry_at = 0.0
             reversal_boundary_seeded_slug = None
             reversal_completed_attempts = 0
             open_price_tracker.reset()
@@ -2757,6 +2860,37 @@ def watch() -> None:
                 )
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
+            current_resolution_mode = detect_crypto_resolution_mode(
+                current_market.rules_text,
+                args.crypto_resolution_mode,
+            )
+            if reversal_runtime is not None:
+                changed = reversal_runtime.set_boundary_price_mode(
+                    current_resolution_mode.value
+                )
+                if changed:
+                    logger.warning(
+                        "REVERSAL_BOUNDARY_MODE_CHANGED slug=%s mode=%s; old boundary cache cleared",
+                        current_market.slug,
+                        current_resolution_mode.value,
+                    )
+                if (
+                    current_resolution_mode is CryptoResolutionMode.TWAP_30
+                    and reversal_runtime.strategy.state.last_settled_slug
+                    == previous_5m_slug(current_market.slug)
+                ):
+                    reversal_boundary_seeded_slug = current_market.slug
+            if args.crypto_resolution_mode == "auto" and not current_market.rules_text:
+                logger.warning(
+                    "CRYPTO_RESOLUTION_RULES_MISSING slug=%s; retaining legacy mode",
+                    current_market.slug,
+                )
+            logger.info(
+                "CRYPTO_RESOLUTION_MODE slug=%s mode=%s configured=%s",
+                current_market.slug,
+                current_resolution_mode.value,
+                args.crypto_resolution_mode,
+            )
             if _seconds_to_end(current_market, datetime.now(timezone.utc)) <= 0:
                 logger.info("Skipping expired window: %s", current_market.slug)
                 slug = next_5m_slug(current_market.slug)
@@ -2837,6 +2971,59 @@ def watch() -> None:
 
         seconds_to_start = _seconds_to_start(current_market, now)
         seconds_to_end = _seconds_to_end(current_market, now)
+
+        # Warm the one likely retained token and the collateral snapshot before
+        # the window boundary. This keeps metadata and balance HTTP calls out of
+        # the order-critical path without polling every market unnecessarily.
+        if (
+            args.live_trading
+            and args.strategy in REVERSAL_STRATEGIES
+            and reversal_runtime is not None
+            and trader is not None
+            and Decimal("0") < seconds_to_end <= Decimal("15")
+        ):
+            next_order_slug = next_5m_slug(current_market.slug)
+            if reversal_execution_prewarm_slug != next_order_slug:
+                reversal_state = reversal_runtime.strategy.state
+                likely_trend_side: Direction | None = None
+                if reversal_state.active_round is not None:
+                    likely_trend_side = reversal_state.active_round.trend_side
+                else:
+                    needed = reversal_runtime.strategy.settings.trigger_streak - 1
+                    recent = reversal_state.recent_results[-needed:] if needed > 0 else []
+                    if recent and len(recent) == needed and len(set(recent)) == 1:
+                        likely_trend_side = recent[-1]
+                if likely_trend_side is not None:
+                    # Mark attempted first: a transient prefetch failure must not
+                    # block every final-second loop or compete with boundary work.
+                    reversal_execution_prewarm_slug = next_order_slug
+                    try:
+                        next_order_market = load_updown_market(gamma, next_order_slug)
+                        if next_order_market is None:
+                            raise LookupError(
+                                f"next reversal market unavailable: {next_order_slug}"
+                            )
+                        retained_index = 1 if likely_trend_side is Direction.UP else 0
+                        retained_token = next_order_market.token_ids[retained_index]
+                        trader.prewarm_market_order_metadata((retained_token,))
+                        prefetched_collateral = trader.refresh_collateral_balance(
+                            args.signature_type
+                        )
+                        logger.info(
+                            "REVERSAL_EXECUTION_PREWARM slug=%s token=%s "
+                            "collateral=%s seconds_left=%s",
+                            next_order_slug,
+                            retained_token,
+                            prefetched_collateral,
+                            seconds_to_end,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "REVERSAL_EXECUTION_PREWARM_FAILED slug=%s error=%s; "
+                            "normal order-path lookup remains available",
+                            next_order_slug,
+                            exc,
+                        )
         poll_interval = polling_interval_for_seconds_left(
             seconds_to_end,
             float(args.interval),
@@ -2899,7 +3086,11 @@ def watch() -> None:
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
         try:
-            spot = price_client.btc_usd()
+            spot = (
+                price_client.polymarket_chainlink_twap()
+                if current_resolution_mode is CryptoResolutionMode.TWAP_30
+                else price_client.btc_usd()
+            )
             if spot.observed_at is not None:
                 report_age = abs(int(time.time()) - spot.observed_at)
                 if report_age > args.max_spot_age:
@@ -2908,6 +3099,13 @@ def watch() -> None:
             last_spot_fetched_at = time.monotonic()
         except Exception as exc:
             notifications.notify_exception("Chainlink BTC 行情", exc, key="spot-price")
+            if current_resolution_mode is CryptoResolutionMode.TWAP_30:
+                logger.warning(
+                    "TWAP price unavailable; current window fails closed without legacy/cache fallback: %s",
+                    exc,
+                )
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
             if last_spot_price is None:
                 logger.warning("Spot price unavailable and no cached price exists: %s", exc)
                 sleep_until_next_poll(poll_interval, iteration_started_at)
@@ -2947,6 +3145,7 @@ def watch() -> None:
             and reversal_boundary_seeded_slug != current_market.slug
             and not notifications.trading_paused
             and reversal_completed_attempts < REVERSAL_COMPLETED_FAST_ATTEMPTS
+            and current_resolution_mode is CryptoResolutionMode.LEGACY
         ):
             reversal_completed_attempts += 1
             try:
@@ -3348,7 +3547,126 @@ def watch() -> None:
             sleep_until_next_poll(poll_interval, iteration_started_at)
             continue
 
-        if start_price is None:
+        if (
+            start_price is None
+            and current_resolution_mode is CryptoResolutionMode.TWAP_30
+        ):
+            elapsed_since_start = -seconds_to_start
+            boundary_timestamp_ms = int(current_market.event_start_time.timestamp() * 1000)
+            boundary_spot = None
+            boundary_source = "chainlink_twap_30_boundary"
+            try:
+                boundary_spot = price_client.polymarket_chainlink_twap_near(
+                    boundary_timestamp_ms,
+                    args.max_boundary_sample_offset_ms,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "TWAP_OPEN_BOUNDARY_PENDING slug=%s boundary_ms=%s error=%s; "
+                    "checking Gamma official priceToBeat without legacy fallback",
+                    current_market.slug,
+                    boundary_timestamp_ms,
+                    exc,
+                )
+                gamma_boundary_price = current_market.official_open_price
+                gamma_boundary_source = "gamma_official_price_to_beat"
+                if (
+                    gamma_boundary_price is None
+                    and time.monotonic() >= next_gamma_open_retry_at
+                ):
+                    next_gamma_open_retry_at = time.monotonic() + 2.0
+                    refreshed_market = load_updown_market(gamma, current_market.slug)
+                    if refreshed_market is not None:
+                        current_market = refreshed_market
+                        gamma_boundary_price = current_market.official_open_price
+                    if gamma_boundary_price is None:
+                        previous_market = load_updown_market(
+                            gamma,
+                            previous_5m_slug(current_market.slug),
+                        )
+                        if previous_market is not None:
+                            gamma_boundary_price = previous_market.official_final_price
+                            gamma_boundary_source = "gamma_previous_final_price"
+                if gamma_boundary_price is None:
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                start_price = gamma_boundary_price
+                boundary_offset_ms = None
+                boundary_source = gamma_boundary_source
+                logger.info(
+                    "GAMMA_OPEN_BOUNDARY slug=%s price=%s capture_delay=%ss",
+                    current_market.slug,
+                    start_price,
+                    elapsed_since_start,
+                )
+            else:
+                start_price = boundary_spot.price
+                boundary_offset_ms = (
+                    boundary_spot.observed_at_ms - boundary_timestamp_ms
+                )
+            if reversal_runtime is not None and args.strategy in REVERSAL_STRATEGIES:
+                boundary_outcomes = reversal_runtime.observe_chainlink_open_prices(
+                    {current_market.slug: start_price}
+                )
+                for result_slug, settlement_status in boundary_outcomes:
+                    result = reversal_runtime.strategy.state.pending_gamma_results.get(
+                        result_slug
+                    )
+                    logger.info(
+                        "REVERSAL_TWAP_RESULT slug=%s result=%s status=%s source=%s",
+                        result_slug,
+                        result.value if result is not None else "already_settled",
+                        settlement_status,
+                        boundary_source,
+                    )
+                if (
+                    reversal_runtime.strategy.state.last_settled_slug
+                    == previous_5m_slug(current_market.slug)
+                ):
+                    reversal_boundary_seeded_slug = current_market.slug
+                elif boundary_source.startswith("gamma_"):
+                    # Gamma backfill reconstructs any missing predecessor sequence
+                    # before tick; do not block it on unavailable RTDS history.
+                    reversal_boundary_seeded_slug = current_market.slug
+            alignment_record = {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "slug": current_market.slug,
+                "status": "TWAP_30_BOUNDARY",
+                "boundary_source": boundary_source,
+                "official_price_to_beat": str(start_price),
+                "boundary_chainlink_price": str(start_price),
+                "boundary_chainlink_timestamp_ms": (
+                    boundary_spot.observed_at_ms if boundary_spot is not None else None
+                ),
+                "boundary_offset_ms": boundary_offset_ms,
+                "alignment_difference": "0",
+                "boundary_error": None,
+                "capture_delay_seconds": str(elapsed_since_start),
+                "endpoint_timestamp_ms": None,
+                "endpoint_incomplete": None,
+            }
+            if boundary_spot is not None:
+                logger.info(
+                    "TWAP_OPEN_BOUNDARY slug=%s price=%s boundary_offset_ms=%s capture_delay=%ss",
+                    current_market.slug,
+                    start_price,
+                    boundary_offset_ms,
+                    elapsed_since_start,
+                )
+            if args.price_alignment_jsonl:
+                alignment_path = Path(args.price_alignment_jsonl)
+                alignment_path.parent.mkdir(parents=True, exist_ok=True)
+                with alignment_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(alignment_record, ensure_ascii=True) + "\n")
+            prices = [spot.price]
+            price_sample_times = [time.monotonic()]
+            logger.info(
+                "Captured official price_to_beat=%s for %s source=%s",
+                start_price,
+                current_market.slug,
+                boundary_source,
+            )
+        elif start_price is None:
             elapsed_since_start = -seconds_to_start
             try:
                 price_to_beat = price_to_beat_client.fetch(
@@ -3394,9 +3712,16 @@ def watch() -> None:
                 boundary_spot = None
                 boundary_error: str | None = None
                 try:
-                    boundary_spot = price_client.polymarket_chainlink_price_near(
-                        boundary_timestamp_ms,
-                        args.max_boundary_sample_offset_ms,
+                    boundary_spot = (
+                        price_client.polymarket_chainlink_twap_near(
+                            boundary_timestamp_ms,
+                            args.max_boundary_sample_offset_ms,
+                        )
+                        if current_resolution_mode is CryptoResolutionMode.TWAP_30
+                        else price_client.polymarket_chainlink_price_near(
+                            boundary_timestamp_ms,
+                            args.max_boundary_sample_offset_ms,
+                        )
                     )
                 except Exception as exc:
                     boundary_error = str(exc)
@@ -3488,13 +3813,22 @@ def watch() -> None:
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
             try:
-                chainlink_open_prices = fetch_reversal_chainlink_open_prices(
-                    price_to_beat_client,
-                    current_market,
-                    start_price,
-                    reversal_runtime.strategy.state.chainlink_open_prices,
-                    reversal_runtime.strategy.settings.trigger_streak,
-                )
+                if current_resolution_mode is CryptoResolutionMode.TWAP_30:
+                    chainlink_open_prices = fetch_reversal_twap_open_prices(
+                        price_client,
+                        current_market,
+                        reversal_runtime.strategy.state.chainlink_open_prices,
+                        1,
+                        args.max_boundary_sample_offset_ms,
+                    )
+                else:
+                    chainlink_open_prices = fetch_reversal_chainlink_open_prices(
+                        price_to_beat_client,
+                        current_market,
+                        start_price,
+                        reversal_runtime.strategy.state.chainlink_open_prices,
+                        reversal_runtime.strategy.settings.trigger_streak,
+                    )
                 boundary_outcomes = reversal_runtime.observe_chainlink_open_prices(
                     chainlink_open_prices
                 )
@@ -3520,10 +3854,15 @@ def watch() -> None:
                     result_slug
                 )
                 logger.info(
-                    "REVERSAL_CHAINLINK_RESULT slug=%s result=%s status=%s source=official_open_boundary",
+                    "REVERSAL_CHAINLINK_RESULT slug=%s result=%s status=%s source=%s",
                     result_slug,
                     result.value if result is not None else "already_settled",
                     settlement_status,
+                    (
+                        "chainlink_twap_30_boundary"
+                        if current_resolution_mode is CryptoResolutionMode.TWAP_30
+                        else "official_open_boundary"
+                    ),
                 )
 
         sigma = estimate_sigma_per_sqrt_second(
@@ -3696,6 +4035,19 @@ def watch() -> None:
                         current_market.slug,
                     )
                 reversal_state = reversal_runtime.strategy.state
+                if reversal_state.active_round is None:
+                    gamma_backfills = (
+                        reversal_runtime.backfill_immediate_gamma_results(
+                            current_market.slug
+                        )
+                    )
+                    for backfilled_slug, backfilled_result in gamma_backfills:
+                        logger.info(
+                            "REVERSAL_GAMMA_BACKFILL slug=%s result=%s "
+                            "phase=pre_order_missing_history",
+                            backfilled_slug,
+                            backfilled_result,
+                        )
                 next_amount = reversal_runtime.strategy.opening_split_amount(
                     current_market.slug
                 )
@@ -3753,6 +4105,11 @@ def watch() -> None:
                 if reversal_result.status in {
                     "entry_complete",
                     "entry_reconciled",
+                    "entry_partial",
+                    "entry_unmatched",
+                    "entry_amount_rejected",
+                    "entry_book_pending",
+                    "entry_balance_insufficient",
                     "exit_complete",
                     "awaiting_settlement",
                     "exit_reconciled",
@@ -3779,18 +4136,7 @@ def watch() -> None:
                     reversal_result.status
                 ):
                     run_slow_notification_maintenance(maintenance_slug)
-                if (
-                    reversal_daily_restart_pending
-                    and reversal_runtime.strategy.state.active_round is None
-                    and reversal_runtime.strategy.state.prepared_split is None
-                ):
-                    live_summary["status"] = "daily_safe_restart"
-                    write_live_summary()
-                    notifications.stop("反转策略日报安全重启")
-                    os.execv(
-                        sys.executable,
-                        [sys.executable, "-m", "src.watch_updown", *sys.argv[1:]],
-                    )
+                maybe_execute_weekly_restart()
             except Exception as exc:
                 live_summary["error"] = f"{type(exc).__name__}: {exc}"
                 notifications.notify_exception(
@@ -3804,6 +4150,42 @@ def watch() -> None:
                 if isinstance(exc, GammaResultMismatch):
                     reversal_runtime.quarantine_gamma_mismatch(exc)
                     reversal_pause_slug = current_market.slug
+                    try:
+                        correction_result = (
+                            reversal_runtime.correct_gamma_mismatch_position(
+                                market=current_market,
+                                up_book=up_book,
+                                down_book=down_book,
+                                seconds_left=Decimal(str(max(0.0, seconds_to_end))),
+                            )
+                        )
+                        logger.warning(
+                            "REVERSAL_GAMMA_CORRECTION slug=%s result_slug=%s "
+                            "status=%s detail=%s",
+                            current_market.slug,
+                            exc.slug,
+                            correction_result.status,
+                            correction_result.detail,
+                        )
+                        if correction_result.order is not None:
+                            live_summary["orders"].append(correction_result.order)
+                            live_orders_submitted += 1
+                            live_summary["order_attempts"] = live_orders_submitted
+                            if live_response_is_matched(
+                                correction_result.order.get("response"),
+                                require_fill_amounts=True,
+                            ):
+                                live_orders_matched += 1
+                                live_summary["matched_orders"] = live_orders_matched
+                            write_live_summary(finalize=False)
+                    except Exception as correction_exc:
+                        logger.exception(
+                            "REVERSAL_GAMMA_CORRECTION_FAILED slug=%s result_slug=%s "
+                            "error=%s; current window remains paused",
+                            current_market.slug,
+                            exc.slug,
+                            correction_exc,
+                        )
                     logger.error(
                         "REVERSAL_GAMMA_WINDOW_PAUSE_SET slug=%s result_slug=%s; "
                         "global trading remains enabled",

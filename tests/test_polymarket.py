@@ -48,6 +48,7 @@ from src.watch_updown import (
     executable_ask_depth,
     fetch_reversal_completed_window_prices,
     fetch_reversal_chainlink_open_prices,
+    fetch_reversal_twap_open_prices,
     choose_fair_value_edge_signal,
     choose_open_060_signal,
     choose_smart_score_signal,
@@ -79,10 +80,72 @@ from src.watch_updown import (
     shrink_probability_toward_even,
     strategy_trade_limit,
     AutoTradeSignal,
+    argv_with_current_slug,
+    current_5m_slug,
     next_5m_slug,
     slug_from_value,
+    weekly_restart_report_day,
+    weekly_restart_is_safe,
     parse_args as parse_watch_args,
 )
+
+
+def test_current_window_slug_and_restart_argv_replace_stale_slug() -> None:
+    now = datetime(2026, 8, 7, 0, 10, 42, tzinfo=timezone.utc)
+    slug = current_5m_slug("btc-updown-5m-1785896100", now)
+
+    assert slug == "btc-updown-5m-1786061400"
+    assert argv_with_current_slug(
+        ["--slug", "btc-updown-5m-1785896100", "--duration", "0"],
+        slug,
+    ) == ["--slug", slug, "--duration", "0"]
+
+
+def test_weekly_restart_is_scheduled_from_sunday_report_only() -> None:
+    assert weekly_restart_report_day(datetime(2026, 8, 9, tzinfo=timezone.utc).date())
+    assert not weekly_restart_report_day(datetime(2026, 8, 8, tzinfo=timezone.utc).date())
+
+
+def test_weekly_restart_waits_for_first_stage_round_to_finish() -> None:
+    idle = type("State", (), {"active_round": None, "prepared_split": None})()
+    stage_one = type("State", (), {"active_round": object(), "prepared_split": None})()
+    presplit = type("State", (), {"active_round": None, "prepared_split": object()})()
+
+    assert weekly_restart_is_safe(idle)
+    assert not weekly_restart_is_safe(stage_one)
+    assert not weekly_restart_is_safe(presplit)
+
+
+def test_gamma_market_collects_resolution_rules(monkeypatch) -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return [
+                {
+                    "title": "BTC Up or Down",
+                    "slug": "btc-updown-5m-100",
+                    "description": "Uses a 30-second TWAP.",
+                    "markets": [
+                        {
+                            "question": "BTC Up or Down",
+                            "slug": "btc-updown-5m-100",
+                            "conditionId": "0xcondition",
+                            "clobTokenIds": '["1", "2"]',
+                            "outcomes": '["Up", "Down"]',
+                            "resolutionSource": "Chainlink",
+                        }
+                    ],
+                }
+            ]
+
+    monkeypatch.setattr("src.polymarket.requests.get", lambda *args, **kwargs: Response())
+
+    market = GammaClient().event_by_slug("btc-updown-5m-100").markets[0]
+
+    assert "30-second TWAP" in market.rules_text
+    assert "Chainlink" in market.rules_text
 
 
 def test_http_rate_limit_detection_requires_429_response() -> None:
@@ -195,6 +258,51 @@ def test_fetch_reversal_chainlink_boundaries_supports_four_window_trigger() -> N
         "btc-updown-5m-1000",
         "btc-updown-5m-1300",
     ]
+
+
+def test_fetch_reversal_twap_boundaries_uses_only_cached_official_samples() -> None:
+    class FakeTwapClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def polymarket_chainlink_twap_near(self, timestamp_ms, max_distance_ms):
+            self.calls.append((timestamp_ms, max_distance_ms))
+            return SpotPrice(
+                "BTC/USD",
+                Decimal(timestamp_ms) / Decimal("1000"),
+                "POLYMARKET_CHAINLINK_TWAP_30",
+                observed_at_ms=timestamp_ms,
+            )
+
+    start = datetime.fromtimestamp(1300, timezone.utc)
+    market = Market(
+        "BTC Up or Down",
+        "btc-updown-5m-1300",
+        "0xcondition",
+        ("101", "202"),
+        "0.01",
+        False,
+        Decimal("100"),
+        ("Up", "Down"),
+        start,
+        start + timedelta(seconds=300),
+    )
+    client = FakeTwapClient()
+
+    prices = fetch_reversal_twap_open_prices(
+        client,
+        market,
+        known_prices={"btc-updown-5m-700": Decimal("700.25")},
+        lookback_windows=2,
+        max_distance_ms=750,
+    )
+
+    assert prices == {
+        "btc-updown-5m-700": Decimal("700.25"),
+        "btc-updown-5m-1000": Decimal("1000"),
+        "btc-updown-5m-1300": Decimal("1300"),
+    }
+    assert client.calls == [(1000000, 750), (1300000, 750)]
 
 
 def test_fetch_reversal_completed_prices_only_returns_final_missing_windows() -> None:
@@ -445,6 +553,10 @@ def test_event_by_slug_parses_nested_markets(monkeypatch) -> None:
                 {
                     "title": "Bitcoin daily",
                     "slug": "bitcoin-daily",
+                    "eventMetadata": {
+                        "priceToBeat": 64367.84616391988,
+                        "finalPrice": 64278.69396114934,
+                    },
                     "markets": [
                         {
                             "question": "Will Bitcoin be above $100,000?",
@@ -469,6 +581,8 @@ def test_event_by_slug_parses_nested_markets(monkeypatch) -> None:
     assert len(event.markets) == 1
     assert event.markets[0].token_ids == ("yes", "no")
     assert event.markets[0].outcomes == ("Yes", "No")
+    assert event.markets[0].official_open_price == Decimal("64367.84616391988")
+    assert event.markets[0].official_final_price == Decimal("64278.69396114934")
 
 
 def test_strategy_builds_intent_under_max_price() -> None:
@@ -1021,6 +1135,29 @@ def test_trading_quote_selects_best_prices_from_v2_book_order() -> None:
     trader.client = Client()
 
     assert trader.quote("up") == OrderBookQuote(bid=Decimal("0.46"), ask=Decimal("0.47"))
+
+
+def test_market_order_metadata_prewarm_populates_each_unique_token() -> None:
+    calls = []
+
+    class Client:
+        def get_tick_size(self, token_id):
+            calls.append(token_id)
+            return "0.01"
+
+    trader = object.__new__(ClobTradingClient)
+    trader.client = Client()
+
+    trader.prewarm_market_order_metadata(("up", "down", "up"))
+
+    assert calls == ["up", "down"]
+
+
+def test_collateral_balance_uses_fresh_prefetched_value() -> None:
+    trader = object.__new__(ClobTradingClient)
+    trader._collateral_balance_cache = (3, time.monotonic(), Decimal("12.34"))
+
+    assert trader.collateral_balance(3) == Decimal("12.34")
 
 
 def test_live_session_defaults_to_unlimited_orders_and_two_per_window(monkeypatch) -> None:

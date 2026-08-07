@@ -246,6 +246,7 @@ class ReversalState:
     current_streak_side: Direction | None = None
     current_streak: int = 0
     last_settled_slug: str | None = None
+    chainlink_price_mode: str = "legacy"
     chainlink_open_prices: dict[str, Decimal] = field(default_factory=dict)
     pending_gamma_results: dict[str, Direction] = field(default_factory=dict)
     gamma_verified_slugs: list[str] = field(default_factory=list)
@@ -518,6 +519,18 @@ class ReversalV11:
         result = Direction(result)
         if window_slug == self.state.last_settled_slug:
             return "duplicate_ignored"
+        previous_epoch: int | None = None
+        current_epoch = int(window_slug.rpartition("-")[2])
+        if self.state.last_settled_slug is not None:
+            previous_epoch = int(self.state.last_settled_slug.rpartition("-")[2])
+            if current_epoch <= previous_epoch:
+                return "duplicate_ignored"
+        continuous = previous_epoch is None or current_epoch == previous_epoch + 300
+        if not continuous:
+            self.state.recent_results = []
+            self.state.recent_slugs = []
+            self.state.current_streak_side = None
+            self.state.current_streak = 0
         self.state.last_settled_slug = window_slug
         self.state.recent_results = (
             self.state.recent_results + [result]
@@ -1003,6 +1016,7 @@ class ReversalV11:
             ),
             current_streak=int(payload.get("current_streak", 0)),
             last_settled_slug=payload.get("last_settled_slug"),
+            chainlink_price_mode=str(payload.get("chainlink_price_mode", "legacy")),
             chainlink_open_prices={
                 str(slug): Decimal(str(price))
                 for slug, price in (payload.get("chainlink_open_prices") or {}).items()
@@ -1021,6 +1035,7 @@ class ReversalV11:
             reported_days=[str(value) for value in payload.get("reported_days", [])],
             daily=daily,
         )
+        _normalize_recent_continuity(state)
         return cls(settings=settings, state=state)
 
     def execute_complete_set(
@@ -1129,3 +1144,40 @@ def _are_immediate_predecessors(
     return recent_epochs == [
         current_epoch - 300 * offset for offset in range(count, 0, -1)
     ]
+
+
+def _normalize_recent_continuity(state: ReversalState) -> None:
+    """Trim persisted trend history to its trailing gap-free sequence."""
+    pair_count = min(len(state.recent_slugs), len(state.recent_results))
+    pairs = list(
+        zip(
+            state.recent_slugs[-pair_count:],
+            state.recent_results[-pair_count:],
+        )
+    )
+    if not pairs or pairs[-1][0] != state.last_settled_slug:
+        state.recent_slugs = []
+        state.recent_results = []
+        state.current_streak_side = None
+        state.current_streak = 0
+        return
+    start = len(pairs) - 1
+    while start > 0:
+        previous_epoch = int(pairs[start - 1][0].rpartition("-")[2])
+        current_epoch = int(pairs[start][0].rpartition("-")[2])
+        if current_epoch != previous_epoch + 300:
+            break
+        start -= 1
+    if start == 0:
+        return
+    trailing = pairs[start:]
+    state.recent_slugs = [slug for slug, _ in trailing]
+    state.recent_results = [result for _, result in trailing]
+    final_side = trailing[-1][1]
+    streak = 0
+    for _, result in reversed(trailing):
+        if result is not final_side:
+            break
+        streak += 1
+    state.current_streak_side = final_side
+    state.current_streak = streak

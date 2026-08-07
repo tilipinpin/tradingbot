@@ -779,16 +779,39 @@ class DiscordNotifier:
     def enabled(self) -> bool:
         return bool(self.webhook_url)
 
-    def send_with_message_id(self, message: str) -> tuple[bool, str | None]:
+    def send_with_message_id(
+        self,
+        message: str,
+        *,
+        preserve_text_format: bool = False,
+    ) -> tuple[bool, str | None]:
         if not self.enabled:
             return False, None
         payload: dict[str, Any] = {
-            "embeds": [build_discord_embed(message)],
             "username": self.username,
             "allowed_mentions": {"parse": self.allowed_mentions},
         }
-        if self.mention:
-            payload["content"] = self.mention
+        sanitized = sanitize_sensitive_text(message)
+        if preserve_text_format:
+            content = "\n".join(part for part in (self.mention, sanitized) if part)
+            if len(content) <= 2000:
+                payload["content"] = content
+            else:
+                # Normal settlement messages are comfortably below Discord's
+                # 2,000-character content limit. Keep every line in order for
+                # an unusually large window by using one unstructured embed.
+                payload["embeds"] = [
+                    {
+                        "description": _truncate_discord(sanitized, 4096),
+                        "color": _discord_embed_color(sanitized),
+                    }
+                ]
+                if self.mention:
+                    payload["content"] = self.mention
+        else:
+            payload["embeds"] = [build_discord_embed(sanitized)]
+            if self.mention:
+                payload["content"] = self.mention
         try:
             separator = "&" if "?" in self.webhook_url else "?"
             response = self.session.post(
@@ -969,7 +992,10 @@ class TradingNotificationService:
         if channel == "telegram":
             return self.notifier.send(message, reply_markup=telegram_reply_markup)
         if channel == "discord":
-            sent, message_id = self.discord_notifier.send_with_message_id(message)
+            sent, message_id = self.discord_notifier.send_with_message_id(
+                message,
+                preserve_text_format=discord_message_kind == "settlement",
+            )
             if sent and message_id and discord_retention_seconds is not None:
                 self._schedule_discord_deletion(
                     message_id,

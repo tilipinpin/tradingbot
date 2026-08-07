@@ -8,10 +8,30 @@ readonly RUNTIME="$APP_ROOT/runtime"
 readonly DATA_DIR="$APP_ROOT/data"
 readonly ENV_FILE="/Users/tianliuping/Documents/tradingbot/.env"
 readonly PYTHON="/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"
+readonly PROXY_WAIT_SECONDS=60
+readonly PROXY_HEALTH="$APP_ROOT/proxy-health.sh"
+
+source "$PROXY_HEALTH"
 
 now=$(/bin/date +%s)
 slug=${1:-btc-updown-5m-$((now / 300 * 300))}
 cd "$RUNTIME"
+
+if ! proxy_wait_ready "$PROXY_WAIT_SECONDS" 0; then
+  print -u2 -- "Local proxy did not become healthy within ${PROXY_WAIT_SECONDS}s; refusing to start live trading"
+  exit 1
+fi
+if polymarket_proxy_is_eligible; then
+  :
+else
+  status=$?
+  if (( status == 2 )); then
+    print -u2 -- "Polymarket proxy egress is geo-blocked; refusing to start live trading"
+  else
+    print -u2 -- "Polymarket proxy eligibility could not be verified; refusing to start live trading"
+  fi
+  exit 1
+fi
 
 export PYTHONUNBUFFERED=1
 export TELEGRAM_TRADE_LEDGER="$DATA_DIR/live_trade_events.jsonl"
@@ -25,6 +45,7 @@ exec "$PYTHON" -u -m src.watch_updown \
   --live-trading \
   --strategy reversal_v11_four_streak \
   --price-source POLYMARKET_CHAINLINK \
+  --crypto-resolution-mode auto \
   --ws-proxy http://127.0.0.1:7897 \
   --price-to-beat-proxy socks5h://127.0.0.1:7898 \
   --price-alignment-jsonl "$DATA_DIR/live_price_alignment.jsonl" \

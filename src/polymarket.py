@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -11,6 +11,7 @@ import requests
 
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+COLLATERAL_BALANCE_CACHE_TTL_SECONDS = 20.0
 
 
 class OrderQuoteExpiredError(TimeoutError):
@@ -29,6 +30,9 @@ class Market:
     outcomes: tuple[str, str]
     event_start_time: datetime | None
     end_time: datetime | None
+    rules_text: str = ""
+    official_open_price: Decimal | None = None
+    official_final_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,12 @@ def _market_from_payload(item: dict[str, Any]) -> Market | None:
     if token_ids is None or not condition_id:
         return None
 
+    rules_parts = (
+        item.get("description"),
+        item.get("rules"),
+        item.get("resolutionSource"),
+        item.get("resolution_source"),
+    )
     return Market(
         question=str(item.get("question") or ""),
         slug=str(item.get("slug") or ""),
@@ -120,6 +130,7 @@ def _market_from_payload(item: dict[str, Any]) -> Market | None:
         outcomes=_parse_outcomes(item.get("outcomes")),
         event_start_time=_parse_datetime(item.get("eventStartTime")),
         end_time=_parse_datetime(item.get("endDate") or item.get("endDateIso")),
+        rules_text="\n".join(str(part) for part in rules_parts if part),
     )
 
 
@@ -161,8 +172,35 @@ class GammaClient:
             raise LookupError(f"No Polymarket event found for slug: {slug}")
 
         item = events[0]
+        event_metadata = item.get("eventMetadata") or {}
+        official_open_price = (
+            _parse_decimal(event_metadata.get("priceToBeat"))
+            if isinstance(event_metadata, dict)
+            and event_metadata.get("priceToBeat") not in (None, "")
+            else None
+        )
+        official_final_price = (
+            _parse_decimal(event_metadata.get("finalPrice"))
+            if isinstance(event_metadata, dict)
+            and event_metadata.get("finalPrice") not in (None, "")
+            else None
+        )
         markets = tuple(
-            market
+            replace(
+                market,
+                rules_text="\n".join(
+                    part
+                    for part in (
+                        market.rules_text,
+                        str(item.get("description") or ""),
+                        str(item.get("rules") or ""),
+                        str(item.get("resolutionSource") or ""),
+                    )
+                    if part
+                ),
+                official_open_price=official_open_price,
+                official_final_price=official_final_price,
+            )
             for payload in item.get("markets", [])
             if isinstance(payload, dict)
             if (market := _market_from_payload(payload))
@@ -288,6 +326,7 @@ class ClobTradingClient(ClobDataClient):
                 signature_type=signature_type,
                 funder=funder_address,
             )
+        self._collateral_balance_cache: tuple[int, float, Decimal] | None = None
 
     def quote(self, token_id: str) -> OrderBookQuote:
         book = self.client.get_order_book(token_id)
@@ -307,6 +346,11 @@ class ClobTradingClient(ClobDataClient):
         elif hasattr(self.client, "get_version"):
             self.client.get_version()
 
+    def prewarm_market_order_metadata(self, token_ids: tuple[str, ...]) -> None:
+        """Fill SDK token metadata caches before an order reaches the hot path."""
+        for token_id in dict.fromkeys(token_ids):
+            self.client.get_tick_size(token_id)
+
     def conditional_balance(self, token_id: str, signature_type: int) -> Decimal:
         try:
             from py_clob_client_v2 import AssetType, BalanceAllowanceParams
@@ -321,7 +365,7 @@ class ClobTradingClient(ClobDataClient):
         payload = self.client.get_balance_allowance(params)
         return Decimal(str(payload.get("balance") or "0")) / Decimal("1000000")
 
-    def collateral_balance(self, signature_type: int) -> Decimal:
+    def refresh_collateral_balance(self, signature_type: int) -> Decimal:
         try:
             from py_clob_client_v2 import AssetType, BalanceAllowanceParams
         except ImportError:
@@ -332,7 +376,21 @@ class ClobTradingClient(ClobDataClient):
         )
         self.client.update_balance_allowance(params)
         payload = self.client.get_balance_allowance(params)
-        return Decimal(str(payload.get("balance") or "0")) / Decimal("1000000")
+        balance = Decimal(str(payload.get("balance") or "0")) / Decimal("1000000")
+        self._collateral_balance_cache = (signature_type, time.monotonic(), balance)
+        return balance
+
+    def collateral_balance(self, signature_type: int) -> Decimal:
+        cached = getattr(self, "_collateral_balance_cache", None)
+        if cached is not None:
+            cached_signature_type, cached_at, cached_balance = cached
+            if (
+                cached_signature_type == signature_type
+                and time.monotonic() - cached_at
+                <= COLLATERAL_BALANCE_CACHE_TTL_SECONDS
+            ):
+                return cached_balance
+        return self.refresh_collateral_balance(signature_type)
 
     def open_orders(self) -> list[Any]:
         return list(self.client.get_open_orders() or [])
@@ -428,6 +486,9 @@ class ClobTradingClient(ClobDataClient):
         submit_not_after_monotonic: float | None,
         post_only: bool,
     ) -> dict[str, Any]:
+        # Any accepted BUY or SELL can change available collateral. Invalidate
+        # the short-lived prefetch before submission so a retry cannot reuse it.
+        self._collateral_balance_cache = None
         selected_order_type = getattr(OrderType, order_type.upper())
         order_args = OrderArgs(
             token_id=token_id,

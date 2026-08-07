@@ -47,6 +47,7 @@ class SpotPriceClient:
         self.timeout = timeout
         self.ws_proxy = ws_proxy
         self._polymarket_stream: PolymarketChainlinkStream | None = None
+        self._polymarket_twap_stream: PolymarketChainlinkTwapStream | None = None
         self._polymarket_failures = 0
 
     def btc_usd(self) -> SpotPrice:
@@ -85,6 +86,31 @@ class SpotPriceClient:
         if self._polymarket_stream is None:
             raise RuntimeError("Polymarket Chainlink stream has not started")
         return self._polymarket_stream.price_near(timestamp_ms, max_distance_ms)
+
+    def polymarket_chainlink_twap(self) -> SpotPrice:
+        if self._polymarket_twap_stream is None:
+            self._polymarket_twap_stream = PolymarketChainlinkTwapStream(
+                timeout=self.timeout,
+                proxy_url=self.ws_proxy,
+            )
+        return self._polymarket_twap_stream.btc_usd()
+
+    def warm_polymarket_chainlink_twap(self) -> None:
+        if self._polymarket_twap_stream is None:
+            self._polymarket_twap_stream = PolymarketChainlinkTwapStream(
+                timeout=self.timeout,
+                proxy_url=self.ws_proxy,
+            )
+        self._polymarket_twap_stream.start()
+
+    def polymarket_chainlink_twap_near(
+        self,
+        timestamp_ms: int,
+        max_distance_ms: int,
+    ) -> SpotPrice:
+        if self._polymarket_twap_stream is None:
+            raise RuntimeError("Polymarket Chainlink 30-second TWAP stream has not started")
+        return self._polymarket_twap_stream.price_near(timestamp_ms, max_distance_ms)
 
     def _btc_usd_from_source(self, source: str) -> SpotPrice:
         if source == "POLYMARKET_CHAINLINK":
@@ -249,10 +275,7 @@ class PolymarketChainlinkStream:
         )
 
     def btc_usd(self) -> SpotPrice:
-        with self._lock:
-            if not self._started:
-                self._started = True
-                threading.Thread(target=self._run, name="polymarket-chainlink", daemon=True).start()
+        self.start()
         initial_stream_timeout = max(12, self.timeout)
         if not self._ready.wait(initial_stream_timeout):
             detail = f": {self._last_error}" if self._last_error else ""
@@ -263,6 +286,12 @@ class PolymarketChainlinkStream:
         if latest.observed_at is None or int(time.time()) - latest.observed_at > self.max_stale_seconds:
             raise RuntimeError("Polymarket Chainlink BTC/USD stream is stale")
         return latest
+
+    def start(self) -> None:
+        with self._lock:
+            if not self._started:
+                self._started = True
+                threading.Thread(target=self._run, name="polymarket-chainlink", daemon=True).start()
 
     def price_near(self, timestamp_ms: int, max_distance_ms: int) -> SpotPrice:
         if max_distance_ms < 0:
@@ -346,6 +375,50 @@ class PolymarketChainlinkStream:
                 with self._lock:
                     self._last_error = str(exc)
                 await asyncio.sleep(1)
+
+
+class PolymarketChainlinkTwapStream(PolymarketChainlinkStream):
+    """Official RTDS BTC/USD 30-second TWAP using its exact E18 value."""
+
+    SUBSCRIPTION = {
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "crypto_prices_twap_thirty",
+                "type": "update",
+                "filters": '{"symbol":"btc/usd"}',
+            }
+        ],
+    }
+
+    def __init__(self, timeout: int = 5, proxy_url: str | None = None, max_stale_seconds: int = 45) -> None:
+        super().__init__(timeout=timeout, proxy_url=proxy_url, max_stale_seconds=max_stale_seconds)
+        self._history = deque(maxlen=16384)
+
+    @staticmethod
+    def parse_message(message: str) -> SpotPrice | None:
+        envelope = json.loads(message)
+        if envelope.get("topic") != "crypto_prices_twap_thirty" or envelope.get("type") != "update":
+            return None
+        payload = envelope.get("payload") or {}
+        if str(payload.get("symbol", "")).lower() != "btc/usd":
+            return None
+        if int(payload.get("window_s", 0)) != 30:
+            return None
+        exact = payload.get("full_accuracy_value")
+        if exact is None:
+            raise ValueError("Chainlink TWAP update omitted full_accuracy_value")
+        price = Decimal(str(exact)) / Decimal(10**18)
+        if price <= 0:
+            raise ValueError("Chainlink TWAP update contains a non-positive price")
+        timestamp_ms = int(payload["timestamp"])
+        return SpotPrice(
+            symbol="BTC/USD",
+            price=price,
+            source="POLYMARKET_CHAINLINK_TWAP_30",
+            observed_at=timestamp_ms // 1000,
+            observed_at_ms=timestamp_ms,
+        )
 
 
 def extract_price_threshold(text: str) -> Decimal | None:
