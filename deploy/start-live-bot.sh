@@ -34,6 +34,9 @@ else
 fi
 
 export PYTHONUNBUFFERED=1
+export TELEGRAM_PROXY="socks5h://127.0.0.1:7898"
+export TELEGRAM_FALLBACK_PROXY="http://127.0.0.1:7897"
+export TELEGRAM_TIMEOUT="20"
 export TELEGRAM_TRADE_LEDGER="$DATA_DIR/live_trade_events.jsonl"
 export TELEGRAM_DAILY_STATE="$DATA_DIR/telegram_daily_state.json"
 
@@ -43,7 +46,7 @@ exec "$PYTHON" -u -m src.watch_updown \
   --interval 5 \
   --auto-trade \
   --live-trading \
-  --strategy reversal_v11_four_streak \
+  --strategy reversal_three_16 \
   --price-source POLYMARKET_CHAINLINK \
   --crypto-resolution-mode auto \
   --ws-proxy http://127.0.0.1:7897 \
@@ -55,9 +58,8 @@ exec "$PYTHON" -u -m src.watch_updown \
   --official-open-stable-seconds 5 \
   --env-file "$ENV_FILE" \
   --reversal-state-json "$DATA_DIR/reversal_v11_state.json" \
-  --reversal-first-stage-max-rv60 0.0010 \
-  --reversal-first-stage-max-rv300 0.0020 \
-  --spread-maker-state-json "$DATA_DIR/spread_market_maker_state.json" \
+  --reversal-first-stage-max-rv60 0.0020 \
+  --reversal-first-stage-max-rv300 0.0050 \
   --decision-seconds-before-end 120 \
   --min-seconds-before-end 25 \
   --signal-confirmations 2 \
@@ -90,6 +92,12 @@ exec "$PYTHON" -u -m src.watch_updown \
   --pre-submit-max-quote-age-seconds 1.0 \
   --min-win-probability 0.55 \
   --probability-shrinkage 1.00 \
+  --fair-value-fee-rate 0.07 \
+  --fair-value-confirmation-min-seconds 0 \
+  --fair-value-book-trend-samples 3 \
+  --fair-value-book-min-slope 0.003 \
+  --fair-value-book-min-relative-slope 0.005 \
+  --fair-value-book-max-pullback 0.01 \
   --edge 0.02 \
   --min-entry 0.50 \
   --low-entry-cutoff 0.55 \

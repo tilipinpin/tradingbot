@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tianliuping.polymarket-ewma-twap-paper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/tianliuping/.codex/worktrees/b0a7/tradingbot/deploy/start-ewma-twap-paper.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/tianliuping/.codex/worktrees/b0a7/tradingbot</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/tianliuping/.codex/worktrees/b0a7/tradingbot/data/ewma_twap_paper.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/tianliuping/.codex/worktrees/b0a7/tradingbot/data/ewma_twap_paper.stderr.log</string>
+</dict>
+</plist>

@@ -2,7 +2,7 @@
 
 # Shared boot-time proxy checks for desktop apps and the live trading bot.
 typeset -gr SHARED_PROXY_HTTP="http://127.0.0.1:7897"
-typeset -gr SHARED_PROXY_SOCKS="socks5://127.0.0.1:7898"
+typeset -gr SHARED_PROXY_SOCKS="socks5h://127.0.0.1:7898"
 
 proxy_export_launchd_environment() {
   /bin/launchctl setenv HTTP_PROXY "$SHARED_PROXY_HTTP"

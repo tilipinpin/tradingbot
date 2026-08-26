@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +21,7 @@ from src.telegram_commands import (
     DEFAULT_STRATEGY,
     LIVE_STRATEGIES,
     PAPER_ONLY_STRATEGIES,
+    REVERSAL_STAGE_LIMITS,
     STRATEGY_LABELS,
     TelegramCommandPoller,
     manual_confirmation_markup,
@@ -293,6 +294,32 @@ def model_probability(order: dict[str, Any]) -> Decimal | None:
 
 
 def format_fill_message(order: dict[str, Any]) -> str:
+    if str(order.get("action") or "BUY").upper() == "SELL":
+        response = order.get("response") if isinstance(order.get("response"), dict) else {}
+        shares = _as_decimal(response.get("makingAmount")) or _as_decimal(order.get("size"))
+        proceeds = _as_decimal(response.get("takingAmount"))
+        if proceeds <= 0:
+            proceeds = shares * _as_decimal(order.get("price"))
+        price = proceeds / shares if shares > 0 else _as_decimal(order.get("price"))
+        estimated_fee = (
+            shares * CRYPTO_TAKER_FEE_RATE * price * (Decimal("1") - price)
+            if shares > 0 and Decimal("0") <= price <= Decimal("1")
+            else Decimal("0")
+        )
+        order_id = str(response.get("orderID") or "N/A")
+        return "\n".join(
+            [
+                "🛑 Polymarket 风险退出已成交",
+                f"市场: {order.get('slug', 'N/A')}",
+                "订单类型: 止损卖出原仓",
+                f"方向: {str(order.get('side', 'N/A')).upper()}",
+                f"成交均价: {price.quantize(Decimal('0.0001'))}",
+                f"卖出数量: {shares.quantize(Decimal('0.0001'))} 份",
+                f"实际回款: {_money(proceeds)}",
+                f"Taker 手续费估算: {_money(estimated_fee)}",
+                f"订单: {order_id[:18]}{'…' if len(order_id) > 18 else ''}",
+            ]
+        )
     cost, shares, price = fill_amounts(order)
     estimated_fee = estimated_crypto_taker_fee(order)
     winning_profit = shares - cost - estimated_fee
@@ -331,6 +358,10 @@ def settlement_key(order: dict[str, Any]) -> str:
 
 def order_role(order: dict[str, Any]) -> str:
     configured = str(order.get("order_role") or "").strip().lower()
+    if configured == "directional_entry":
+        return "primary"
+    if configured == "stop_hedge":
+        return "reverse_protection"
     if configured in {
         "primary",
         "same_direction_add",
@@ -353,14 +384,92 @@ def order_role_label(order: dict[str, Any]) -> str:
     }[order_role(order)]
 
 
-def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
+def strategy_notice_lines(strategy: Any) -> list[str]:
+    key = str(strategy or "").strip()
+    if not key:
+        return []
+    lines = [f"策略: {STRATEGY_LABELS.get(key, key)}"]
+    stage_limit = REVERSAL_STAGE_LIMITS.get(key)
+    if stage_limit is not None:
+        lines.append(f"阶段上限: {stage_limit}")
+    return lines
+
+
+def is_position_exit_order(order: dict[str, Any]) -> bool:
+    return str(order.get("ledger_type") or "") == "position_exit" or str(
+        order.get("order_role") or ""
+    ).endswith("_correction_exit")
+
+
+def position_exit_key(order: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(order.get("slug") or ""),
+        str(order.get("round_id") or ""),
+        str(order.get("attempt") or ""),
+        str(order.get("side") or "").upper(),
+    )
+
+
+def position_exit_adjustments(
+    ledger_entries: list[dict[str, Any]],
+) -> dict[tuple[str, str, str, str], dict[str, Decimal]]:
+    adjustments: dict[tuple[str, str, str, str], dict[str, Decimal]] = {}
+    for entry in ledger_entries:
+        if not is_position_exit_order(entry):
+            continue
+        response = entry.get("response") if isinstance(entry.get("response"), dict) else {}
+        sold_shares = _as_decimal(entry.get("sold_shares")) or _as_decimal(
+            response.get("makingAmount")
+        )
+        sell_proceeds = _as_decimal(entry.get("sell_proceeds")) or _as_decimal(
+            response.get("takingAmount")
+        )
+        if sold_shares <= 0:
+            continue
+        price = sell_proceeds / sold_shares if sell_proceeds > 0 else _as_decimal(
+            entry.get("price")
+        )
+        exit_fee = (
+            sold_shares
+            * CRYPTO_TAKER_FEE_RATE
+            * price
+            * (Decimal("1") - price)
+            if Decimal("0") <= price <= Decimal("1")
+            else Decimal("0")
+        )
+        key = position_exit_key(entry)
+        current = adjustments.setdefault(
+            key,
+            {"sold_shares": Decimal("0"), "sell_proceeds": Decimal("0"), "exit_fee": Decimal("0")},
+        )
+        current["sold_shares"] += sold_shares
+        current["sell_proceeds"] += sell_proceeds
+        current["exit_fee"] += exit_fee
+    return adjustments
+
+
+def settlement_values(
+    order: dict[str, Any],
+    winner: str,
+    exit_adjustment: dict[str, Decimal] | None = None,
+) -> dict[str, Any]:
     cost, shares, price = fill_amounts(order)
     side = str(order.get("side") or "").upper()
-    won = side == winner.upper()
-    payout = shares if won else Decimal("0")
-    gross_pnl = payout - cost
-    estimated_fee = estimated_crypto_taker_fee(order)
+    side_won = side == winner.upper()
+    sold_shares = min(
+        shares,
+        max(Decimal("0"), (exit_adjustment or {}).get("sold_shares", Decimal("0"))),
+    )
+    remaining_shares = max(Decimal("0"), shares - sold_shares)
+    sell_proceeds = max(
+        Decimal("0"), (exit_adjustment or {}).get("sell_proceeds", Decimal("0"))
+    )
+    exit_fee = max(Decimal("0"), (exit_adjustment or {}).get("exit_fee", Decimal("0")))
+    payout = remaining_shares if side_won else Decimal("0")
+    gross_pnl = sell_proceeds + payout - cost
+    estimated_fee = estimated_crypto_taker_fee(order) + exit_fee
     net_pnl = gross_pnl - estimated_fee
+    won = net_pnl > 0
     return_rate = gross_pnl / cost if cost > 0 else None
     net_return_rate = net_pnl / cost if cost > 0 else None
     result = {
@@ -370,6 +479,7 @@ def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
         "reason": str(order.get("reason") or ""),
         "winner": winner.upper(),
         "won": won,
+        "settlement_side_won": side_won,
         "cost": str(cost),
         "shares": str(shares),
         "entry_price": str(price),
@@ -380,12 +490,23 @@ def settlement_values(order: dict[str, Any], winner: str) -> dict[str, Any]:
         "return_rate": str(return_rate) if return_rate is not None else None,
         "net_return_rate": str(net_return_rate) if net_return_rate is not None else None,
     }
+    if sold_shares > 0:
+        result.update(
+            {
+                "forced_exit_shares": str(sold_shares),
+                "forced_exit_proceeds": str(sell_proceeds),
+                "remaining_shares": str(remaining_shares),
+                "forced_exit_fee": str(exit_fee),
+            }
+        )
     for key in (
         "reversal_trend_side",
         "reversal_exit_proceeds",
         "reversal_split_amount",
         "round_id",
         "attempt",
+        "strategy",
+        "soft_limit_final_recovery",
     ):
         if order.get(key) not in (None, ""):
             result[key] = order[key]
@@ -518,7 +639,10 @@ def format_window_settlement_message(
         reversal_summary = [
             f"轮次/阶段: {reversal.get('round_id', 'N/A')}/{reversal.get('attempt', 'N/A')}",
             f"本轮累计净盈亏估算: {round_net_pnl:+.4f} pUSD",
+            *strategy_notice_lines(reversal.get("strategy")),
         ]
+        if reversal.get("soft_limit_final_recovery"):
+            reversal_summary.append("风控阶段: 64U软警戒后的最终完整追回单")
     lines = [
         "🏁 Polymarket 交易已结算",
         f"结果: {result}",
@@ -552,6 +676,15 @@ def format_window_settlement_message(
                     f"保留 {reversal.get('side', 'N/A')}",
                     f"拆分金额: {_money(_as_decimal(reversal.get('reversal_split_amount')))}",
                     f"趋势仓卖出回款: {_money(_as_decimal(reversal.get('reversal_exit_proceeds')))}",
+                ]
+            )
+        forced_exit_shares = _as_decimal(reversal.get("forced_exit_shares"))
+        if forced_exit_shares > 0:
+            lines.extend(
+                [
+                    f"强制卖出数量: {forced_exit_shares:.4f}份",
+                    f"强制卖出回款: {_money(_as_decimal(reversal.get('forced_exit_proceeds')))}",
+                    f"结算剩余仓位: {_as_decimal(reversal.get('remaining_shares')):.4f}份",
                 ]
             )
     for index, item in enumerate(window_settlements, start=1):
@@ -651,6 +784,11 @@ def format_daily_message(
     win_rate = "N/A" if stats.win_rate is None else f"{stats.win_rate:.2%}"
     lines = [
         f"📊 Polymarket 日报 {report_date.isoformat()}",
+        (
+            "统计周期: 北京时间 "
+            f"{report_date.isoformat()} 08:00 至 "
+            f"{(report_date + timedelta(days=1)).isoformat()} 08:00"
+        ),
         f"实际成交: {stats.fills} 单（已结算 {stats.settled}，待结算 {stats.unresolved}）",
         f"胜负: {stats.wins} 胜 / {stats.losses} 负",
         f"胜率: {win_rate}",
@@ -675,12 +813,24 @@ class TelegramNotifier:
         chat_id: str | None,
         timeout: float = 10,
         session: Any = requests,
+        fallback_session: Any | None = None,
     ) -> None:
         self.token = (token or "").strip()
         self.chat_id = (chat_id or "").strip()
         self.timeout = timeout
         self.session = session
+        self.fallback_session = fallback_session
+        self._session_lock = threading.Lock()
         self._last_alert_at: dict[str, float] = {}
+
+    @staticmethod
+    def _proxied_session(proxy: str | None) -> Any:
+        if not proxy:
+            return requests
+        session = requests.Session()
+        session.trust_env = False
+        session.proxies = {"http": proxy, "https": proxy}
+        return session
 
     @classmethod
     def from_env(cls) -> "TelegramNotifier":
@@ -692,11 +842,44 @@ class TelegramNotifier:
         }
         token = os.getenv("TELEGRAM_BOT_TOKEN") if enabled else None
         chat_id = os.getenv("TELEGRAM_CHAT_ID") if enabled else None
-        return cls(token, chat_id, timeout=float(os.getenv("TELEGRAM_TIMEOUT", "10")))
+        primary_proxy = (
+            os.getenv("TELEGRAM_PROXY")
+            or os.getenv("ALL_PROXY")
+        )
+        fallback_proxy = (
+            os.getenv("TELEGRAM_FALLBACK_PROXY")
+            or os.getenv("HTTPS_PROXY")
+        )
+        if fallback_proxy == primary_proxy:
+            fallback_proxy = None
+        return cls(
+            token,
+            chat_id,
+            timeout=float(os.getenv("TELEGRAM_TIMEOUT", "10")),
+            session=cls._proxied_session(primary_proxy),
+            fallback_session=cls._proxied_session(fallback_proxy) if fallback_proxy else None,
+        )
 
     @property
     def enabled(self) -> bool:
         return bool(self.token and self.chat_id)
+
+    @staticmethod
+    def _send_message_retry_is_safe(exc: requests.RequestException) -> bool:
+        """Return whether a failed POST is known not to have reached Telegram.
+
+        ``sendMessage`` is not idempotent.  In particular, a read timeout can
+        happen after Telegram has accepted the message, so retrying it through
+        another proxy can create a duplicate notification.
+        """
+        return isinstance(
+            exc,
+            (
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ProxyError,
+                requests.exceptions.SSLError,
+            ),
+        )
 
     def send(self, message: str, reply_markup: dict[str, Any] | None = None) -> bool:
         payload: dict[str, Any] = {
@@ -716,20 +899,65 @@ class TelegramNotifier:
     ) -> dict[str, Any] | None:
         if not self.enabled:
             return None
-        try:
-            response = self.session.post(
-                f"https://api.telegram.org/bot{self.token}/{method}",
-                json=payload,
-                timeout=timeout if timeout is not None else self.timeout,
-            )
-            response.raise_for_status()
-            response_payload = response.json()
-            if response_payload.get("ok") is not True:
-                raise RuntimeError("Telegram API returned ok=false")
-            return response_payload
-        except Exception as exc:
-            logger.warning("Telegram API %s failed: %s", method, sanitize_sensitive_text(exc))
-            return None
+        with self._session_lock:
+            sessions = [self.session]
+            if self.fallback_session is not None:
+                sessions.append(self.fallback_session)
+        for index, session in enumerate(sessions):
+            try:
+                response = session.post(
+                    f"https://api.telegram.org/bot{self.token}/{method}",
+                    json=payload,
+                    timeout=timeout if timeout is not None else self.timeout,
+                )
+                response.raise_for_status()
+                response_payload = response.json()
+                if response_payload.get("ok") is not True:
+                    raise RuntimeError("Telegram API returned ok=false")
+                if index > 0:
+                    with self._session_lock:
+                        if (
+                            self.session is sessions[0]
+                            and self.fallback_session is session
+                        ):
+                            self.session, self.fallback_session = (
+                                self.fallback_session,
+                                self.session,
+                            )
+                    logger.info("Telegram fallback transport promoted to primary")
+                return response_payload
+            except requests.RequestException as exc:
+                if method == "sendMessage" and not self._send_message_retry_is_safe(exc):
+                    logger.warning(
+                        "Telegram API sendMessage delivery is unknown after transport "
+                        "failure; suppressing retry to avoid a duplicate: %s",
+                        sanitize_sensitive_text(exc),
+                    )
+                    # Treat an ambiguous response as delivered.  This also keeps
+                    # the notification service from submitting the same message
+                    # again on its next polling cycle.
+                    return {"ok": True, "result": {"delivery_unknown": True}}
+                if index + 1 < len(sessions):
+                    logger.warning(
+                        "Telegram API %s primary transport failed; retrying fallback: %s",
+                        method,
+                        sanitize_sensitive_text(exc),
+                    )
+                    continue
+                logger.warning(
+                    "Telegram API %s failed: %s",
+                    method,
+                    sanitize_sensitive_text(exc),
+                )
+                return None
+            except Exception as exc:
+                logger.warning(
+                    "Telegram API %s failed: %s",
+                    method,
+                    sanitize_sensitive_text(exc),
+                )
+                return None
+        return None
 
     def alert(self, key: str, message: str, cooldown: float = 300) -> bool:
         now = time.monotonic()
@@ -981,6 +1209,10 @@ class TradingNotificationService:
             channels.add("discord")
         return channels
 
+    def _realtime_channels(self) -> set[str]:
+        """Channels allowed to receive anything other than the daily report."""
+        return {"telegram"} if self.notifier.enabled else set()
+
     def _send_channel(
         self,
         channel: str,
@@ -1024,7 +1256,7 @@ class TradingNotificationService:
                 discord_retention_seconds,
                 discord_message_kind,
             )
-            for channel in self._ordered_channels(self._enabled_channels())
+            for channel in self._ordered_channels(self._realtime_channels())
         ]
         return any(results)
 
@@ -1038,7 +1270,7 @@ class TradingNotificationService:
         return self._deliver_missing_channels_to(
             message,
             delivered,
-            self._enabled_channels(),
+            self._realtime_channels(),
             discord_retention_seconds,
             discord_message_kind,
         )
@@ -1267,13 +1499,33 @@ class TradingNotificationService:
             len(positions),
         )
 
+    def reversal_unlocked_profit(self, lock_fraction: Decimal) -> Decimal:
+        """Return settled trading profit above a high-water profit lock."""
+        if not Decimal("0") < lock_fraction < Decimal("1"):
+            raise ValueError("profit lock fraction must be between zero and one")
+        settlements = [
+            item
+            for item in self.state.get("settlements", {}).values()
+            if isinstance(item, dict)
+        ]
+        settlements.sort(key=lambda item: str(item.get("settled_at") or ""))
+        running = Decimal("0")
+        peak = Decimal("0")
+        for item in settlements:
+            running += _as_decimal(item.get("gross_pnl")) - settlement_estimated_fee(item)
+            peak = max(peak, running)
+        locked = peak * lock_fraction
+        return max(Decimal("0"), running - locked)
+
     def start(self) -> None:
         if not self.enabled:
             logger.info("Telegram and Discord notifications are disabled or not configured")
             return
         account = self.current_account_snapshot()
         local_now = datetime.now(self.local_timezone)
-        self._ensure_day(local_now.date(), account.available_balance)
+        # Daily accounting uses UTC dates so the boundary is exactly 08:00 in
+        # Asia/Shanghai, matching the strategy report's accounting period.
+        self._ensure_day(datetime.now(timezone.utc).date(), account.available_balance)
         self._broadcast(
             "\n".join(
                 [
@@ -1281,7 +1533,7 @@ class TradingNotificationService:
                     f"版本: {self.version}",
                     f"服务器: {socket.gethostname()}",
                     f"模式: {self.mode}",
-                    f"策略: {self.strategy}",
+                    f"策略: {STRATEGY_LABELS.get(self.strategy, self.strategy)}",
                     f"启动时间: {local_now.isoformat(timespec='seconds')}",
                     *account_snapshot_lines(account),
                 ]
@@ -1361,6 +1613,16 @@ class TradingNotificationService:
 
     def record_fill(self, order: dict[str, Any]) -> None:
         order["matched_at"] = order.get("matched_at") or datetime.now(timezone.utc).isoformat()
+        if str(order.get("action") or "BUY").upper() == "SELL":
+            response = order.get("response") if isinstance(order.get("response"), dict) else {}
+            order["ledger_type"] = "position_exit"
+            order["sold_shares"] = str(
+                _as_decimal(response.get("makingAmount")) or _as_decimal(order.get("size"))
+            )
+            order["sell_proceeds"] = str(
+                _as_decimal(response.get("takingAmount"))
+                or _as_decimal(order.get("price")) * _as_decimal(order.get("size"))
+            )
         self._append_trade_ledger(order)
         if self.notify_on_matched:
             self.notifier.send(format_fill_message(order))
@@ -1474,13 +1736,44 @@ class TradingNotificationService:
         """Record the retained reversal position and optionally broadcast the SELL fill."""
         order["matched_at"] = order.get("matched_at") or datetime.now(timezone.utc).isoformat()
         response = order.get("response") if isinstance(order.get("response"), dict) else {}
-        if order.get("order_role") == "reversal_direct_entry":
+        role = str(order.get("order_role") or "")
+        if role.endswith("_correction_exit"):
+            order["strategy"] = order.get("strategy") or self.strategy
+            sold_shares = _as_decimal(response.get("makingAmount"))
+            proceeds = _as_decimal(response.get("takingAmount"))
+            if sold_shares > 0:
+                exit_record = dict(order)
+                exit_record.update(
+                    {
+                        "ledger_type": "position_exit",
+                        "sold_shares": str(sold_shares),
+                        "sell_proceeds": str(proceeds),
+                    }
+                )
+                self._append_trade_ledger(exit_record)
+            if self.notify_on_matched:
+                self._broadcast(
+                    "\n".join(
+                        [
+                            "🛑 反转仓位强制卖出",
+                            *strategy_notice_lines(order.get("strategy")),
+                            f"市场: {order.get('slug', 'N/A')}",
+                            f"方向: {str(order.get('side', 'N/A')).upper()}",
+                            f"卖出数量: {sold_shares:.4f}份",
+                            f"实际回款: {_money(proceeds)}",
+                            f"轮次/阶段: {order.get('round_id', 'N/A')}/{order.get('attempt', 'N/A')}",
+                        ]
+                    )
+                )
+            return
+        if role in {"reversal_direct_entry", "gamma_correction_replacement", "chain_correction_replacement"}:
             cost = _as_decimal(response.get("makingAmount"))
             shares = _as_decimal(response.get("takingAmount"))
             price = cost / shares if shares > 0 else _as_decimal(order.get("price"))
             retained_order = dict(order)
             retained_order.update(
                 {
+                    "strategy": order.get("strategy") or self.strategy,
                     "order_role": "reversal_retained",
                     "notional": str(cost),
                     "size": str(shares),
@@ -1495,6 +1788,9 @@ class TradingNotificationService:
                     ).upper(),
                     "reversal_planned_shares": str(order.get("planned_shares") or shares),
                     "reversal_entry_cost": str(cost),
+                    "soft_limit_final_recovery": bool(
+                        order.get("soft_limit_final_recovery", False)
+                    ),
                 }
             )
             self._append_trade_ledger(retained_order)
@@ -1503,6 +1799,7 @@ class TradingNotificationService:
                     "\n".join(
                         [
                             "⚡ 反转策略直接买入",
+                            *strategy_notice_lines(retained_order.get("strategy")),
                             f"市场: {order.get('slug', 'N/A')}",
                             f"原趋势方向: {str(order.get('trend_side', 'N/A')).upper()}",
                             f"买入方向: {str(order.get('side', 'N/A')).upper()}",
@@ -1510,6 +1807,11 @@ class TradingNotificationService:
                             f"买入数量: {shares.quantize(Decimal('0.0001'))} 份",
                             f"实际成本: {_money(cost)}",
                             f"轮次/阶段: {order.get('round_id', 'N/A')}/{order.get('attempt', 'N/A')}",
+                            *(
+                                ["风控阶段: 64U软警戒后的最终完整追回单"]
+                                if order.get("soft_limit_final_recovery")
+                                else []
+                            ),
                         ]
                     )
                 )
@@ -1533,6 +1835,7 @@ class TradingNotificationService:
                     f"trend_side={str(order.get('side') or 'N/A').upper()}"
                 ),
                 "order_role": "reversal_retained",
+                "strategy": order.get("strategy") or self.strategy,
                 "round_id": order.get("round_id"),
                 "attempt": order.get("attempt"),
                 "reversal_trend_side": str(order.get("side") or "N/A").upper(),
@@ -1556,6 +1859,7 @@ class TradingNotificationService:
                 "\n".join(
                 [
                     "💱 反转策略趋势仓卖出",
+                    *strategy_notice_lines(order.get("strategy") or self.strategy),
                     f"市场: {order.get('slug', 'N/A')}",
                     f"原趋势方向: {str(order.get('side', 'N/A')).upper()}",
                     f"保留方向: {str(order.get('retained_side', 'N/A')).upper()}",
@@ -1600,8 +1904,10 @@ class TradingNotificationService:
         self._next_settlement_attempt = now + self.settlement_interval
         settlements = self.state.setdefault("settlements", {})
         settlement_windows = self.state.setdefault("settlement_windows", {})
-        required_channels = self._enabled_channels()
-        ledger_orders = self._ledger_orders()
+        required_channels = self._realtime_channels()
+        ledger_entries = self._ledger_orders()
+        exit_adjustments = position_exit_adjustments(ledger_entries)
+        ledger_orders = [entry for entry in ledger_entries if not is_position_exit_order(entry)]
         orders_by_slug: dict[str, list[dict[str, Any]]] = {}
         for order in ledger_orders:
             slug = str(order.get("slug") or "")
@@ -1650,7 +1956,11 @@ class TradingNotificationService:
         for order, winner in resolved:
             assert winner is not None
             key = settlement_key(order)
-            record = settlement_values(order, winner)
+            record = settlement_values(
+                order,
+                winner,
+                exit_adjustments.get(position_exit_key(order)),
+            )
             record["settled_at"] = datetime.now(timezone.utc).isoformat()
             record["notified_channels"] = []
             settlements[key] = record
@@ -1698,32 +2008,37 @@ class TradingNotificationService:
         if changed:
             self._save_state()
 
-    def maybe_send_daily(self, winner_lookup: Callable[[str], str | None]) -> None:
+    def maybe_send_daily(
+        self,
+        winner_lookup: Callable[[str], str | None],
+        additional_report: Callable[[date], str | None] | None = None,
+        on_reported: Callable[[date], None] | None = None,
+    ) -> date | None:
         if not self.enabled or time.monotonic() < self._next_daily_attempt:
-            return
-        local_today = datetime.now(self.local_timezone).date()
+            return None
+        report_today = datetime.now(timezone.utc).date()
         days = self.state.get("days", {})
-        needs_roll = local_today.isoformat() not in days or any(
-            day_text < local_today.isoformat() and "end_balance" not in item
+        needs_roll = report_today.isoformat() not in days or any(
+            day_text < report_today.isoformat() and "end_balance" not in item
             for day_text, item in days.items()
         )
         has_pending = any(
-            day_text < local_today.isoformat() and not item.get("reported")
+            day_text < report_today.isoformat() and not item.get("reported")
             for day_text, item in days.items()
         )
         if not needs_roll and not has_pending:
-            return
+            return None
         account = self.current_account_snapshot()
-        self._roll_days(local_today, account.available_balance)
+        self._roll_days(report_today, account.available_balance)
         pending = sorted(
             day_text
             for day_text, item in self.state.get("days", {}).items()
-            if day_text < local_today.isoformat() and not item.get("reported")
+            if day_text < report_today.isoformat() and not item.get("reported")
         )
         if not pending:
-            return
+            return None
         report_day = date.fromisoformat(pending[0])
-        orders = self._orders_for_date(report_day)
+        orders = self._orders_for_utc_date(report_day)
         winners: dict[str, str | None] = {}
         try:
             for slug in sorted({str(order.get("slug") or "") for order in orders}):
@@ -1731,15 +2046,26 @@ class TradingNotificationService:
         except Exception as exc:
             self.notify_exception("生成每日报告", exc, key="daily-report")
             self._next_daily_attempt = time.monotonic() + 300
-            return
+            return None
         stats = calculate_daily_stats(orders, winners)
         day_state = self.state["days"][report_day.isoformat()]
         start_balance = self._optional_decimal(day_state.get("start_balance"))
         end_balance = self._optional_decimal(day_state.get("end_balance"))
         delivered = set(day_state.get("reported_channels") or [])
         daily_channels = self._enabled_channels()
+        message = format_daily_message(
+            report_day,
+            stats,
+            start_balance,
+            end_balance,
+            account,
+        )
+        if additional_report is not None:
+            extra = additional_report(report_day)
+            if extra:
+                message = f"{message}\n\n{extra}"
         delivered = self._deliver_missing_channels_to(
-            format_daily_message(report_day, stats, start_balance, end_balance, account),
+            message,
             delivered,
             daily_channels,
         )
@@ -1747,7 +2073,10 @@ class TradingNotificationService:
         if daily_channels.issubset(delivered):
             day_state["reported"] = True
             day_state["reported_at"] = datetime.now(timezone.utc).isoformat()
+            if on_reported is not None:
+                on_reported(report_day)
         self._save_state()
+        return report_day if day_state.get("reported") else None
 
     def stop(self, reason: str, error: Any = None) -> None:
         if self._stopped:
@@ -1995,7 +2324,7 @@ class TradingNotificationService:
             f"交易: {'已暂停' if self.trading_paused else '运行中'}",
             f"版本: {self.version}",
             f"模式: {self.mode}",
-            f"策略: {self.strategy}",
+            f"策略: {STRATEGY_LABELS.get(self.strategy, self.strategy)}",
             f"运行时长: {_duration(time.monotonic() - self.started_monotonic)}",
             f"心跳: {heartbeat_age} 秒前",
             f"累计尝试/成交: {self.summary.get('order_attempts', 0)}/{self.summary.get('matched_orders', 0)}",
@@ -2292,6 +2621,19 @@ class TradingNotificationService:
             except (KeyError, TypeError, ValueError):
                 continue
             if matched_at.astimezone(self.local_timezone).date() == report_date:
+                orders.append(order)
+        return orders
+
+    def _orders_for_utc_date(self, report_date: date) -> list[dict[str, Any]]:
+        orders: list[dict[str, Any]] = []
+        for order in self._ledger_orders():
+            try:
+                matched_at = datetime.fromisoformat(
+                    str(order["matched_at"]).replace("Z", "+00:00")
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if matched_at.astimezone(timezone.utc).date() == report_date:
                 orders.append(order)
         return orders
 

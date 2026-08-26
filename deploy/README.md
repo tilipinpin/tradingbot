@@ -8,18 +8,20 @@ Git.
 Snapshot captured on 2026-07-18 before enabling official Polymarket `openPrice`
 alignment:
 
-- Live launch default: `reversal_v11_four_streak`, unlimited duration. Telegram
-  offers the 2-window, 3-window, and 4-window reversal variants. The former
+- Live launch default: `reversal_four_64`, unlimited duration. Telegram
+  offers the currently approved reversal and signal strategies. The former
   `open_060_late_070`, standalone `open_060`, `late_070`, and `late_one_way`
   entries are no longer shown.
 
 The shell launchers accept an optional first argument for the initial event slug.
 When omitted, they start from the current five-minute epoch.
 
-All current launchers use official Polymarket `openPrice`. The closest cached
-Chainlink boundary sample is audited against 1000 ms and 0.50 USD thresholds;
-missing or mismatched audit samples emit warnings but no longer reject a window.
-Fresh realtime Chainlink data is still required before any order signal.
+In TWAP mode, every strategy that needs a window-open reference starts from the
+first Polymarket Chainlink RTDS tick at or after the exact boundary, within the
+configured 1000 ms limit. Missing or late ticks fail the window closed. The
+official Polymarket Price to Beat is reconciled asynchronously with a 0.50 USD
+tolerance and is never fetched synchronously on the order-critical path. Fresh
+realtime Chainlink data is still required before any order signal.
 
 The live fair-value launcher uses actual sample timing for volatility and a
 long-run floor of 0.00005 per square-root second. Primary entries allow a 0.05
@@ -39,8 +41,9 @@ strictly reduces the maximum loss relative to leaving the first fill
 unprotected. Polling accelerates to a one-second cadence for the final 30
 seconds.
 
-Polymarket's timestamped official `openPrice` is the only permitted window-open
-value; realtime or cached local spot data can never replace it. The bot keeps
-retrying until the selected strategy's entry phase begins (90 seconds remaining
-for `fair_value_edge`, or the configured late-strategy entry start). It skips
-the window if the official value is still unavailable at that point.
+The provisional boundary may only come from the post-boundary Polymarket
+Chainlink RTDS stream; pre-boundary samples, stale cache values, and unrelated
+spot sources are forbidden. Once published, the official Price to Beat replaces
+the provisional value after background reconciliation. In TWAP markets,
+reversal settlement compares the prior window's Price to Beat with its ending
+60-second TWAP rather than comparing consecutive TWAP boundary values.

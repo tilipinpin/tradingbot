@@ -12,6 +12,44 @@ from typing import Any
 from src.polygon_split import CompleteSetSplitter, SplitReceipt
 
 
+MAX_REVERSAL_STAGES = 25
+COMPACT_REVERSAL_STAKES = (Decimal("2"), Decimal("4"))
+FIRST_STAGE_ONLY_STAKES = (Decimal("1"),)
+TWO_WINDOW_FIXED_NOTIONALS = (
+    Decimal("1"),
+    Decimal("2"),
+    Decimal("2"),
+    Decimal("2"),
+    Decimal("2"),
+    Decimal("1"),
+    Decimal("2"),
+    Decimal("4"),
+    Decimal("8"),
+    Decimal("16"),
+    Decimal("32"),
+    Decimal("64"),
+)
+SPARSE_RECOVERY_NOTIONALS = (
+    Decimal("4"),
+    Decimal("0"),
+    Decimal("0"),
+    Decimal("1"),
+    Decimal("2"),
+    Decimal("4"),
+    Decimal("8"),
+    Decimal("16"),
+    Decimal("32"),
+    Decimal("64"),
+)
+REVERSAL_STAGE_STAKES = (
+    Decimal("1"),
+    Decimal("2"),
+    Decimal("4"),
+    Decimal("8"),
+    Decimal("16"),
+) + (Decimal("16"),) * (MAX_REVERSAL_STAGES - 5)
+
+
 class Direction(str, Enum):
     UP = "UP"
     DOWN = "DOWN"
@@ -24,23 +62,8 @@ class Direction(str, Enum):
 @dataclass(frozen=True)
 class ReversalSettings:
     trigger_streak: int = 2
-    stakes: tuple[Decimal, ...] = (
-        Decimal("2"),
-        Decimal("4"),
-        Decimal("8"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-        Decimal("16"),
-    )
+    stakes: tuple[Decimal, ...] = REVERSAL_STAGE_STAKES
+    maximum_attempts: int | None = None
     preferred_sell_price: Decimal = Decimal("0.50")
     max_short_volatility: Decimal = Decimal("0.0015")
     max_window_move: Decimal = Decimal("0.0030")
@@ -51,10 +74,14 @@ class ReversalSettings:
     first_stage_max_rv60: Decimal = Decimal("0.0010")
     first_stage_rv300_filter_enabled: bool = False
     first_stage_max_rv300: Decimal = Decimal("0.0020")
+    first_stage_rv300_persistence_ratio: Decimal = Decimal("0.35")
+    first_stage_rv300_hard_multiplier: Decimal = Decimal("2.0")
     dynamic_final_recovery_enabled: bool = False
     dynamic_recovery_start_attempt: int = 5
     full_loss_recovery_enabled: bool = True
-    full_loss_recovery_start_attempt: int = 2
+    full_loss_recovery_start_attempt: int = 6
+    full_loss_recovery_strict_funding: bool = False
+    continue_final_stage_until_success_or_unfunded: bool = False
     minimum_round_profit: Decimal = Decimal("0")
     late_stage_recovery_fraction: Decimal = Decimal("1.00")
     recovery_fraction: Decimal = Decimal("0.50")
@@ -65,40 +92,98 @@ class ReversalSettings:
     recovery_max_shares: Decimal = Decimal("16")
     allocated_capital: Decimal = Decimal("110")
     maximum_streak_loss: Decimal = Decimal("110")
+    hard_round_loss_limit: Decimal | None = None
+    soft_round_loss_limit: Decimal | None = None
+    one_final_recovery_after_soft_limit: bool = False
+    end_round_at_soft_loss_limit: bool = False
+    compact_two_stage_enabled: bool = False
+    compact_first_max_ask: Decimal = Decimal("0.50")
+    compact_second_max_ask: Decimal = Decimal("0.45")
+    compact_max_spread: Decimal = Decimal("0.03")
+    compact_round_loss_limit: Decimal = Decimal("3")
+    compact_max_order_notional: Decimal = Decimal("1.90")
+    compact_profit_lock_fraction: Decimal = Decimal("0.70")
+    compact_loss_round_limit: int = 5
+    compact_pause_windows: int = 3
+    first_stage_only_enabled: bool = False
+    first_attempt_uses_first_stage_rules: bool = False
+    first_stage_only_max_ask: Decimal = Decimal("0.64")
+    first_stage_only_max_spread: Decimal = Decimal("0.05")
+    first_stage_only_max_fak_attempts: int = 3
+    fixed_notional_stages: tuple[Decimal, ...] = ()
+    fixed_notional_max_ask: Decimal = Decimal("0.49")
+    fixed_notional_recovery_start_attempt: int | None = None
+    fixed_notional_recovery_loss_start_attempt: int | None = None
+    sparse_recovery_notional_stages: tuple[Decimal, ...] = ()
+    sparse_recovery_start_attempt: int = 5
+    sparse_recovery_loss_start_attempt: int = 4
 
     def __post_init__(self) -> None:
         if self.trigger_streak < 2:
             raise ValueError("trigger streak must be at least two windows")
-        if self.stakes != (
-            Decimal("2"),
-            Decimal("4"),
-            Decimal("8"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
-            Decimal("16"),
+        if self.maximum_attempts is not None and not 1 <= self.maximum_attempts <= len(
+            self.stakes
         ):
-            raise ValueError(
-                "V1.1 must have 15 stages: 2, 4, 8, then twelve 16-share bases"
+            raise ValueError("maximum attempts must fit within the stage sequence")
+        selected_bounded_profiles = sum(
+            (
+                self.compact_two_stage_enabled,
+                self.first_stage_only_enabled,
+                bool(self.fixed_notional_stages),
+                bool(self.sparse_recovery_notional_stages),
             )
-        if any(value <= 0 for value in self.stakes):
+        )
+        if selected_bounded_profiles > 1:
+            raise ValueError("reversal profiles cannot be combined")
+        expected_stakes = (
+            self.sparse_recovery_notional_stages
+            if self.sparse_recovery_notional_stages
+            else self.fixed_notional_stages
+            if self.fixed_notional_stages
+            else FIRST_STAGE_ONLY_STAKES
+            if self.first_stage_only_enabled
+            else COMPACT_REVERSAL_STAKES
+            if self.compact_two_stage_enabled
+            else REVERSAL_STAGE_STAKES
+        )
+        if self.stakes != expected_stakes:
+            raise ValueError(
+                "invalid stage sequence for the selected reversal profile"
+            )
+        if not self.sparse_recovery_notional_stages and any(
+            value <= 0 for value in self.stakes
+        ):
             raise ValueError("stakes must be positive")
+        if self.sparse_recovery_notional_stages and (
+            any(value < 0 for value in self.sparse_recovery_notional_stages)
+            or not any(value > 0 for value in self.sparse_recovery_notional_stages)
+            or not 1
+            <= self.sparse_recovery_start_attempt
+            <= len(self.sparse_recovery_notional_stages)
+            or not 1
+            <= self.sparse_recovery_loss_start_attempt
+            < self.sparse_recovery_start_attempt
+        ):
+            raise ValueError("invalid sparse-recovery reversal settings")
         if self.dynamic_recovery_start_attempt != 5:
             raise ValueError("dynamic recovery must start on attempt 5")
         if self.first_stage_max_rv60 <= 0:
             raise ValueError("first-stage RV60 threshold must be positive")
         if self.first_stage_max_rv300 <= 0:
             raise ValueError("first-stage RV300 threshold must be positive")
-        if self.full_loss_recovery_start_attempt != 2:
-            raise ValueError("full-loss recovery must start on attempt 2")
+        if not Decimal("0") < self.first_stage_rv300_persistence_ratio <= Decimal("1"):
+            raise ValueError("first-stage RV300 persistence ratio must be in (0, 1]")
+        if self.first_stage_rv300_hard_multiplier < Decimal("1"):
+            raise ValueError("first-stage RV300 hard multiplier must be at least one")
+        if (
+            self.full_loss_recovery_enabled
+            and not self.compact_two_stage_enabled
+            and not self.first_stage_only_enabled
+            and not 2 <= self.full_loss_recovery_start_attempt <= len(self.stakes)
+        ):
+            raise ValueError(
+                "full-loss recovery must start between attempt 2 and the final stage"
+            )
         if self.minimum_round_profit < 0:
             raise ValueError("minimum round profit must not be negative")
         if not Decimal("0") < self.late_stage_recovery_fraction <= Decimal("1"):
@@ -122,17 +207,133 @@ class ReversalSettings:
             or self.maximum_streak_loss <= 0
         ):
             raise ValueError("dynamic recovery risk limits must be positive")
+        if self.hard_round_loss_limit is not None and self.hard_round_loss_limit <= 0:
+            raise ValueError("hard round loss limit must be positive when configured")
+        if self.soft_round_loss_limit is not None and self.soft_round_loss_limit <= 0:
+            raise ValueError("soft round loss limit must be positive when configured")
+        if self.one_final_recovery_after_soft_limit and self.soft_round_loss_limit is None:
+            raise ValueError("final soft-limit recovery requires a soft loss limit")
+        if self.end_round_at_soft_loss_limit and self.soft_round_loss_limit is None:
+            raise ValueError("soft-limit round exit requires a soft loss limit")
+        if not Decimal("0") < self.compact_profit_lock_fraction < Decimal("1"):
+            raise ValueError("compact profit lock fraction must be between zero and one")
+        if (
+            self.compact_first_max_ask <= 0
+            or self.compact_second_max_ask <= 0
+            or self.compact_first_max_ask >= 1
+            or self.compact_second_max_ask >= 1
+            or self.compact_max_spread < 0
+            or self.compact_round_loss_limit <= 0
+            or self.compact_max_order_notional <= 0
+            or self.compact_loss_round_limit < 1
+            or self.compact_pause_windows < 0
+        ):
+            raise ValueError("invalid compact reversal risk settings")
+        if (
+            self.first_stage_only_max_ask <= 0
+            or self.first_stage_only_max_ask >= 1
+            or self.first_stage_only_max_spread < 0
+            or self.first_stage_only_max_fak_attempts < 1
+        ):
+            raise ValueError("invalid first-stage-only order-book settings")
+        if self.fixed_notional_stages and (
+            any(value <= 0 for value in self.fixed_notional_stages)
+            or self.fixed_notional_max_ask <= 0
+            or self.fixed_notional_max_ask >= 1
+        ):
+            raise ValueError("invalid fixed-notional reversal settings")
+        fixed_recovery_bounds = (
+            self.fixed_notional_recovery_start_attempt,
+            self.fixed_notional_recovery_loss_start_attempt,
+        )
+        if any(value is not None for value in fixed_recovery_bounds):
+            if (
+                not self.fixed_notional_stages
+                or any(value is None for value in fixed_recovery_bounds)
+                or not 1
+                <= self.fixed_notional_recovery_loss_start_attempt
+                < self.fixed_notional_recovery_start_attempt
+                <= len(self.fixed_notional_stages)
+            ):
+                raise ValueError("invalid fixed-notional recovery settings")
+
     def uses_dynamic_recovery(self, attempt: int) -> bool:
         return (
             self.dynamic_final_recovery_enabled
-            and self.dynamic_recovery_start_attempt <= attempt <= len(self.stakes)
+            and self.dynamic_recovery_start_attempt <= attempt <= self.attempt_limit
         )
+
+    @property
+    def attempt_limit(self) -> int:
+        return self.maximum_attempts or len(self.stakes)
 
     def uses_full_loss_recovery(self, attempt: int) -> bool:
         return (
-            self.full_loss_recovery_enabled
-            and self.full_loss_recovery_start_attempt <= attempt <= len(self.stakes)
+            not self.compact_two_stage_enabled
+            and not self.first_stage_only_enabled
+            and not self.fixed_notional_stages
+            and not self.sparse_recovery_notional_stages
+            and self.full_loss_recovery_enabled
+            and self.full_loss_recovery_start_attempt <= attempt <= self.attempt_limit
         )
+
+    def uses_sparse_full_loss_recovery(self, attempt: int) -> bool:
+        return bool(self.sparse_recovery_notional_stages) and (
+            self.sparse_recovery_start_attempt <= attempt <= self.attempt_limit
+        )
+
+    def uses_fixed_notional_full_loss_recovery(self, attempt: int) -> bool:
+        return (
+            bool(self.fixed_notional_stages)
+            and self.fixed_notional_recovery_start_attempt is not None
+            and self.fixed_notional_recovery_start_attempt
+            <= attempt
+            <= self.attempt_limit
+        )
+
+    def tracks_direct_loss(self, attempt: int) -> bool:
+        """Return whether a failed direct-buy stage belongs to its recovery segment."""
+        if self.sparse_recovery_notional_stages:
+            return attempt >= self.sparse_recovery_loss_start_attempt
+        if self.fixed_notional_recovery_loss_start_attempt is not None:
+            return attempt >= self.fixed_notional_recovery_loss_start_attempt
+        return True
+
+    def uses_first_stage_order_rules(self, attempt: int) -> bool:
+        return self.first_stage_only_enabled or (
+            self.first_attempt_uses_first_stage_rules and attempt == 1
+        )
+
+    def first_stage_volatility_block_reason(
+        self,
+        short_volatility: Decimal,
+        five_minute_volatility: Decimal,
+    ) -> str | None:
+        """Block current extremes without treating decayed RV300 as current risk."""
+        if (
+            self.first_stage_rv60_filter_enabled
+            and short_volatility >= self.first_stage_max_rv60
+        ):
+            return "rv60_extreme"
+        if (
+            not self.first_stage_rv300_filter_enabled
+            or five_minute_volatility < self.first_stage_max_rv300
+        ):
+            return None
+        if (
+            five_minute_volatility
+            >= self.first_stage_max_rv300
+            * self.first_stage_rv300_hard_multiplier
+        ):
+            return "rv300_hard_extreme"
+        if (
+            short_volatility
+            >= five_minute_volatility
+            * self.first_stage_rv300_persistence_ratio
+        ):
+            return "rv300_persistent"
+        return None
+
 
 @dataclass(frozen=True)
 class MarketHealth:
@@ -197,6 +398,8 @@ class ActiveRound:
     planned_shares: Decimal = Decimal("0")
     entry_fees: Decimal = Decimal("0")
     cumulative_loss: Decimal = Decimal("0")
+    entry_unmatched_attempts: int = 0
+    soft_limit_final_recovery: bool = False
 
     @property
     def target_side(self) -> Direction:
@@ -219,7 +422,9 @@ class DailyMetrics:
     successful_rounds: int = 0
     forced_exit_rounds: int = 0
     stage_successes: dict[str, int] = field(
-        default_factory=lambda: {str(stage): 0 for stage in range(1, 16)}
+        default_factory=lambda: {
+            str(stage): 0 for stage in range(1, MAX_REVERSAL_STAGES + 1)
+        }
     )
     maximum_same_direction_streak: int = 0
     total_making_amount: Decimal = Decimal("0")
@@ -251,6 +456,10 @@ class ReversalState:
     pending_gamma_results: dict[str, Direction] = field(default_factory=dict)
     gamma_verified_slugs: list[str] = field(default_factory=list)
     gamma_mismatch_slugs: list[str] = field(default_factory=list)
+    chain_verified_slugs: list[str] = field(default_factory=list)
+    chain_mismatch_slugs: list[str] = field(default_factory=list)
+    compact_consecutive_losing_rounds: int = 0
+    compact_pause_windows_remaining: int = 0
     last_volatility_pause_slug: str | None = None
     reported_days: list[str] = field(default_factory=list)
     daily: dict[str, DailyMetrics] = field(default_factory=dict)
@@ -290,7 +499,7 @@ class ReversalV11:
             next_stage = active.failures + 1
             return (
                 self.settings.stakes[next_stage]
-                if next_stage < len(self.settings.stakes)
+                if next_stage < self.settings.attempt_limit
                 else self.settings.stakes[0]
             )
         return self.settings.stakes[active.failures]
@@ -435,17 +644,10 @@ class ReversalV11:
             )
             and self.state.blocked_trend_side != self.state.recent_results[-1]
         )
-        if first_stage_trigger_ready and (
-            (
-                self.settings.first_stage_rv60_filter_enabled
-                and health.short_volatility >= self.settings.first_stage_max_rv60
-            )
-            or (
-                self.settings.first_stage_rv300_filter_enabled
-                and health.five_minute_volatility
-                >= self.settings.first_stage_max_rv300
-            )
-        ):
+        if first_stage_trigger_ready and self.settings.first_stage_volatility_block_reason(
+            health.short_volatility,
+            health.five_minute_volatility,
+        ) is not None:
             if self.state.last_volatility_pause_slug != window_slug:
                 self.metrics(day).volatility_pauses += 1
                 self.state.last_volatility_pause_slug = window_slug
@@ -464,6 +666,11 @@ class ReversalV11:
                 self.state.last_volatility_pause_slug = window_slug
             return None
         if active is None:
+            if (
+                self.settings.compact_two_stage_enabled
+                and self.state.compact_pause_windows_remaining > 0
+            ):
+                return None
             if (
                 len(self.state.recent_results) < self.settings.trigger_streak
                 or len(
@@ -487,9 +694,15 @@ class ReversalV11:
             self.state.active_round = active
             self.metrics(day).triggered_rounds += 1
 
-        if active.failures >= len(self.settings.stakes):
-            raise RuntimeError("round exceeded the fifteen-attempt limit")
+        if active.failures >= self.settings.attempt_limit:
+            raise RuntimeError("round exceeded the configured attempt limit")
         amount = self.settings.stakes[active.failures]
+        if (
+            self.settings.one_final_recovery_after_soft_limit
+            and self.settings.soft_round_loss_limit is not None
+            and active.cumulative_loss >= self.settings.soft_round_loss_limit
+        ):
+            active.soft_limit_final_recovery = True
         active.awaiting_window = window_slug
         active.committed += amount
         active.execution_phase = "planned"
@@ -517,6 +730,7 @@ class ReversalV11:
         day: date | None = None,
     ) -> str:
         result = Direction(result)
+        compact_pause_before = self.state.compact_pause_windows_remaining
         if window_slug == self.state.last_settled_slug:
             return "duplicate_ignored"
         previous_epoch: int | None = None
@@ -554,6 +768,8 @@ class ReversalV11:
             metrics.maximum_same_direction_streak,
             self.state.current_streak,
         )
+        if self.settings.compact_two_stage_enabled and compact_pause_before > 0:
+            self.state.compact_pause_windows_remaining = compact_pause_before - 1
 
         active = self.state.active_round
         if active is None or active.awaiting_window != window_slug:
@@ -599,12 +815,19 @@ class ReversalV11:
             )
             self.state.active_round = None
             self.state.blocked_trend_side = None
+            if self.settings.compact_two_stage_enabled:
+                self.state.compact_consecutive_losing_rounds = 0
             return "reversal_success"
 
+        completed_attempt = active.failures + 1
         active.failures += 1
-        if direct_buy:
+        if direct_buy and self.settings.tracks_direct_loss(completed_attempt):
             active.cumulative_loss += active.exit_sell_proceeds + active.entry_fees
-        if active.failures >= len(self.settings.stakes):
+        if (
+            self.settings.end_round_at_soft_loss_limit
+            and self.settings.soft_round_loss_limit is not None
+            and active.cumulative_loss >= self.settings.soft_round_loss_limit
+        ):
             metrics.forced_exit_rounds += 1
             self.state.blocked_trend_side = active.trend_side
             self.state.active_round = None
@@ -615,7 +838,63 @@ class ReversalV11:
                 - metrics.fees
                 - metrics.slippage
             )
-            return "forced_exit_after_fifteen_failures"
+            return "soft_loss_limit_reached"
+        if (
+            active.soft_limit_final_recovery
+            and not self.settings.continue_final_stage_until_success_or_unfunded
+        ):
+            metrics.forced_exit_rounds += 1
+            self.state.blocked_trend_side = active.trend_side
+            self.state.active_round = None
+            metrics.net_profit = (
+                metrics.sell_proceeds
+                + metrics.settlement_payout
+                - metrics.total_making_amount
+                - metrics.fees
+                - metrics.slippage
+            )
+            return "soft_limit_final_recovery_loss"
+        if (
+            active.failures >= self.settings.attempt_limit
+            and self.settings.continue_final_stage_until_success_or_unfunded
+        ):
+            # The named stage limit caps the progression and notification stage;
+            # it does not abandon a funded live round. Keep retrying the final
+            # full-recovery stage until the reversal wins or funding is short.
+            active.failures = self.settings.attempt_limit - 1
+            active.execution_phase = "idle"
+            active.split_transaction_hash = None
+            active.exit_sold_shares = Decimal("0")
+            active.exit_sell_proceeds = Decimal("0")
+            active.entry_submitted_price = None
+            active.planned_shares = Decimal("0")
+            active.entry_fees = Decimal("0")
+            active.entry_unmatched_attempts = 0
+            return "trend_continued_at_final_stage"
+        if active.failures >= self.settings.attempt_limit:
+            metrics.forced_exit_rounds += 1
+            self.state.blocked_trend_side = active.trend_side
+            self.state.active_round = None
+            if self.settings.compact_two_stage_enabled:
+                self._record_compact_losing_round()
+            metrics.net_profit = (
+                metrics.sell_proceeds
+                + metrics.settlement_payout
+                - metrics.total_making_amount
+                - metrics.fees
+                - metrics.slippage
+            )
+            return (
+                "compact_two_stage_loss"
+                if self.settings.compact_two_stage_enabled
+                else "first_stage_only_loss"
+                if self.settings.first_stage_only_enabled
+                else "fixed_notional_stages_loss"
+                if self.settings.fixed_notional_stages
+                else "forced_exit_after_twenty_five_failures"
+                if self.settings.attempt_limit == MAX_REVERSAL_STAGES
+                else "forced_exit_after_configured_failures"
+            )
         active.execution_phase = "idle"
         active.split_transaction_hash = None
         active.exit_sold_shares = Decimal("0")
@@ -623,7 +902,61 @@ class ReversalV11:
         active.entry_submitted_price = None
         active.planned_shares = Decimal("0")
         active.entry_fees = Decimal("0")
+        active.entry_unmatched_attempts = 0
         return "trend_continued"
+
+    def reconcile_stale_direct_entry(
+        self,
+        window_slug: str,
+        result: Direction | str,
+        *,
+        day: date | None = None,
+    ) -> str:
+        """Close a direct-buy round whose result cursor has already passed it.
+
+        This is a recovery path for a process that was suspended across several
+        windows.  It never creates a catch-up trade and is deliberately limited
+        to a fully completed direct entry, where no trend-side position exists.
+        """
+        active = self.state.active_round
+        if active is None or active.awaiting_window != window_slug:
+            return "stale_active_absent"
+        if (
+            active.split_transaction_hash != "direct-buy"
+            or active.execution_phase != "direct_entry_complete"
+        ):
+            raise RuntimeError(
+                "stale reversal round cannot be reconciled without position review"
+            )
+        if self.state.last_settled_slug is None:
+            return "stale_active_not_passed"
+        active_epoch = int(window_slug.rpartition("-")[2])
+        last_epoch = int(self.state.last_settled_slug.rpartition("-")[2])
+        if active_epoch >= last_epoch:
+            return "stale_active_not_passed"
+
+        result = Direction(result)
+        metrics = self.metrics(day)
+        metrics.settled_windows += 1
+        acquired_shares = active.exit_sold_shares
+        if result == active.target_side:
+            metrics.successful_rounds += 1
+            metrics.stage_successes[str(active.failures + 1)] += 1
+            metrics.settlement_payout += acquired_shares
+            outcome = "stale_reversal_success"
+        else:
+            metrics.forced_exit_rounds += 1
+            outcome = "stale_reversal_loss_closed"
+        metrics.net_profit = (
+            metrics.sell_proceeds
+            + metrics.settlement_payout
+            - metrics.total_making_amount
+            - metrics.fees
+            - metrics.slippage
+        )
+        self.state.active_round = None
+        self.state.blocked_trend_side = None
+        return outcome
 
     def resize_active_plan(self, plan: TradePlan, shares: Decimal) -> TradePlan:
         if shares <= 0:
@@ -649,7 +982,19 @@ class ReversalV11:
             split_complete_set=False,
         )
 
-    def abandon_filtered_attempt(self, plan: TradePlan) -> None:
+    def mark_observation_stage(self, plan: TradePlan) -> None:
+        active = self._require_active_plan(plan)
+        if plan.making_amount != 0 or active.execution_phase != "planned":
+            raise RuntimeError("only a planned zero-notional stage can be observed")
+        active.execution_phase = "observation_only"
+        self.state.last_opening_processed_slug = plan.window_slug
+
+    def abandon_filtered_attempt(
+        self,
+        plan: TradePlan,
+        *,
+        block_trend: bool = True,
+    ) -> None:
         active = self._require_active_plan(plan)
         if (
             active.execution_phase not in {"planned", "direct_entry_ready"}
@@ -667,12 +1012,56 @@ class ReversalV11:
             - self.metrics().fees
             - self.metrics().slippage
         )
-        self.state.blocked_trend_side = active.trend_side
+        if block_trend:
+            self.state.blocked_trend_side = active.trend_side
         self.state.last_opening_processed_slug = plan.window_slug
+        if self.settings.compact_two_stage_enabled and active.failures > 0:
+            self._record_compact_losing_round()
         self.state.active_round = None
+
+    def defer_unfilled_attempt(self, plan: TradePlan) -> None:
+        """Skip this window without consuming the stage or ending its round."""
+        active = self._require_active_plan(plan)
+        if (
+            active.execution_phase not in {"planned", "direct_entry_ready"}
+            or active.exit_sold_shares > 0
+        ):
+            raise RuntimeError(
+                "only an unfilled planned/ready attempt can be deferred"
+            )
+        active.committed -= plan.making_amount
+        self.metrics().total_making_amount -= plan.making_amount
+        active.awaiting_window = None
+        active.execution_phase = "idle"
+        active.split_transaction_hash = None
+        active.exit_sold_shares = Decimal("0")
+        active.exit_sell_proceeds = Decimal("0")
+        active.entry_submitted_price = None
+        active.planned_shares = Decimal("0")
+        active.entry_fees = Decimal("0")
+        active.entry_unmatched_attempts = 0
+        self.state.last_opening_processed_slug = plan.window_slug
+
+    def record_direct_entry_unmatched(self, plan: TradePlan) -> int:
+        active = self._require_active_plan(plan)
+        if active.exit_sold_shares > 0:
+            return active.entry_unmatched_attempts
+        active.entry_unmatched_attempts += 1
+        return active.entry_unmatched_attempts
 
     def abandon_dynamic_recovery(self, plan: TradePlan) -> None:
         self.abandon_filtered_attempt(plan)
+
+    def _record_compact_losing_round(self) -> None:
+        self.state.compact_consecutive_losing_rounds += 1
+        if (
+            self.state.compact_consecutive_losing_rounds
+            >= self.settings.compact_loss_round_limit
+        ):
+            self.state.compact_consecutive_losing_rounds = 0
+            self.state.compact_pause_windows_remaining = (
+                self.settings.compact_pause_windows
+            )
 
     def mark_direct_entry_ready(
         self,
@@ -946,6 +1335,12 @@ class ReversalV11:
                 cumulative_loss=Decimal(
                     str(active_payload.get("cumulative_loss", "0"))
                 ),
+                entry_unmatched_attempts=int(
+                    active_payload.get("entry_unmatched_attempts", 0)
+                ),
+                soft_limit_final_recovery=bool(
+                    active_payload.get("soft_limit_final_recovery", False)
+                ),
             )
             if isinstance(active_payload, dict)
             else None
@@ -967,7 +1362,7 @@ class ReversalV11:
                     str(stage): int(
                         (value.get("stage_successes") or {}).get(str(stage), 0)
                     )
-                    for stage in range(1, 16)
+                    for stage in range(1, MAX_REVERSAL_STAGES + 1)
                 },
                 maximum_same_direction_streak=int(
                     value.get("maximum_same_direction_streak", 0)
@@ -1016,7 +1411,11 @@ class ReversalV11:
             ),
             current_streak=int(payload.get("current_streak", 0)),
             last_settled_slug=payload.get("last_settled_slug"),
-            chainlink_price_mode=str(payload.get("chainlink_price_mode", "legacy")),
+            chainlink_price_mode=(
+                "twap60"
+                if str(payload.get("chainlink_price_mode", "legacy")) == "twap30"
+                else str(payload.get("chainlink_price_mode", "legacy"))
+            ),
             chainlink_open_prices={
                 str(slug): Decimal(str(price))
                 for slug, price in (payload.get("chainlink_open_prices") or {}).items()
@@ -1031,6 +1430,18 @@ class ReversalV11:
             gamma_mismatch_slugs=[
                 str(value) for value in payload.get("gamma_mismatch_slugs", [])
             ],
+            chain_verified_slugs=[
+                str(value) for value in payload.get("chain_verified_slugs", [])
+            ],
+            chain_mismatch_slugs=[
+                str(value) for value in payload.get("chain_mismatch_slugs", [])
+            ],
+            compact_consecutive_losing_rounds=int(
+                payload.get("compact_consecutive_losing_rounds", 0)
+            ),
+            compact_pause_windows_remaining=int(
+                payload.get("compact_pause_windows_remaining", 0)
+            ),
             last_volatility_pause_slug=payload.get("last_volatility_pause_slug"),
             reported_days=[str(value) for value in payload.get("reported_days", [])],
             daily=daily,
@@ -1086,10 +1497,14 @@ def build_exit_sequence(
     )
 
 
-def format_daily_report(report_day: date, metrics: DailyMetrics) -> str:
+def format_daily_report(
+    report_day: date,
+    metrics: DailyMetrics,
+    maximum_attempts: int = MAX_REVERSAL_STAGES,
+) -> str:
     stages = " / ".join(
         f"第{stage}次 {metrics.stage_successes.get(str(stage), 0)}"
-        for stage in range(1, 16)
+        for stage in range(1, maximum_attempts + 1)
     )
     return "\n".join(
         [
@@ -1098,7 +1513,8 @@ def format_daily_report(report_day: date, metrics: DailyMetrics) -> str:
             f"信号触发轮数: {metrics.triggered_rounds}",
             f"已确认拆分轮数: {metrics.executed_rounds}",
             f"成功轮数: {metrics.successful_rounds}",
-            f"十五次失败退出: {metrics.forced_exit_rounds}",
+            f"{'二十五' if maximum_attempts == 25 else maximum_attempts}次失败退出: "
+            f"{metrics.forced_exit_rounds}",
             f"各阶段成功: {stages}",
             f"最大连续同向窗口: {metrics.maximum_same_direction_streak}",
             f"总做市金额: {metrics.total_making_amount}U",

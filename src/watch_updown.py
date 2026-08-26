@@ -10,6 +10,7 @@ import re
 import sys
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
@@ -21,8 +22,27 @@ from dotenv import load_dotenv
 from requests import RequestException
 
 from src import __version__
-from src.crypto_resolution import CryptoResolutionMode, detect_crypto_resolution_mode
-from src.fair_value import btc_up_probability, choose_theoretical_action, estimate_sigma_per_sqrt_second
+from src.crypto_resolution import (
+    CryptoResolutionMode,
+    detect_crypto_resolution_mode,
+    has_official_btc_5m_twap_rule,
+)
+from src.fair_value import (
+    btc_up_probability,
+    btc_up_twap_probability,
+    choose_theoretical_action,
+    estimate_sigma_per_sqrt_second,
+    trailing_time_weighted_average,
+)
+from src.fast_directional_hedge_simple import (
+    FastDirectionalHedgeSimpleEngine,
+    FastDirectionalHedgeSimpleSettings,
+)
+from src.ewma_twap_fair import (
+    EwmaTwapSettings,
+    choose_ewma_twap_decision,
+    ewma_twap_fair_value,
+)
 from src.market_recorder import JsonlSnapshotWriter, build_snapshot
 from src.manual_trading import ManualTradeExecutor
 from src.polymarket import (
@@ -37,16 +57,23 @@ from src.polymarket import (
 from src.price_alignment import PolymarketPriceToBeatClient, StableOpenPriceTracker
 from src.price_signal import SpotPriceClient
 from src.polygon_split import splitter_from_config
+from src.polygon_resolution import PolygonResolutionReader
 from src.reversal_runtime import (
+    ChainResultMismatch,
     GammaResultMismatch,
     ReversalRuntime,
     market_health_from_books,
     previous_5m_slug,
     reversal_startup_self_check,
 )
-from src.reversal_v11 import Direction, ReversalV11
-from src.spread_maker_runtime import SpreadMakerRuntime
-from src.spread_market_maker import BookSide, OutcomeSide, SpreadMarketMaker, SpreadSnapshot
+from src.reversal_v11 import (
+    FIRST_STAGE_ONLY_STAKES,
+    SPARSE_RECOVERY_NOTIONALS,
+    TWO_WINDOW_FIXED_NOTIONALS,
+    Direction,
+    MarketHealth,
+    ReversalV11,
+)
 from src.telegram_commands import (
     DEFAULT_LAUNCH_STRATEGY,
     LIVE_STRATEGIES,
@@ -65,7 +92,88 @@ REVERSAL_COMPLETED_FAST_ATTEMPTS = 1
 
 SLUG_PATTERN = re.compile(r"^(btc-updown-5m-)(\d+)$")
 GAMMA_API = "https://gamma-api.polymarket.com"
+REVERSAL_FAST_FAK_RETRY_DELAY_SECONDS = 0.15
 _ACTIVE_NOTIFICATIONS: TradingNotificationService | None = None
+
+
+def is_reversal_clob_timeout(exc: BaseException) -> bool:
+    """Return true for transient CLOB transport timeouts handled fail-closed."""
+    error = str(exc).lower()
+    return isinstance(exc, requests.exceptions.Timeout) and (
+        "clob.polymarket.com" in error or "clob api" in error
+    )
+
+
+def reversal_profile_overrides(strategy: str) -> dict[str, object]:
+    overrides: dict[str, object] = {
+        "trigger_streak": REVERSAL_TRIGGER_STREAKS.get(strategy, 2),
+        "first_stage_rv60_filter_enabled": True,
+        "first_stage_rv300_filter_enabled": True,
+    }
+    if strategy in {"reversal_v11", "reversal_v11_four_streak"}:
+        overrides["maximum_attempts"] = 10
+        overrides["first_attempt_uses_first_stage_rules"] = True
+        overrides["full_loss_recovery_start_attempt"] = 2
+        overrides["full_loss_recovery_strict_funding"] = True
+        overrides["continue_final_stage_until_success_or_unfunded"] = True
+        overrides["market_filters_enabled"] = False
+    if strategy == "reversal_four_64":
+        overrides.update(
+            allocated_capital=Decimal("64"),
+            maximum_streak_loss=Decimal("64"),
+            hard_round_loss_limit=None,
+            soft_round_loss_limit=Decimal("64"),
+            one_final_recovery_after_soft_limit=False,
+            end_round_at_soft_loss_limit=True,
+            full_loss_recovery_start_attempt=2,
+            full_loss_recovery_strict_funding=True,
+            continue_final_stage_until_success_or_unfunded=False,
+        )
+    elif strategy == "reversal_three_16":
+        overrides.update(
+            allocated_capital=Decimal("16"),
+            maximum_streak_loss=Decimal("16"),
+            hard_round_loss_limit=None,
+            soft_round_loss_limit=Decimal("16"),
+            one_final_recovery_after_soft_limit=False,
+            end_round_at_soft_loss_limit=True,
+            full_loss_recovery_start_attempt=2,
+            full_loss_recovery_strict_funding=True,
+            continue_final_stage_until_success_or_unfunded=False,
+        )
+    elif strategy in {"reversal_first_stage", "reversal_or_fair_value"}:
+        overrides.update(
+            first_stage_only_enabled=True,
+            stakes=FIRST_STAGE_ONLY_STAKES,
+            full_loss_recovery_enabled=False,
+            dynamic_final_recovery_enabled=False,
+            market_filters_enabled=False,
+        )
+    elif strategy == "reversal_three_4_8":
+        overrides.update(
+            stakes=TWO_WINDOW_FIXED_NOTIONALS,
+            fixed_notional_stages=TWO_WINDOW_FIXED_NOTIONALS,
+            fixed_notional_max_ask=Decimal("0.49"),
+            fixed_notional_recovery_loss_start_attempt=6,
+            fixed_notional_recovery_start_attempt=7,
+            continue_final_stage_until_success_or_unfunded=True,
+            full_loss_recovery_enabled=False,
+            dynamic_final_recovery_enabled=False,
+            market_filters_enabled=False,
+        )
+    elif strategy == "reversal_v11_six_streak":
+        overrides.update(
+            stakes=SPARSE_RECOVERY_NOTIONALS,
+            sparse_recovery_notional_stages=SPARSE_RECOVERY_NOTIONALS,
+            sparse_recovery_start_attempt=5,
+            sparse_recovery_loss_start_attempt=4,
+            continue_final_stage_until_success_or_unfunded=True,
+            maximum_attempts=10,
+            full_loss_recovery_enabled=False,
+            dynamic_final_recovery_enabled=False,
+            market_filters_enabled=False,
+        )
+    return overrides
 
 
 @dataclass(frozen=True)
@@ -74,6 +182,22 @@ class AutoTradeSignal:
     token_id: str
     price: Decimal
     reason: str
+    size: Decimal | None = None
+    fair_probability: Decimal | None = None
+    action: str = "BUY"
+    role: str = "ENTRY"
+    executable_price: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class BookTrendEvidence:
+    side: str
+    selected_slope: Decimal
+    opposite_slope: Decimal
+    relative_slope: Decimal
+    pullback: Decimal
+    span_seconds: Decimal
+    samples: int
 
 
 @dataclass
@@ -87,6 +211,10 @@ class PaperPosition:
     settled: bool = False
     profit: Decimal | None = None
     accounted: bool = False
+    winner: str | None = None
+    exit_shares: Decimal = Decimal("0")
+    exit_proceeds: Decimal = Decimal("0")
+    exit_fee: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -123,6 +251,24 @@ class SignalConfirmationState:
         self.initial_price = None
 
 
+class AmbiguousTwapResult(RuntimeError):
+    def __init__(
+        self,
+        slug: str,
+        price_to_beat: Decimal,
+        ending_twap: Decimal,
+    ) -> None:
+        self.slug = slug
+        self.price_to_beat = price_to_beat
+        self.ending_twap = ending_twap
+        self.move = ending_twap - price_to_beat
+        super().__init__(
+            f"ambiguous Chainlink TWAP result for {slug}: "
+            f"price_to_beat={price_to_beat} ending_twap={ending_twap} "
+            f"move={self.move}; wait for terminal book or Gamma final outcome"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Watch rolling BTC 5m Up/Down Polymarket windows.")
     parser.add_argument("--slug", required=True, help="Current BTC 5m event slug or Polymarket event URL.")
@@ -135,6 +281,18 @@ def parse_args() -> argparse.Namespace:
         default="0.00005",
         help="Fallback and long-run floor for volatility per sqrt(second).",
     )
+    parser.add_argument("--ewma-twap-lambda", default="0.94")
+    parser.add_argument("--ewma-twap-realized-seconds", default="60")
+    parser.add_argument("--ewma-twap-weight", default="0.70")
+    parser.add_argument("--ewma-twap-min-edge", default="0.015")
+    parser.add_argument("--ewma-twap-half-spread-buffer", default="0.0025")
+    parser.add_argument("--ewma-twap-slippage-buffer", default="0.0030")
+    parser.add_argument("--ewma-twap-fee-rate", default="0.07")
+    parser.add_argument("--ewma-twap-kelly-fraction", default="0.25")
+    parser.add_argument("--ewma-twap-kelly-bankroll", default="1000")
+    parser.add_argument("--ewma-twap-max-notional", default="25")
+    parser.add_argument("--ewma-twap-entry-seconds", default="300")
+    parser.add_argument("--ewma-twap-cutoff-seconds", default="75")
     parser.add_argument("--clob-host", default="https://clob.polymarket.com")
     parser.add_argument("--market-data-timeout", type=int, default=3, help="Per-request timeout for CLOB and spot data.")
     parser.add_argument("--ws-proxy", help="Optional WebSocket proxy, e.g. socks5h://127.0.0.1:7898.")
@@ -264,7 +422,7 @@ def parse_args() -> argparse.Namespace:
         "--crypto-resolution-mode",
         choices=[mode.value for mode in CryptoResolutionMode],
         default="auto",
-        help="Resolution source: auto from market rules, legacy boundary price, or Chainlink 30-second TWAP.",
+        help="Resolution source: auto from market rules, legacy boundary price, or Chainlink 60-second TWAP.",
     )
     parser.add_argument(
         "--official-open-confirmations",
@@ -284,6 +442,62 @@ def parse_args() -> argparse.Namespace:
         default="1.00",
         help="Shrink fair-value probability toward 0.50 before evaluating edge; 1 disables calibration.",
     )
+    parser.add_argument(
+        "--fair-value-fee-rate",
+        default="0.07",
+        help="Taker fee coefficient deducted before testing fair-value edge.",
+    )
+    parser.add_argument(
+        "--fair-value-confirmation-min-seconds",
+        type=float,
+        default=0.0,
+        help="Extra duration after the book-trend confirmation; zero avoids duplicating it.",
+    )
+    parser.add_argument("--fair-value-book-trend-samples", type=int, default=3)
+    parser.add_argument("--fair-value-book-min-slope", default="0.003")
+    parser.add_argument("--fair-value-book-min-relative-slope", default="0.005")
+    parser.add_argument("--fair-value-book-max-pullback", default="0.01")
+    parser.add_argument("--fdh-entry-price-min", default="0.53")
+    parser.add_argument("--fdh-entry-price-max", default="0.60")
+    parser.add_argument("--fdh-entry-confirm-ticks", type=int, default=2)
+    parser.add_argument("--fdh-entry-confirm-min-interval-ms", type=int, default=150)
+    parser.add_argument("--fdh-base-position-size", default="2")
+    parser.add_argument("--fdh-min-ask-gap", default="0.04")
+    parser.add_argument("--fdh-max-spread", default="0.04")
+    parser.add_argument("--fdh-max-ask-sum", default="1.06")
+    parser.add_argument("--fdh-max-entry-drift", default="0.02")
+    parser.add_argument("--fdh-entry-max-slippage", default="0.02")
+    parser.add_argument("--fdh-initial-stop-pct", default="0.25")
+    parser.add_argument("--fdh-trailing-start-gain", default="0.15")
+    parser.add_argument("--fdh-break-even-buffer", default="0.00")
+    parser.add_argument("--fdh-trailing-drawdown-pct", default="0.20")
+    parser.add_argument("--fdh-stop-confirm-ticks", type=int, default=2)
+    parser.add_argument("--fdh-fast-move-window-ms", type=int, default=500)
+    parser.add_argument("--fdh-fast-move-threshold", default="0.05")
+    parser.add_argument("--fdh-fast-stop-confirm-ticks", type=int, default=1)
+    parser.add_argument("--fdh-emergency-stop-penetration", default="0.06")
+    parser.add_argument("--fdh-hedge-max-slippage", default="0.05")
+    parser.add_argument("--fdh-hedge-max-price", default="0.85")
+    parser.add_argument("--fdh-hedge-entry-max-seconds", default="150")
+    parser.add_argument("--fdh-hedge-entry-min-seconds", default="30")
+    parser.add_argument("--fdh-exit-max-slippage", default="0.03")
+    parser.add_argument("--fdh-take-profit-net-per-share", default="0.02")
+    parser.add_argument("--fdh-take-profit-confirm-ticks", type=int, default=1)
+    parser.add_argument("--fdh-max-entries-per-window", type=int, default=2)
+    parser.add_argument("--fdh-normal-entry-max-seconds", default="180")
+    parser.add_argument("--fdh-normal-entry-min-seconds", default="60")
+    parser.add_argument("--fdh-stop-new-entry-time", default="30")
+    parser.add_argument("--fdh-risk-only-time", default="15")
+    parser.add_argument("--fdh-fee-rate", default="0.07")
+    parser.add_argument("--fdh-max-book-age-seconds", default="0.50")
+    parser.add_argument(
+        "--fdh-state-json",
+        default="data/fast_directional_hedge_simple_state.json",
+    )
+    parser.add_argument(
+        "--fdh-record-jsonl",
+        default="data/fast_directional_hedge_simple_events.jsonl",
+    )
     parser.add_argument("--smart-score-threshold", default="70")
     parser.add_argument("--smart-score-entry-seconds", type=int, default=100)
     parser.add_argument("--smart-score-cutoff-seconds", type=int, default=25)
@@ -292,6 +506,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smart-score-slippage", default="0.01")
     parser.add_argument("--smart-score-trend-samples", type=int, default=3)
     parser.add_argument("--smart-score-stability-samples", type=int, default=3)
+    parser.add_argument("--momentum-entry-seconds", type=int, default=270)
+    parser.add_argument("--momentum-cutoff-seconds", type=int, default=25)
+    parser.add_argument("--momentum-min-move-percent", default="0.0004")
+    parser.add_argument("--momentum-min-move-usd", default="20")
+    parser.add_argument("--momentum-confirmation-seconds", type=int, default=30)
+    parser.add_argument("--momentum-min-entry", default="0.45")
+    parser.add_argument("--momentum-max-entry", default="0.75")
+    parser.add_argument("--momentum-fee-rate", default="0.07")
+    parser.add_argument("--fair-scratch-entry-seconds", type=int, default=180)
+    parser.add_argument("--fair-scratch-cutoff-seconds", type=int, default=25)
+    parser.add_argument("--fair-scratch-min-entry", default="0.45")
+    parser.add_argument("--fair-scratch-max-entry", default="0.55")
+    parser.add_argument("--fair-scratch-min-probability", default="0.53")
+    parser.add_argument("--fair-scratch-min-net-edge", default="0.02")
+    parser.add_argument("--fair-scratch-fee-rate", default="0.07")
+    parser.add_argument("--fair-scratch-exit-probability", default="0.52")
+    parser.add_argument("--fair-scratch-price-tolerance", default="0.02")
     parser.add_argument("--open-060-entry-seconds", type=int, default=300)
     parser.add_argument("--open-060-cutoff-seconds", type=int, default=270)
     parser.add_argument("--open-060-target", default="0.60")
@@ -363,9 +594,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--spread-maker-state-json",
-        default="data/spread_market_maker_state.json",
-        help="Crash-safe persistent state for spread_market_maker.",
+        "--reversal-first-stage-rv300-persistence-ratio",
+        default="0.35",
+        help=(
+            "When RV300 exceeds its base threshold, block only if RV60/RV300 "
+            "is at least this ratio, unless the hard multiplier is reached."
+        ),
+    )
+    parser.add_argument(
+        "--reversal-first-stage-rv300-hard-multiplier",
+        default="2.0",
+        help="Always block when RV300 reaches this multiple of its base threshold.",
     )
     parser.add_argument("--late-entry-start-seconds", type=int, default=55)
     parser.add_argument("--late-entry-cutoff-seconds", type=int, default=8)
@@ -487,6 +726,35 @@ def fetch_winner(slug: str) -> str | None:
     return None
 
 
+def fetch_near_certain_market_winner(
+    slug: str,
+    *,
+    winner_min_price: Decimal = Decimal("0.98"),
+    loser_max_price: Decimal = Decimal("0.02"),
+) -> Direction | None:
+    """Read Gamma's current market prices without treating them as final audit."""
+    response = requests.get(
+        f"{GAMMA_API}/events",
+        params={"slug": slug, "limit": 1},
+        timeout=3,
+    )
+    response.raise_for_status()
+    events = response.json()
+    markets = events[0].get("markets") if events else None
+    if not markets:
+        return None
+    try:
+        prices = json.loads(markets[0].get("outcomePrices") or "")
+        up_price, down_price = (Decimal(str(prices[0])), Decimal(str(prices[1])))
+    except (IndexError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    up_wins = up_price >= winner_min_price and down_price <= loser_max_price
+    down_wins = down_price >= winner_min_price and up_price <= loser_max_price
+    if up_wins == down_wins:
+        return None
+    return Direction.UP if up_wins else Direction.DOWN
+
+
 def fetch_reversal_chainlink_open_prices(
     client: PolymarketPriceToBeatClient,
     market: Market,
@@ -511,31 +779,59 @@ def fetch_reversal_chainlink_open_prices(
     return prices
 
 
-def fetch_reversal_twap_open_prices(
-    client: SpotPriceClient,
+def fetch_reversal_twap_completed_prices(
     market: Market,
-    known_prices: dict[str, Decimal] | None = None,
-    lookback_windows: int = 2,
-    max_distance_ms: int = 1000,
-) -> dict[str, Decimal]:
-    """Read cached official TWAP observations nearest consecutive boundaries.
+    known_price_to_beat: dict[str, Decimal],
+    ending_twap: Decimal,
+    minimum_decisive_move_usd: Decimal = Decimal("1.00"),
+) -> dict[str, tuple[Decimal, Decimal]]:
+    """Build one official-rule result from fixed Price to Beat and ending TWAP.
 
-    RTDS provides no history or replay. Missing boundary observations therefore
-    fail closed instead of falling back to the legacy spot boundary.
+    The Price to Beat is the Chainlink TWAP-60 value fixed at the window's
+    opening boundary. The value observed at the next boundary is that window's
+    ending TWAP. Legacy instant ``openPrice`` values are a different series and
+    must never be substituted. Very small boundary moves fail closed because
+    one-second delivery alignment can decide those windows; Gamma's finalized
+    outcome subsequently fills them in.
     """
-    known = known_prices or {}
-    prices: dict[str, Decimal] = {}
-    for offset in range(lookback_windows, -1, -1):
-        slug = previous_5m_slug(market.slug, offset) if offset else market.slug
-        if slug in known:
-            prices[slug] = known[slug]
-            continue
-        boundary = market.event_start_time - timedelta(seconds=300 * offset)
-        prices[slug] = client.polymarket_chainlink_twap_near(
-            int(boundary.timestamp() * 1000),
-            max_distance_ms,
-        ).price
-    return prices
+    completed_slug = previous_5m_slug(market.slug)
+    price_to_beat = known_price_to_beat.get(completed_slug)
+    if price_to_beat is None:
+        raise RuntimeError(
+            f"fixed Chainlink TWAP Price to Beat unavailable for completed window "
+            f"{completed_slug}"
+        )
+    if ending_twap <= 0:
+        raise RuntimeError(
+            f"invalid ending Chainlink TWAP for {market.slug}: {ending_twap}"
+        )
+    if minimum_decisive_move_usd < 0:
+        raise ValueError("minimum decisive TWAP move must not be negative")
+    move = ending_twap - price_to_beat
+    if abs(move) <= minimum_decisive_move_usd:
+        raise AmbiguousTwapResult(
+            completed_slug,
+            price_to_beat,
+            ending_twap,
+        )
+    return {completed_slug: (price_to_beat, ending_twap)}
+
+
+def terminal_book_winner(
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    *,
+    winner_min_bid: Decimal = Decimal("0.98"),
+    loser_max_bid: Decimal = Decimal("0.02"),
+) -> Direction | None:
+    """Return a terminal consensus only from executable best bids."""
+    if up_quote is None or down_quote is None:
+        return None
+    up_wins = up_quote.bid >= winner_min_bid and down_quote.bid <= loser_max_bid
+    down_wins = down_quote.bid >= winner_min_bid and up_quote.bid <= loser_max_bid
+    if up_wins == down_wins:
+        return None
+    return Direction.UP if up_wins else Direction.DOWN
 
 
 def fetch_reversal_completed_window_prices(
@@ -568,6 +864,11 @@ def fetch_reversal_completed_window_prices(
 def is_http_rate_limit(exc: BaseException) -> bool:
     response = getattr(exc, "response", None)
     return getattr(response, "status_code", None) == 429
+
+
+def suppress_reversal_boundary_alert(exc: BaseException) -> bool:
+    """Keep expected, retryable boundary states out of realtime alerts."""
+    return is_http_rate_limit(exc) or isinstance(exc, AmbiguousTwapResult)
 
 
 def accept_open_price(
@@ -640,6 +941,22 @@ def executable_ask_depth(
     )
 
 
+def executable_bid_depth(
+    book: OrderBookSnapshot,
+    minimum_price: Decimal,
+) -> Decimal:
+    if minimum_price <= 0:
+        return Decimal("0")
+    return sum(
+        (
+            level.size
+            for level in book.bids
+            if level.price >= minimum_price and level.size > 0
+        ),
+        Decimal("0"),
+    )
+
+
 def effective_pullback_tolerance(
     fixed_usd: Decimal,
     reference_move_usd: Decimal,
@@ -669,23 +986,99 @@ def recent_spot_samples_support_side(
     recent = prices[-sample_count:]
     if side == "UP":
         distances = [price - start_price for price in recent]
+        if not all(distance > 0 for distance in distances):
+            return False
         peak_distance = max(distances)
         tolerance = effective_pullback_tolerance(
             pullback_tolerance_usd,
             peak_distance,
             pullback_tolerance_percent,
         )
-        return all(distance > 0 for distance in distances) and peak_distance - distances[-1] <= tolerance
+        return peak_distance - distances[-1] <= tolerance
     if side == "DOWN":
         distances = [start_price - price for price in recent]
+        if not all(distance > 0 for distance in distances):
+            return False
         peak_distance = max(distances)
         tolerance = effective_pullback_tolerance(
             pullback_tolerance_usd,
             peak_distance,
             pullback_tolerance_percent,
         )
-        return all(distance > 0 for distance in distances) and peak_distance - distances[-1] <= tolerance
+        return peak_distance - distances[-1] <= tolerance
     return False
+
+
+def book_trend_evidence(
+    up_ask_prices: list[Decimal],
+    down_ask_prices: list[Decimal],
+    sample_times: list[float],
+    side: str,
+    sample_count: int = 3,
+    minimum_selected_slope: Decimal = Decimal("0.003"),
+    minimum_relative_slope: Decimal = Decimal("0.005"),
+    maximum_pullback: Decimal = Decimal("0.01"),
+) -> BookTrendEvidence | None:
+    """Confirm same-window direction from executable asks, not BTC movement.
+
+    The selected token must rise, outperform the opposite token, and remain
+    near its recent high. Samples are reset at every five-minute boundary, so
+    cross-window prices can never leak into this direction decision.
+    """
+    if (
+        side not in {"UP", "DOWN"}
+        or sample_count < 3
+        or len(up_ask_prices) < sample_count
+        or len(down_ask_prices) < sample_count
+        or len(sample_times) < sample_count
+        or min(minimum_selected_slope, minimum_relative_slope, maximum_pullback) < 0
+    ):
+        return None
+    recent_up = up_ask_prices[-sample_count:]
+    recent_down = down_ask_prices[-sample_count:]
+    recent_times = sample_times[-sample_count:]
+    if any(current <= previous for previous, current in zip(recent_times, recent_times[1:])):
+        return None
+    selected = recent_up if side == "UP" else recent_down
+    opposite = recent_down if side == "UP" else recent_up
+    x = [Decimal(str(value - recent_times[0])) for value in recent_times]
+    x_mean = sum(x, Decimal("0")) / Decimal(sample_count)
+    denominator = sum(((value - x_mean) ** 2 for value in x), Decimal("0"))
+    if denominator <= 0:
+        return None
+
+    def slope(values: list[Decimal]) -> Decimal:
+        y_mean = sum(values, Decimal("0")) / Decimal(sample_count)
+        return (
+            sum(
+                (
+                    (time_value - x_mean) * (price_value - y_mean)
+                    for time_value, price_value in zip(x, values)
+                ),
+                Decimal("0"),
+            )
+            / denominator
+        )
+
+    selected_slope = slope(selected)
+    opposite_slope = slope(opposite)
+    relative_slope = selected_slope - opposite_slope
+    pullback = max(selected) - selected[-1]
+    if (
+        selected_slope < minimum_selected_slope
+        or relative_slope < minimum_relative_slope
+        or pullback > maximum_pullback
+    ):
+        return None
+    return BookTrendEvidence(
+        side=side,
+        selected_slope=selected_slope,
+        opposite_slope=opposite_slope,
+        relative_slope=relative_slope,
+        pullback=pullback,
+        span_seconds=x[-1],
+        samples=sample_count,
+    )
 
 
 def protective_open_cross_buffer(
@@ -772,6 +1165,17 @@ def shrink_probability_toward_even(probability: Decimal, shrinkage: Decimal) -> 
     return Decimal("0.5") + shrinkage * (probability - Decimal("0.5"))
 
 
+def cross_window_volatility_series(
+    samples: list[tuple[float, Decimal]] | deque[tuple[float, Decimal]],
+    latest: tuple[float, Decimal] | None = None,
+) -> tuple[list[Decimal], list[float]]:
+    """Return rolling BTC history reserved exclusively for volatility."""
+    combined = list(samples)
+    if latest is not None and (not combined or latest[0] > combined[-1][0]):
+        combined.append(latest)
+    return [price for _, price in combined], [observed_at for observed_at, _ in combined]
+
+
 def late_spot_buffer_metrics(
     prices: list[Decimal],
     start_price: Decimal,
@@ -832,9 +1236,17 @@ def late_spot_safety_metrics(
 
 
 def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
+    if strategy == "fast_directional_hedge_simple":
+        return max(configured_limit, 8)
     if strategy == "late_one_way":
         return min(2, configured_limit)
-    if strategy in {"smart_score", "open_060"}:
+    if strategy in {
+        "smart_score",
+        "ewma_twap_fair",
+        "momentum_confirmation",
+        "reversal_four_64",
+        "open_060",
+    }:
         return min(1, configured_limit)
     if is_fair_value_strategy(strategy):
         # --max-trades remains the primary-entry allowance. Aggregate protection
@@ -844,14 +1256,141 @@ def strategy_trade_limit(strategy: str, configured_limit: int) -> int:
 
 
 def is_fair_value_strategy(strategy: str) -> bool:
-    return strategy in {"fair_value_edge", "late_070"}
+    return strategy in {
+        "fair_value_edge",
+        "late_070",
+        "reversal_or_fair_value",
+    }
+
+
+def hybrid_fair_value_fallback_allowed(
+    strategy: str,
+    reversal_order: dict[str, Any] | None,
+    active_round: object | None,
+    prepared_split: object | None,
+    *,
+    current_slug: str | None = None,
+    signal_owner: str | None = None,
+) -> bool:
+    """Run the hybrid fair-value channel when reversal owns no current trade.
+
+    Reversal history and fair-value probability are independent signal inputs.
+    A stale round from another window must not suppress the fair-value channel,
+    while a matched fair-value entry permanently owns the current window so a
+    late reversal-history repair cannot create a second strategy entry.
+    """
+    if strategy != "reversal_or_fair_value" or signal_owner == "reversal":
+        return False
+    if signal_owner == "fair_value":
+        return True
+    if reversal_order is not None:
+        return False
+    if current_slug is None:
+        return active_round is None and prepared_split is None
+    active_window = getattr(active_round, "awaiting_window", None)
+    prepared_window = getattr(prepared_split, "window_slug", None)
+    return active_window != current_slug and prepared_window != current_slug
 
 
 def primary_signal_confirmation_count(strategy: str, configured_count: int) -> int:
     """Return the confirmation count for non-protective primary signals."""
-    if strategy == "late_070":
+    if strategy in {
+        "fair_value_edge",
+        "reversal_or_fair_value",
+        "late_070",
+        "fast_directional_hedge_simple",
+        "ewma_twap_fair",
+    }:
         return 1
     return configured_count
+
+
+def choose_ewma_twap_signal(
+    market: Market,
+    volatility_samples: list[tuple[float, Decimal]],
+    underlying_spot: Decimal,
+    price_to_beat: Decimal,
+    seconds_to_expiry: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    settings: EwmaTwapSettings,
+    fallback_sigma: Decimal,
+) -> AutoTradeSignal | None:
+    fair = ewma_twap_fair_value(
+        volatility_samples,
+        underlying_spot,
+        price_to_beat,
+        seconds_to_expiry,
+        settings,
+        fallback_sigma,
+    )
+    if fair is None:
+        return None
+    decision = choose_ewma_twap_decision(
+        fair,
+        up_quote.ask if up_quote is not None else None,
+        down_quote.ask if down_quote is not None else None,
+        seconds_to_expiry,
+        settings,
+    )
+    if decision is None:
+        return None
+    token_index = 0 if decision.side == "UP" else 1
+    return AutoTradeSignal(
+        side=decision.side,
+        token_id=market.token_ids[token_index],
+        price=decision.price,
+        size=decision.shares,
+        fair_probability=decision.probability,
+        reason=(
+            f"ewma_twap_fair p={decision.probability:.4f} "
+            f"raw_edge={decision.raw_edge:.4f} fee={decision.fee_per_share:.4f} "
+            f"net_model_edge={decision.net_model_edge:.4f} "
+            f"sigma={fair.sigma_per_sqrt_second:.8f} "
+            f"effective_seconds={fair.effective_variance_seconds:.2f} "
+            f"kelly_notional={decision.notional:.4f}"
+        ),
+    )
+
+
+def choose_fast_directional_hedge_simple_signal(
+    engine: FastDirectionalHedgeSimpleEngine,
+    market: Market,
+    start_price: Decimal,
+    spot_price: Decimal,
+    seconds_to_end: Decimal,
+    sigma_per_sqrt_second: Decimal,
+    base_probability_up: Decimal,
+    prices: list[Decimal],
+    sample_times: list[float],
+    up_book: OrderBookSnapshot,
+    down_book: OrderBookSnapshot,
+    observed_at: float | None = None,
+) -> AutoTradeSignal | None:
+    decision = engine.evaluate(
+        slug=market.slug,
+        seconds_to_expiry=seconds_to_end,
+        up_book=up_book,
+        down_book=down_book,
+        spot_price=spot_price,
+        price_to_beat=start_price,
+        sigma_per_sqrt_second=sigma_per_sqrt_second,
+        observed_at=observed_at,
+    )
+    if decision is None:
+        return None
+    token_id = market.token_ids[0] if decision.side == "UP" else market.token_ids[1]
+    return AutoTradeSignal(
+        side=decision.side,
+        token_id=token_id,
+        price=decision.limit_price,
+        reason=decision.reason,
+        size=decision.quantity,
+        fair_probability=decision.probability,
+        action=decision.action,
+        role=decision.role,
+        executable_price=decision.executable_price,
+    )
 
 
 def choose_open_060_signal(
@@ -1009,6 +1548,7 @@ def buy_limit_price_preserving_edge(
     probability: Decimal,
     seconds_to_end: Decimal,
     base_edge: Decimal,
+    fee_rate: Decimal = Decimal("0"),
 ) -> Decimal:
     tick = Decimal(tick_size)
     candidate = buy_limit_price_with_slippage(
@@ -1018,7 +1558,8 @@ def buy_limit_price_preserving_edge(
         maximum_price,
     )
     while candidate > ask_price:
-        if probability - candidate >= required_fair_value_edge(
+        fee_per_share = fee_rate * candidate * (Decimal("1") - candidate)
+        if probability - candidate - fee_per_share >= required_fair_value_edge(
             candidate,
             seconds_to_end,
             base_edge,
@@ -1055,12 +1596,17 @@ def choose_fair_value_edge_signal(
     max_ask_sum: Decimal,
     min_seconds_before_end: Decimal = Decimal("0"),
     min_win_probability: Decimal = Decimal("0"),
-    recent_spot_prices: list[Decimal] | None = None,
-    start_price: Decimal | None = None,
+    up_ask_prices: list[Decimal] | None = None,
+    down_ask_prices: list[Decimal] | None = None,
+    book_sample_times: list[float] | None = None,
+    book_trend_samples: int = 3,
+    book_trend_min_slope: Decimal = Decimal("0.003"),
+    book_trend_min_relative_slope: Decimal = Decimal("0.005"),
+    book_trend_max_pullback: Decimal = Decimal("0.01"),
     low_entry_cutoff: Decimal = Decimal("0.50"),
     low_entry_min_win_probability: Decimal = Decimal("0.61"),
-    low_entry_confirmation_samples: int = 3,
     probability_shrinkage: Decimal = Decimal("1"),
+    fee_rate: Decimal = Decimal("0"),
 ) -> AutoTradeSignal | None:
     if seconds_to_end > decision_seconds_before_end or seconds_to_end < min_seconds_before_end:
         return None
@@ -1073,18 +1619,65 @@ def choose_fair_value_edge_signal(
     raw_probability_up = probability_up
     probability_up = shrink_probability_toward_even(probability_up, probability_shrinkage)
     down_probability = Decimal("1") - probability_up
-    up_edge = probability_up - up_quote.ask
-    down_edge = down_probability - down_quote.ask
-    if up_edge >= down_edge:
+    up_raw_edge = probability_up - up_quote.ask
+    down_raw_edge = down_probability - down_quote.ask
+    up_fee = fee_rate * up_quote.ask * (Decimal("1") - up_quote.ask)
+    down_fee = fee_rate * down_quote.ask * (Decimal("1") - down_quote.ask)
+    up_edge = up_raw_edge - up_fee
+    down_edge = down_raw_edge - down_fee
+    if (
+        not up_ask_prices
+        or not down_ask_prices
+        or up_ask_prices[-1] != up_quote.ask
+        or down_ask_prices[-1] != down_quote.ask
+    ):
+        return None
+    trend_candidates = [
+        evidence
+        for evidence in (
+            book_trend_evidence(
+                up_ask_prices,
+                down_ask_prices,
+                book_sample_times or [],
+                "UP",
+                book_trend_samples,
+                book_trend_min_slope,
+                book_trend_min_relative_slope,
+                book_trend_max_pullback,
+            ),
+            book_trend_evidence(
+                up_ask_prices,
+                down_ask_prices,
+                book_sample_times or [],
+                "DOWN",
+                book_trend_samples,
+                book_trend_min_slope,
+                book_trend_min_relative_slope,
+                book_trend_max_pullback,
+            ),
+        )
+        if evidence is not None
+    ]
+    if not trend_candidates:
+        return None
+    trend = max(
+        trend_candidates,
+        key=lambda evidence: (evidence.relative_slope, evidence.selected_slope),
+    )
+    if trend.side == "UP":
         side = "UP"
         token_id = market.token_ids[0]
         entry = up_quote.ask
         edge = up_edge
+        raw_edge = up_raw_edge
+        fee_per_share = up_fee
     else:
         side = "DOWN"
         token_id = market.token_ids[1]
         entry = down_quote.ask
         edge = down_edge
+        raw_edge = down_raw_edge
+        fee_per_share = down_fee
 
     if entry < min_entry or entry > max_entry:
         return None
@@ -1092,17 +1685,6 @@ def choose_fair_value_edge_signal(
     required_probability = min_win_probability
     if entry < low_entry_cutoff:
         required_probability = max(required_probability, low_entry_min_win_probability)
-        if (
-            recent_spot_prices is None
-            or start_price is None
-            or not recent_spot_samples_support_side(
-                recent_spot_prices,
-                start_price,
-                side,
-                low_entry_confirmation_samples,
-            )
-        ):
-            return None
     if selected_probability < required_probability:
         return None
 
@@ -1117,12 +1699,167 @@ def choose_fair_value_edge_signal(
         token_id=token_id,
         price=entry,
         reason=(
-            f"fair_value_edge entry={entry} edge={edge.quantize(Decimal('0.0001'))} "
+            f"fair_value_edge entry={entry} raw_edge={raw_edge.quantize(Decimal('0.0001'))} "
+            f"fee={fee_per_share.quantize(Decimal('0.0001'))} "
+            f"net_edge={edge.quantize(Decimal('0.0001'))} "
             f"required_edge={required_edge.quantize(Decimal('0.0001'))} "
             f"required_probability={required_probability.quantize(Decimal('0.0001'))} "
             f"p_up={probability_up.quantize(Decimal('0.0001'))} "
             f"raw_p_up={raw_probability_up.quantize(Decimal('0.0001'))} "
             f"shrinkage={probability_shrinkage.quantize(Decimal('0.01'))} "
+            f"book_samples={trend.samples} "
+            f"book_slope={trend.selected_slope:+.6f}/s "
+            f"opposite_slope={trend.opposite_slope:+.6f}/s "
+            f"relative_slope={trend.relative_slope:+.6f}/s "
+            f"book_span={trend.span_seconds:.3f}s "
+            f"book_pullback={trend.pullback:.4f} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def choose_momentum_confirmation_signal(
+    market: Market,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    recent_spot_prices: list[Decimal],
+    recent_sample_times: list[float],
+    start_price: Decimal,
+    entry_seconds: Decimal = Decimal("240"),
+    cutoff_seconds: Decimal = Decimal("25"),
+    min_move_percent: Decimal = Decimal("0.0004"),
+    min_move_usd: Decimal = Decimal("40"),
+    min_entry: Decimal = Decimal("0.45"),
+    max_entry: Decimal = Decimal("0.70"),
+    max_spread: Decimal = Decimal("0.05"),
+    min_ask_sum: Decimal = Decimal("0.90"),
+    max_ask_sum: Decimal = Decimal("1.10"),
+    confirmation_seconds: int = 30,
+) -> AutoTradeSignal | None:
+    """Strategy A: direction comes only from BTC momentum and order-book skew."""
+    if (
+        seconds_to_end > entry_seconds
+        or seconds_to_end < cutoff_seconds
+        or start_price <= 0
+        or len(recent_spot_prices) != len(recent_sample_times)
+        or not recent_spot_prices
+        or confirmation_seconds < 1
+    ):
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and up_quote.bid is not None and up_quote.ask is not None
+    assert down_quote is not None and down_quote.bid is not None and down_quote.ask is not None
+
+    current_price = recent_spot_prices[-1]
+    directional_move = current_price - start_price
+    required_move = max(start_price * min_move_percent, min_move_usd)
+    if abs(directional_move) < required_move:
+        return None
+    side = "UP" if directional_move > 0 else "DOWN"
+
+    confirmation_cutoff = recent_sample_times[-1] - float(confirmation_seconds)
+    prior_indices = [
+        index for index, observed_at in enumerate(recent_sample_times)
+        if observed_at <= confirmation_cutoff
+    ]
+    if not prior_indices:
+        return None
+    confirmation_move = current_price - recent_spot_prices[prior_indices[-1]]
+    if (side == "UP" and confirmation_move <= 0) or (side == "DOWN" and confirmation_move >= 0):
+        return None
+
+    selected_quote = up_quote if side == "UP" else down_quote
+    opposite_quote = down_quote if side == "UP" else up_quote
+    if selected_quote.bid <= opposite_quote.bid:
+        return None
+    entry = selected_quote.ask
+    if entry < min_entry or entry > max_entry:
+        return None
+
+    return AutoTradeSignal(
+        side=side,
+        token_id=market.token_ids[0] if side == "UP" else market.token_ids[1],
+        price=entry,
+        reason=(
+            f"momentum_confirmation side={side} move_usd={directional_move.quantize(Decimal('0.01'))} "
+            f"confirmation_move={confirmation_move.quantize(Decimal('0.01'))} "
+            f"confirmation_seconds={confirmation_seconds} "
+            f"entry={entry} "
+            f"book_skew={(selected_quote.bid - opposite_quote.bid).quantize(Decimal('0.0001'))} "
+            f"seconds_left={int(seconds_to_end)}"
+        ),
+    )
+
+
+def choose_fair_value_scratch_signal(
+    market: Market,
+    probability_up: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    seconds_to_end: Decimal,
+    entry_seconds: Decimal = Decimal("180"),
+    cutoff_seconds: Decimal = Decimal("25"),
+    min_entry: Decimal = Decimal("0.45"),
+    max_entry: Decimal = Decimal("0.55"),
+    min_probability: Decimal = Decimal("0.53"),
+    min_net_edge: Decimal = Decimal("0.02"),
+    fee_rate: Decimal = Decimal("0.07"),
+    max_spread: Decimal = Decimal("0.05"),
+    min_ask_sum: Decimal = Decimal("0.90"),
+    max_ask_sum: Decimal = Decimal("1.10"),
+    probability_shrinkage: Decimal = Decimal("1"),
+) -> AutoTradeSignal | None:
+    """Strategy B: calibrated fair value plus a fee-adjusted edge gate."""
+    if seconds_to_end > entry_seconds or seconds_to_end < cutoff_seconds:
+        return None
+    ok, _ = quotes_pass_sanity_checks(
+        up_quote,
+        down_quote,
+        max_spread,
+        min_ask_sum,
+        max_ask_sum,
+    )
+    if not ok:
+        return None
+    assert up_quote is not None and up_quote.ask is not None
+    assert down_quote is not None and down_quote.ask is not None
+
+    calibrated_up = shrink_probability_toward_even(
+        probability_up,
+        probability_shrinkage,
+    )
+    candidates: list[tuple[Decimal, str, str, Decimal, Decimal]] = []
+    for side, token_id, quote, probability in (
+        ("UP", market.token_ids[0], up_quote, calibrated_up),
+        ("DOWN", market.token_ids[1], down_quote, Decimal("1") - calibrated_up),
+    ):
+        entry = quote.ask
+        if entry < min_entry or entry > max_entry or probability < min_probability:
+            continue
+        fee_per_share = fee_rate * entry * (Decimal("1") - entry)
+        net_edge = probability - entry - fee_per_share
+        if net_edge >= min_net_edge:
+            candidates.append((net_edge, side, token_id, entry, probability))
+    if not candidates:
+        return None
+    net_edge, side, token_id, entry, probability = max(candidates, key=lambda item: item[0])
+    return AutoTradeSignal(
+        side=side,
+        token_id=token_id,
+        price=entry,
+        reason=(
+            f"fair_value_scratch side={side} entry={entry} "
+            f"probability={probability.quantize(Decimal('0.0001'))} "
+            f"net_edge={net_edge.quantize(Decimal('0.0001'))} "
             f"seconds_left={int(seconds_to_end)}"
         ),
     )
@@ -1305,9 +2042,9 @@ def choose_smart_score_signal(
     )
     breakdown = SmartScoreBreakdown(
         total=(
-            edge_quality * Decimal("45")
-            + trend_quality * Decimal("20")
-            + market_quality * Decimal("15")
+            edge_quality * Decimal("50")
+            + trend_quality * Decimal("10")
+            + market_quality * Decimal("20")
             + stability_quality * Decimal("15")
             + timing_quality * Decimal("5")
         ),
@@ -1323,9 +2060,9 @@ def choose_smart_score_signal(
                 else Decimal("0")
             )
         ),
-        edge=edge_quality * Decimal("45"),
-        trend=trend_quality * Decimal("20"),
-        market=market_quality * Decimal("15"),
+        edge=edge_quality * Decimal("50"),
+        trend=trend_quality * Decimal("10"),
+        market=market_quality * Decimal("20"),
         stability=stability_quality * Decimal("15"),
         timing=timing_quality * Decimal("5"),
     )
@@ -1638,6 +2375,24 @@ def response_fill_amounts(
     return cost, shares
 
 
+def response_sell_fill_amounts(
+    response: dict[str, Any],
+    fallback_price: Decimal,
+    fallback_shares: Decimal,
+) -> tuple[Decimal, Decimal]:
+    try:
+        shares = Decimal(str(response.get("makingAmount") or "0"))
+        proceeds = Decimal(str(response.get("takingAmount") or "0"))
+    except (ArithmeticError, ValueError):
+        shares = Decimal("0")
+        proceeds = Decimal("0")
+    if shares <= 0:
+        shares = fallback_shares
+    if proceeds <= 0:
+        proceeds = fallback_price * shares
+    return proceeds, shares
+
+
 def advance_signal_confirmation(
     state: SignalConfirmationState,
     signal: AutoTradeSignal,
@@ -1929,6 +2684,48 @@ def open_paper_position(
     return bankroll
 
 
+def close_fast_simple_paper_position(
+    positions: list[PaperPosition],
+    bankroll: Decimal,
+    market_slug: str,
+    side: str,
+    quantity: Decimal,
+    price: Decimal,
+    fee_rate: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    remaining = quantity
+    total_shares = Decimal("0")
+    total_proceeds = Decimal("0")
+    for position in positions:
+        if position.slug != market_slug or position.side != side or position.settled:
+            continue
+        available = max(Decimal("0"), position.shares - position.exit_shares)
+        sold = min(available, remaining)
+        if sold <= 0:
+            continue
+        proceeds = sold * price
+        fee = sold * fee_rate * price * (Decimal("1") - price)
+        position.exit_shares += sold
+        position.exit_proceeds += proceeds
+        position.exit_fee += fee
+        bankroll += proceeds - fee
+        total_shares += sold
+        total_proceeds += proceeds
+        remaining -= sold
+        if remaining <= 0:
+            break
+    logger.info(
+        "PAPER_RISK_EXIT slug=%s side=%s price=%s shares=%s proceeds=%s bankroll=%s",
+        market_slug,
+        side,
+        price,
+        total_shares.quantize(Decimal("0.0001")),
+        total_proceeds.quantize(Decimal("0.0001")),
+        bankroll.quantize(Decimal("0.0001")),
+    )
+    return bankroll, total_shares, total_proceeds
+
+
 def settle_paper_positions(positions: list[PaperPosition], slug: str, bankroll: Decimal) -> Decimal:
     unsettled = [position for position in positions if position.slug == slug and not position.settled]
     if not unsettled:
@@ -1945,9 +2742,17 @@ def settle_paper_positions(positions: list[PaperPosition], slug: str, bankroll: 
 
     for position in unsettled:
         position.settled = True
-        payout = position.shares if position.side == winner else Decimal("0")
+        position.winner = winner
+        remaining_shares = max(Decimal("0"), position.shares - position.exit_shares)
+        payout = remaining_shares if position.side == winner else Decimal("0")
         bankroll += payout
-        profit = payout - position.stake - position.fee
+        profit = (
+            payout
+            + position.exit_proceeds
+            - position.stake
+            - position.fee
+            - position.exit_fee
+        )
         position.profit = profit
         logger.info(
             "PAPER_SETTLE slug=%s side=%s winner=%s payout=%s profit=%s bankroll=%s",
@@ -1991,9 +2796,90 @@ def account_new_paper_settlements(
 
 
 def settle_all_paper_positions(positions: list[PaperPosition], bankroll: Decimal) -> Decimal:
-    slugs = sorted({position.slug for position in positions if not position.settled})
+    now_epoch = int(time.time())
+    slugs = sorted(
+        {
+            position.slug
+            for position in positions
+            if not position.settled
+            and paper_market_has_ended(position.slug, now_epoch)
+        }
+    )
     for slug in slugs:
         bankroll = settle_paper_positions(positions, slug, bankroll)
+    return bankroll
+
+
+def record_fast_simple_paper_settlements(
+    engine: FastDirectionalHedgeSimpleEngine,
+    positions: list[PaperPosition],
+) -> None:
+    settled = {
+        (position.slug, position.winner)
+        for position in positions
+        if position.settled and position.winner in {"UP", "DOWN"}
+    }
+    for slug, winner in settled:
+        assert winner is not None
+        engine.record_settlement(slug, winner)
+
+
+def paper_market_has_ended(slug: str, now_epoch: int) -> bool:
+    """Avoid querying Gamma for a paper position before its window closes."""
+    raw_epoch = slug.rpartition("-")[2]
+    if not raw_epoch.isdigit():
+        # Preserve compatibility for manually supplied/non-recurring markets.
+        return True
+    return now_epoch >= int(raw_epoch) + 300
+
+
+def scratch_decayed_paper_positions(
+    positions: list[PaperPosition],
+    bankroll: Decimal,
+    slug: str,
+    probability_up: Decimal,
+    up_quote: OrderBookQuote | None,
+    down_quote: OrderBookQuote | None,
+    probability_threshold: Decimal = Decimal("0.52"),
+    price_tolerance: Decimal = Decimal("0.02"),
+    fee_rate: Decimal = Decimal("0.07"),
+) -> Decimal:
+    """Paper-close a decayed signal only when the best bid is near entry."""
+    for position in positions:
+        if position.slug != slug or position.settled:
+            continue
+        selected_probability = (
+            probability_up if position.side == "UP" else Decimal("1") - probability_up
+        )
+        if selected_probability >= probability_threshold:
+            continue
+        quote = up_quote if position.side == "UP" else down_quote
+        if quote is None or quote.bid is None or quote.bid < position.entry_price - price_tolerance:
+            logger.info(
+                "PAPER_SCRATCH_WAIT slug=%s side=%s probability=%s bid=%s entry=%s",
+                slug,
+                position.side,
+                selected_probability,
+                quote.bid if quote is not None else None,
+                position.entry_price,
+            )
+            continue
+        proceeds = position.shares * quote.bid
+        exit_fee = position.shares * fee_rate * quote.bid * (Decimal("1") - quote.bid)
+        bankroll += proceeds - exit_fee
+        position.settled = True
+        position.profit = proceeds - exit_fee - position.stake - position.fee
+        logger.info(
+            "PAPER_SCRATCH_EXIT slug=%s side=%s bid=%s probability=%s "
+            "exit_fee=%s profit=%s bankroll=%s",
+            slug,
+            position.side,
+            quote.bid,
+            selected_probability.quantize(Decimal("0.0001")),
+            exit_fee.quantize(Decimal("0.0001")),
+            position.profit.quantize(Decimal("0.0001")),
+            bankroll.quantize(Decimal("0.0001")),
+        )
     return bankroll
 
 
@@ -2062,7 +2948,14 @@ REVERSAL_NOTIFICATION_SAFE_STATUSES = frozenset(
         "paper_complete",
         "dynamic_recovery_skipped",
         "profit_target_unfunded",
+        "break_even_target_unfunded",
+        "compact_entry_filtered",
+        "compact_fak_skipped",
+        "first_stage_entry_filtered",
+        "first_stage_fak_skipped",
         "paper_unused_split_merged",
+        "sparse_stage_observing",
+        "sparse_entry_filtered",
     }
 )
 
@@ -2103,6 +2996,27 @@ def watch() -> None:
     if args.disable_discord:
         os.environ["DISCORD_ENABLED"] = "false"
     gamma = GammaClient()
+    polygon_resolution = PolygonResolutionReader(
+        os.getenv("POLYGON_RPC_URL")
+        or os.getenv("RPC_URL")
+        or "https://polygon.drpc.org",
+        timeout=5,
+    )
+    resolution_market_cache: dict[str, Market] = {}
+
+    def fetch_chain_winner(result_slug: str) -> str | None:
+        result_market = resolution_market_cache.get(result_slug)
+        if result_market is None:
+            result_market = load_updown_market(gamma, result_slug)
+            if result_market is None:
+                return None
+            resolution_market_cache[result_slug] = result_market
+            if len(resolution_market_cache) > 100:
+                resolution_market_cache.pop(next(iter(resolution_market_cache)))
+        return polygon_resolution.winner(
+            result_market.condition_id,
+            result_market.outcomes,
+        )
     clob = ClobDataClient(args.clob_host, timeout=args.market_data_timeout)
     trader: ClobTradingClient | None = None
     price_client = SpotPriceClient(args.price_source, timeout=args.market_data_timeout, ws_proxy=args.ws_proxy)
@@ -2110,6 +3024,7 @@ def watch() -> None:
         # RTDS has no snapshot or replay. Keep the TWAP stream hot before the
         # first upgraded window so its exact opening boundary is already cached.
         price_client.warm_polymarket_chainlink_twap()
+        price_client.warm_polymarket_chainlink_spot()
     price_to_beat_client = PolymarketPriceToBeatClient(
         timeout=args.market_data_timeout,
         proxy_url=args.price_to_beat_proxy or args.ws_proxy,
@@ -2128,11 +3043,15 @@ def watch() -> None:
     last_spot_fetched_at: float | None = None
     prices: list[Decimal] = []
     price_sample_times: list[float] = []
+    volatility_prices: list[Decimal] = []
+    volatility_sample_times: list[float] = []
+    underlying_start_price: Decimal | None = None
     btc_volatility_samples: deque[tuple[float, Decimal]] = deque()
     reversal_entry_rv60: Decimal | None = None
     reversal_entry_rv300: Decimal | None = None
     up_ask_prices: list[Decimal] = []
     down_ask_prices: list[Decimal] = []
+    book_sample_times: list[float] = []
     open_060_previous_up_ask = Decimal("0.50")
     open_060_previous_down_ask = Decimal("0.50")
     open_060_reference_spot: Decimal | None = None
@@ -2146,6 +3065,20 @@ def watch() -> None:
     aggregate_protection_completed = False
     edge_threshold = Decimal(args.edge)
     fallback_sigma = Decimal(args.fallback_sigma)
+    ewma_twap_settings = EwmaTwapSettings(
+        lambda_per_second=Decimal(args.ewma_twap_lambda),
+        realized_window_seconds=Decimal(args.ewma_twap_realized_seconds),
+        ewma_weight=Decimal(args.ewma_twap_weight),
+        minimum_model_edge=Decimal(args.ewma_twap_min_edge),
+        half_spread_buffer=Decimal(args.ewma_twap_half_spread_buffer),
+        slippage_buffer=Decimal(args.ewma_twap_slippage_buffer),
+        taker_fee_rate=Decimal(args.ewma_twap_fee_rate),
+        kelly_fraction=Decimal(args.ewma_twap_kelly_fraction),
+        kelly_bankroll=Decimal(args.ewma_twap_kelly_bankroll),
+        max_notional=Decimal(args.ewma_twap_max_notional),
+        entry_start_seconds=Decimal(args.ewma_twap_entry_seconds),
+        entry_cutoff_seconds=Decimal(args.ewma_twap_cutoff_seconds),
+    )
     confirmation_jump_sigma_multiplier = Decimal(args.confirmation_jump_sigma_multiplier)
     confirmation_min_jump_usd = Decimal(args.confirmation_min_jump_usd)
     trend_pullback_tolerance_usd = Decimal(args.trend_pullback_tolerance_usd)
@@ -2188,12 +3121,77 @@ def watch() -> None:
     max_ask_sum = Decimal(args.max_ask_sum)
     min_win_probability = Decimal(args.min_win_probability)
     probability_shrinkage = Decimal(args.probability_shrinkage)
+    fair_value_fee_rate = Decimal(args.fair_value_fee_rate)
+    fair_value_confirmation_min_seconds = args.fair_value_confirmation_min_seconds
+    fair_value_book_trend_samples = args.fair_value_book_trend_samples
+    fair_value_book_min_slope = Decimal(args.fair_value_book_min_slope)
+    fair_value_book_min_relative_slope = Decimal(
+        args.fair_value_book_min_relative_slope
+    )
+    fair_value_book_max_pullback = Decimal(args.fair_value_book_max_pullback)
+    fast_hedge_settings = FastDirectionalHedgeSimpleSettings(
+        entry_price_min=Decimal(args.fdh_entry_price_min),
+        entry_price_max=Decimal(args.fdh_entry_price_max),
+        entry_confirm_ticks=args.fdh_entry_confirm_ticks,
+        entry_confirm_min_interval_ms=args.fdh_entry_confirm_min_interval_ms,
+        base_position_size=Decimal(args.fdh_base_position_size),
+        min_ask_gap=Decimal(args.fdh_min_ask_gap),
+        max_spread=Decimal(args.fdh_max_spread),
+        max_ask_sum=Decimal(args.fdh_max_ask_sum),
+        max_entry_drift=Decimal(args.fdh_max_entry_drift),
+        entry_max_slippage=Decimal(args.fdh_entry_max_slippage),
+        initial_stop_pct=Decimal(args.fdh_initial_stop_pct),
+        trailing_start_gain=Decimal(args.fdh_trailing_start_gain),
+        break_even_buffer=Decimal(args.fdh_break_even_buffer),
+        trailing_drawdown_pct=Decimal(args.fdh_trailing_drawdown_pct),
+        stop_confirm_ticks=args.fdh_stop_confirm_ticks,
+        fast_move_window_ms=args.fdh_fast_move_window_ms,
+        fast_move_threshold=Decimal(args.fdh_fast_move_threshold),
+        fast_stop_confirm_ticks=args.fdh_fast_stop_confirm_ticks,
+        emergency_stop_penetration=Decimal(args.fdh_emergency_stop_penetration),
+        hedge_max_slippage=Decimal(args.fdh_hedge_max_slippage),
+        hedge_max_price=Decimal(args.fdh_hedge_max_price),
+        hedge_entry_max_seconds=Decimal(args.fdh_hedge_entry_max_seconds),
+        hedge_entry_min_seconds=Decimal(args.fdh_hedge_entry_min_seconds),
+        exit_max_slippage=Decimal(args.fdh_exit_max_slippage),
+        take_profit_net_per_share=Decimal(args.fdh_take_profit_net_per_share),
+        take_profit_confirm_ticks=args.fdh_take_profit_confirm_ticks,
+        max_entries_per_window=args.fdh_max_entries_per_window,
+        normal_entry_max_seconds=Decimal(args.fdh_normal_entry_max_seconds),
+        normal_entry_min_seconds=Decimal(args.fdh_normal_entry_min_seconds),
+        stop_new_entry_time=Decimal(args.fdh_stop_new_entry_time),
+        risk_only_time=Decimal(args.fdh_risk_only_time),
+        fee_rate=Decimal(args.fdh_fee_rate),
+        max_book_age_seconds=Decimal(args.fdh_max_book_age_seconds),
+    )
+    fast_hedge_engine = FastDirectionalHedgeSimpleEngine(
+        settings=fast_hedge_settings,
+        state_path=Path(args.fdh_state_json),
+        recorder_path=Path(args.fdh_record_jsonl) if args.fdh_record_jsonl else None,
+    )
     smart_score_threshold = Decimal(args.smart_score_threshold)
     smart_score_entry_seconds = Decimal(str(args.smart_score_entry_seconds))
     smart_score_cutoff_seconds = Decimal(str(args.smart_score_cutoff_seconds))
     smart_score_min_probability = Decimal(args.smart_score_min_probability)
     smart_score_fee_rate = Decimal(args.smart_score_fee_rate)
     smart_score_slippage = Decimal(args.smart_score_slippage)
+    momentum_entry_seconds = Decimal(str(args.momentum_entry_seconds))
+    momentum_cutoff_seconds = Decimal(str(args.momentum_cutoff_seconds))
+    momentum_min_move_percent = Decimal(args.momentum_min_move_percent)
+    momentum_min_move_usd = Decimal(args.momentum_min_move_usd)
+    momentum_confirmation_seconds = args.momentum_confirmation_seconds
+    momentum_min_entry = Decimal(args.momentum_min_entry)
+    momentum_max_entry = Decimal(args.momentum_max_entry)
+    momentum_fee_rate = Decimal(args.momentum_fee_rate)
+    fair_scratch_entry_seconds = Decimal(str(args.fair_scratch_entry_seconds))
+    fair_scratch_cutoff_seconds = Decimal(str(args.fair_scratch_cutoff_seconds))
+    fair_scratch_min_entry = Decimal(args.fair_scratch_min_entry)
+    fair_scratch_max_entry = Decimal(args.fair_scratch_max_entry)
+    fair_scratch_min_probability = Decimal(args.fair_scratch_min_probability)
+    fair_scratch_min_net_edge = Decimal(args.fair_scratch_min_net_edge)
+    fair_scratch_fee_rate = Decimal(args.fair_scratch_fee_rate)
+    fair_scratch_exit_probability = Decimal(args.fair_scratch_exit_probability)
+    fair_scratch_price_tolerance = Decimal(args.fair_scratch_price_tolerance)
     open_060_entry_seconds = Decimal(str(args.open_060_entry_seconds))
     open_060_cutoff_seconds = Decimal(str(args.open_060_cutoff_seconds))
     open_060_target = Decimal(args.open_060_target)
@@ -2235,14 +3233,26 @@ def watch() -> None:
     live_orders_submitted = 0
     live_orders_matched = 0
     reversal_runtime: ReversalRuntime | None = None
-    spread_runtime: SpreadMakerRuntime | None = None
     manual_executor: ManualTradeExecutor | None = None
     reversal_boundary_seeded_slug: str | None = None
+    reversal_terminal_book_results: dict[str, Direction] = {}
     reversal_completed_attempts = 0
+    price_to_beat_next_retry_monotonic = 0.0
+    price_to_beat_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="official-price-to-beat",
+    )
+    atexit.register(price_to_beat_executor.shutdown, wait=False, cancel_futures=True)
+    official_price_to_beat_task: tuple[str, Future[Any]] | None = None
+    official_price_to_beat_verified_slug: str | None = None
+    official_price_to_beat_next_retry_monotonic = 0.0
+    provisional_open_price: Decimal | None = None
+    provisional_open_mismatch_with_exposure = False
+    hybrid_signal_owner: str | None = None
     reversal_pause_slug: str | None = None
+    reversal_forced_exit_slug: str | None = None
     reversal_weekly_restart_pending = False
     maintenance_deferred_slug: str | None = None
-    next_gamma_open_retry_at = 0.0
     reversal_execution_prewarm_slug: str | None = None
     live_summary = {
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -2266,6 +3276,50 @@ def watch() -> None:
         ),
         "late_max_live_notional": str(late_max_live_notional),
         "probability_shrinkage": str(probability_shrinkage),
+        "fair_value_fee_rate": str(fair_value_fee_rate),
+        "fair_value_confirmation_min_seconds": fair_value_confirmation_min_seconds,
+        "fair_value_book_trend": {
+            "samples": fair_value_book_trend_samples,
+            "minimum_selected_slope_per_second": str(fair_value_book_min_slope),
+            "minimum_relative_slope_per_second": str(
+                fair_value_book_min_relative_slope
+            ),
+            "maximum_pullback": str(fair_value_book_max_pullback),
+        },
+        "ewma_twap_fair": {
+            "lambda_per_second": str(ewma_twap_settings.lambda_per_second),
+            "realized_window_seconds": str(ewma_twap_settings.realized_window_seconds),
+            "ewma_weight": str(ewma_twap_settings.ewma_weight),
+            "minimum_model_edge": str(ewma_twap_settings.minimum_model_edge),
+            "half_spread_buffer": str(ewma_twap_settings.half_spread_buffer),
+            "slippage_buffer": str(ewma_twap_settings.slippage_buffer),
+            "taker_fee_rate": str(ewma_twap_settings.taker_fee_rate),
+            "kelly_fraction": str(ewma_twap_settings.kelly_fraction),
+            "kelly_bankroll": str(ewma_twap_settings.kelly_bankroll),
+            "max_notional": str(ewma_twap_settings.max_notional),
+            "entry_start_seconds": str(ewma_twap_settings.entry_start_seconds),
+            "entry_cutoff_seconds": str(ewma_twap_settings.entry_cutoff_seconds),
+        },
+        "fast_directional_hedge_simple": {
+            "version": fast_hedge_settings.version,
+            "entry_price_range": [
+                str(fast_hedge_settings.entry_price_min),
+                str(fast_hedge_settings.entry_price_max),
+            ],
+            "entry_confirm_ticks": fast_hedge_settings.entry_confirm_ticks,
+            "base_position_size": str(fast_hedge_settings.base_position_size),
+            "initial_stop_pct": str(fast_hedge_settings.initial_stop_pct),
+            "trailing_start_gain": str(fast_hedge_settings.trailing_start_gain),
+            "trailing_drawdown_pct": str(fast_hedge_settings.trailing_drawdown_pct),
+            "stop_confirm_ticks": fast_hedge_settings.stop_confirm_ticks,
+            "fast_move_threshold": str(fast_hedge_settings.fast_move_threshold),
+            "emergency_stop_penetration": str(
+                fast_hedge_settings.emergency_stop_penetration
+            ),
+            "hedge_max_slippage": str(fast_hedge_settings.hedge_max_slippage),
+            "max_entries_per_window": fast_hedge_settings.max_entries_per_window,
+            "max_book_age_seconds": str(fast_hedge_settings.max_book_age_seconds),
+        },
         "smart_score_threshold": str(smart_score_threshold),
         "smart_score_entry_seconds": str(smart_score_entry_seconds),
         "smart_score_cutoff_seconds": str(smart_score_cutoff_seconds),
@@ -2274,6 +3328,24 @@ def watch() -> None:
         "smart_score_slippage": str(smart_score_slippage),
         "smart_score_trend_samples": args.smart_score_trend_samples,
         "smart_score_stability_samples": args.smart_score_stability_samples,
+        "momentum_entry_seconds": str(momentum_entry_seconds),
+        "momentum_cutoff_seconds": str(momentum_cutoff_seconds),
+        "momentum_min_move_percent": str(momentum_min_move_percent),
+        "momentum_min_move_usd": str(momentum_min_move_usd),
+        "momentum_confirmation_seconds": momentum_confirmation_seconds,
+        "momentum_entry_range": [str(momentum_min_entry), str(momentum_max_entry)],
+        "momentum_fee_rate": str(momentum_fee_rate),
+        "fair_scratch_entry_seconds": str(fair_scratch_entry_seconds),
+        "fair_scratch_cutoff_seconds": str(fair_scratch_cutoff_seconds),
+        "fair_scratch_entry_range": [
+            str(fair_scratch_min_entry),
+            str(fair_scratch_max_entry),
+        ],
+        "fair_scratch_min_probability": str(fair_scratch_min_probability),
+        "fair_scratch_min_net_edge": str(fair_scratch_min_net_edge),
+        "fair_scratch_fee_rate": str(fair_scratch_fee_rate),
+        "fair_scratch_exit_probability": str(fair_scratch_exit_probability),
+        "fair_scratch_price_tolerance": str(fair_scratch_price_tolerance),
         "open_060_entry_seconds": str(open_060_entry_seconds),
         "open_060_cutoff_seconds": str(open_060_cutoff_seconds),
         "open_060_target": str(open_060_target),
@@ -2326,6 +3398,10 @@ def watch() -> None:
     def write_live_summary(finalize: bool = True) -> None:
         if not args.live_trading:
             return
+        if args.strategy == "fast_directional_hedge_simple":
+            live_summary["fast_directional_hedge_simple_metrics"] = (
+                fast_hedge_engine.execution_summary()
+            )
         if finalize:
             if live_summary["status"] == "running":
                 live_summary["status"] = (
@@ -2387,6 +3463,18 @@ def watch() -> None:
         if not Decimal("0") <= probability_shrinkage <= Decimal("1"):
             raise ValueError("Probability shrinkage must be between zero and one")
         if (
+            fair_value_fee_rate < 0
+            or fair_value_confirmation_min_seconds < 0
+            or fair_value_book_trend_samples < 3
+            or min(
+                fair_value_book_min_slope,
+                fair_value_book_min_relative_slope,
+                fair_value_book_max_pullback,
+            )
+            < 0
+        ):
+            raise ValueError("Fair-value fee, book-trend, and confirmation settings are invalid")
+        if (
             not Decimal("0") <= smart_score_threshold <= Decimal("100")
             or smart_score_cutoff_seconds < 0
             or smart_score_cutoff_seconds >= smart_score_entry_seconds
@@ -2397,6 +3485,24 @@ def watch() -> None:
             or args.smart_score_stability_samples < 2
         ):
             raise ValueError("Smart-score thresholds, costs, and sample counts must be valid")
+        if (
+            momentum_cutoff_seconds < 0
+            or momentum_cutoff_seconds >= momentum_entry_seconds
+            or momentum_min_move_percent < 0
+            or momentum_min_move_usd < 0
+            or momentum_confirmation_seconds < 1
+            or not Decimal("0") < momentum_min_entry <= momentum_max_entry < Decimal("1")
+            or momentum_fee_rate < 0
+            or fair_scratch_cutoff_seconds < 0
+            or fair_scratch_cutoff_seconds >= fair_scratch_entry_seconds
+            or not Decimal("0") < fair_scratch_min_entry <= fair_scratch_max_entry < Decimal("1")
+            or not Decimal("0.5") <= fair_scratch_min_probability <= Decimal("1")
+            or fair_scratch_min_net_edge < 0
+            or fair_scratch_fee_rate < 0
+            or not Decimal("0.5") <= fair_scratch_exit_probability <= Decimal("1")
+            or fair_scratch_price_tolerance < 0
+        ):
+            raise ValueError("Momentum and fair-scratch parameters must be valid")
         if (
             open_060_cutoff_seconds < 0
             or open_060_cutoff_seconds >= open_060_entry_seconds
@@ -2510,19 +3616,26 @@ def watch() -> None:
         if args.live_trading or args.strategy in REVERSAL_STRATEGIES:
             reversal_state_path = Path(args.reversal_state_json)
             reversal_strategy = ReversalV11.load(reversal_state_path)
-            reversal_setting_overrides: dict[str, object] = {}
-            reversal_setting_overrides["trigger_streak"] = REVERSAL_TRIGGER_STREAKS.get(
-                args.strategy, 2
-            )
-            if args.reversal_first_stage_max_rv60 is not None:
+            reversal_setting_overrides = reversal_profile_overrides(args.strategy)
+            if (
+                args.reversal_first_stage_max_rv60 is not None
+            ):
                 reversal_setting_overrides.update(
                     first_stage_rv60_filter_enabled=True,
                     first_stage_max_rv60=Decimal(args.reversal_first_stage_max_rv60),
                 )
-            if args.reversal_first_stage_max_rv300 is not None:
+            if (
+                args.reversal_first_stage_max_rv300 is not None
+            ):
                 reversal_setting_overrides.update(
                     first_stage_rv300_filter_enabled=True,
                     first_stage_max_rv300=Decimal(args.reversal_first_stage_max_rv300),
+                    first_stage_rv300_persistence_ratio=Decimal(
+                        args.reversal_first_stage_rv300_persistence_ratio
+                    ),
+                    first_stage_rv300_hard_multiplier=Decimal(
+                        args.reversal_first_stage_rv300_hard_multiplier
+                    ),
                 )
             if reversal_setting_overrides:
                 reversal_strategy.settings = replace(
@@ -2586,7 +3699,7 @@ def watch() -> None:
                     and active_reversal.execution_phase
                     in {"trend_exit_complete", "direct_entry_complete"}
                     and active_reversal.failures + 1
-                    < len(reversal_strategy.settings.stakes)
+                    < reversal_strategy.settings.attempt_limit
                 ):
                     required_reversal_collateral = reversal_strategy.settings.stakes[
                         active_reversal.failures + 1
@@ -2614,6 +3727,7 @@ def watch() -> None:
                     required_collateral=required_reversal_collateral,
                     execution_mode="direct_buy",
                     wallet=os.getenv(args.funder_address_env) or "CLOB funder",
+                    require_trade_collateral=not notifications.trading_paused,
                 )
                 live_summary["reversal_startup_self_check"] = {
                     "wallet": startup_report.wallet,
@@ -2648,23 +3762,53 @@ def watch() -> None:
                 live=args.live_trading,
                 execution_mode="direct_buy",
                 order_callback=notifications.record_reversal_exit,
+                chain_winner_lookup=fetch_chain_winner,
+                unlocked_profit_lookup=notifications.reversal_unlocked_profit,
             )
         if args.live_trading:
             assert trader is not None
-            startup_market = load_updown_market(gamma, slug)
-            if startup_market is None:
-                raise ValueError("spread_market_maker startup could not load the current market")
-            spread_runtime = SpreadMakerRuntime(
-                strategy=SpreadMarketMaker(),
-                trader=trader,
-                state_path=Path(args.spread_maker_state_json),
-                signature_type=args.signature_type,
-                live=True,
-            )
-            if args.strategy == "spread_market_maker":
-                live_summary["spread_startup_self_check"] = spread_runtime.startup_self_check(
-                    startup_market
+            if args.strategy == "fast_directional_hedge_simple":
+                startup_market = load_updown_market(gamma, slug)
+                if startup_market is None:
+                    raise ValueError("fast directional hedge startup could not load current market")
+                startup_books = clob.books(startup_market.token_ids)
+                if len(startup_books) != 2:
+                    raise ValueError("fast directional hedge startup did not receive both books")
+                open_orders = trader.open_orders()
+                relevant_open_orders = [
+                    order
+                    for order in open_orders
+                    if str(
+                        (order.get("asset_id") or order.get("assetId") or "")
+                        if isinstance(order, dict)
+                        else getattr(order, "asset_id", "")
+                    )
+                    in startup_market.token_ids
+                ]
+                if relevant_open_orders:
+                    raise RuntimeError(
+                        "fast directional hedge has unresolved current-market open orders"
+                    )
+                startup_up_balance = trader.conditional_balance(
+                    startup_market.token_ids[0], args.signature_type
                 )
+                startup_down_balance = trader.conditional_balance(
+                    startup_market.token_ids[1], args.signature_type
+                )
+                fast_hedge_engine.reconcile_positions(
+                    startup_up_balance,
+                    startup_down_balance,
+                )
+                live_summary["fast_directional_hedge_simple_startup_self_check"] = {
+                    "market": startup_market.slug,
+                    "open_orders": 0,
+                    "up_balance": str(startup_up_balance),
+                    "down_balance": str(startup_down_balance),
+                    "collateral": str(
+                        trader.refresh_collateral_balance(args.signature_type)
+                    ),
+                    "state_reconciled": True,
+                }
             manual_trader = build_live_trader(args)
             manual_executor = ManualTradeExecutor(
                 trader=manual_trader,
@@ -2711,13 +3855,18 @@ def watch() -> None:
         try:
             notifications.maybe_delete_expired_discord_messages()
             notifications.maybe_send_settlements(fetch_winner)
-            notifications.maybe_send_daily(fetch_winner)
+            additional_report = None
+            on_reported = None
             if reversal_runtime is not None and args.strategy in REVERSAL_STRATEGIES:
-                report_day = datetime.now(timezone.utc).date() - timedelta(days=1)
-                if reversal_runtime.send_daily_report_once(
-                    report_day,
-                    notifications.send_strategy_report,
-                ) and weekly_restart_report_day(report_day):
+                additional_report = reversal_runtime.daily_report_text
+                on_reported = reversal_runtime.mark_daily_report_sent
+            report_day = notifications.maybe_send_daily(
+                fetch_winner,
+                additional_report=additional_report,
+                on_reported=on_reported,
+            )
+            if report_day is not None and reversal_runtime is not None:
+                if weekly_restart_report_day(report_day):
                     reversal_weekly_restart_pending = True
         except Exception as exc:
             # Notification maintenance must never alter the trading state or
@@ -2752,6 +3901,7 @@ def watch() -> None:
             "反转策略每周安全重启",
         )
 
+    control_sleep_logged = False
     while time.time() < stop_at:
         iteration_started_at = time.monotonic()
         poll_interval = float(args.interval)
@@ -2760,6 +3910,20 @@ def watch() -> None:
         if notifications.process_commands():
             notifications.prepare_restart()
             restart_with_current_window("restarting", "手动重启")
+        if args.live_trading and notifications.trading_paused:
+            if not control_sleep_logged:
+                logger.warning(
+                    "LIVE_CONTROL_SLEEP trading, market, settlement, and strategy "
+                    "monitoring are suspended; Telegram commands remain available"
+                )
+                control_sleep_logged = True
+            sleep_until_next_poll(min(5.0, max(1.0, poll_interval)), iteration_started_at)
+            continue
+        if control_sleep_logged:
+            logger.warning(
+                "LIVE_CONTROL_RESUME reconnecting to the current market after control sleep"
+            )
+            control_sleep_logged = False
         maintenance_ready = window_priority_initialization_complete(
             current_market,
             now,
@@ -2779,6 +3943,8 @@ def watch() -> None:
         maybe_execute_weekly_restart()
         if args.paper_trading:
             paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
+            if args.strategy == "fast_directional_hedge_simple":
+                record_fast_simple_paper_settlements(fast_hedge_engine, paper_positions)
             if args.strategy == "late_favorite":
                 loss_pause = args.late_pause_windows_after_loss
                 loss_limit = 1 if loss_pause > 0 else 0
@@ -2833,14 +3999,27 @@ def watch() -> None:
                 slug = wall_clock_slug
             current_market = load_updown_market(gamma, slug)
             start_price = None
-            next_gamma_open_retry_at = 0.0
+            price_to_beat_next_retry_monotonic = 0.0
+            official_price_to_beat_task = None
+            official_price_to_beat_verified_slug = None
+            official_price_to_beat_next_retry_monotonic = 0.0
+            provisional_open_price = None
+            provisional_open_mismatch_with_exposure = False
+            hybrid_signal_owner = None
             reversal_boundary_seeded_slug = None
             reversal_completed_attempts = 0
             open_price_tracker.reset()
+            # Direction/confirmation/momentum samples are window-local. The
+            # separate btc_volatility_samples deque is deliberately preserved
+            # across this reset and may be used only for volatility estimation.
             prices = []
             price_sample_times = []
+            volatility_prices = []
+            volatility_sample_times = []
+            underlying_start_price = None
             up_ask_prices = []
             down_ask_prices = []
+            book_sample_times = []
             open_060_previous_up_ask = open_060_initial_ask
             open_060_previous_down_ask = open_060_initial_ask
             open_060_reference_spot = None
@@ -2864,18 +4043,43 @@ def watch() -> None:
                 current_market.rules_text,
                 args.crypto_resolution_mode,
             )
+            if (
+                current_resolution_mode is CryptoResolutionMode.TWAP_60
+                and not has_official_btc_5m_twap_rule(current_market.rules_text)
+            ):
+                notifications.notify_exception(
+                    "读取 Polymarket 结算规则",
+                    RuntimeError(
+                        f"{current_market.slug} does not publish the expected "
+                        "Chainlink BTC/USD TWAP 60s resolution source"
+                    ),
+                    key=f"resolution-rule:{current_market.slug}",
+                )
+                logger.error(
+                    "CRYPTO_RESOLUTION_RULE_UNVERIFIED slug=%s; "
+                    "window fails closed without spot/order-book fallback",
+                    current_market.slug,
+                )
+                slug = next_5m_slug(current_market.slug)
+                current_market = None
+                continue
             if reversal_runtime is not None:
+                reversal_boundary_state_mode = (
+                    "twap60_chainlink_boundary_v3"
+                    if current_resolution_mode is CryptoResolutionMode.TWAP_60
+                    else current_resolution_mode.value
+                )
                 changed = reversal_runtime.set_boundary_price_mode(
-                    current_resolution_mode.value
+                    reversal_boundary_state_mode
                 )
                 if changed:
                     logger.warning(
                         "REVERSAL_BOUNDARY_MODE_CHANGED slug=%s mode=%s; old boundary cache cleared",
                         current_market.slug,
-                        current_resolution_mode.value,
+                        reversal_boundary_state_mode,
                     )
                 if (
-                    current_resolution_mode is CryptoResolutionMode.TWAP_30
+                    current_resolution_mode is CryptoResolutionMode.TWAP_60
                     and reversal_runtime.strategy.state.last_settled_slug
                     == previous_5m_slug(current_market.slug)
                 ):
@@ -2909,25 +4113,15 @@ def watch() -> None:
                 reversal_round_active = (
                     reversal_runtime.strategy.state.active_round is not None
                 )
-            spread_inventory_active = (
-                spread_runtime is not None
-                and args.strategy == "spread_market_maker"
-                and not spread_runtime.flat()
-            )
             activated_strategy = (
                 None
-                if reversal_round_active or spread_inventory_active
+                if reversal_round_active
                 else notifications.activate_pending_strategy(current_market.slug)
             )
             if reversal_round_active and notifications.pending_strategy is not None:
                 logger.info(
                     "REVERSAL_SWITCH_DEFERRED active_round=%s pending=%s",
                     reversal_runtime.strategy.state.active_round.round_id,
-                    notifications.pending_strategy,
-                )
-            if spread_inventory_active and notifications.pending_strategy is not None:
-                logger.info(
-                    "SPREAD_SWITCH_DEFERRED pending=%s; maker orders/inventory remain",
                     notifications.pending_strategy,
                 )
             if activated_strategy is not None:
@@ -2938,28 +4132,39 @@ def watch() -> None:
                     and activated_strategy in REVERSAL_STRATEGIES
                 ):
                     activated_settings = ReversalV11().settings
-                    activated_setting_overrides: dict[str, object] = {}
-                    activated_setting_overrides["trigger_streak"] = (
-                        REVERSAL_TRIGGER_STREAKS.get(activated_strategy, 2)
+                    activated_setting_overrides = reversal_profile_overrides(
+                        activated_strategy
                     )
-                    if args.reversal_first_stage_max_rv60 is not None:
+                    if (
+                        args.reversal_first_stage_max_rv60 is not None
+                    ):
                         activated_setting_overrides.update(
                             first_stage_rv60_filter_enabled=True,
                             first_stage_max_rv60=Decimal(
                                 args.reversal_first_stage_max_rv60
                             ),
                         )
-                    if args.reversal_first_stage_max_rv300 is not None:
+                    if (
+                        args.reversal_first_stage_max_rv300 is not None
+                    ):
                         activated_setting_overrides.update(
                             first_stage_rv300_filter_enabled=True,
                             first_stage_max_rv300=Decimal(
                                 args.reversal_first_stage_max_rv300
+                            ),
+                            first_stage_rv300_persistence_ratio=Decimal(
+                                args.reversal_first_stage_rv300_persistence_ratio
+                            ),
+                            first_stage_rv300_hard_multiplier=Decimal(
+                                args.reversal_first_stage_rv300_hard_multiplier
                             ),
                         )
                     reversal_runtime.strategy.settings = replace(
                         activated_settings,
                         **activated_setting_overrides,
                     )
+            if args.strategy == "fast_directional_hedge_simple":
+                fast_hedge_engine.begin_market(current_market.slug)
             logger.info(
                 "Watching %s | start=%s end=%s liquidity=%s outcomes=%s",
                 current_market.slug,
@@ -3030,8 +4235,6 @@ def watch() -> None:
             args.final_poll_seconds,
             args.final_poll_interval,
         )
-        if args.strategy == "spread_market_maker":
-            poll_interval = min(poll_interval, 2.0)
         if (
             args.strategy in REVERSAL_STRATEGIES
             and reversal_boundary_seeded_slug != current_market.slug
@@ -3086,20 +4289,34 @@ def watch() -> None:
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
         try:
-            spot = (
-                price_client.polymarket_chainlink_twap()
-                if current_resolution_mode is CryptoResolutionMode.TWAP_30
-                else price_client.btc_usd()
-            )
+            if current_resolution_mode is CryptoResolutionMode.TWAP_60:
+                spot = price_client.polymarket_chainlink_twap()
+                underlying_spot = price_client.btc_usd()
+            else:
+                spot = price_client.btc_usd()
+                underlying_spot = spot
             if spot.observed_at is not None:
                 report_age = abs(int(time.time()) - spot.observed_at)
                 if report_age > args.max_spot_age:
                     raise RuntimeError(f"Chainlink report is stale by {report_age}s")
+            if underlying_spot.observed_at is not None:
+                underlying_age = abs(int(time.time()) - underlying_spot.observed_at)
+                if underlying_age > args.max_spot_age:
+                    raise RuntimeError(
+                        f"Underlying Chainlink report is stale by {underlying_age}s"
+                    )
             last_spot_price = spot.price
             last_spot_fetched_at = time.monotonic()
         except Exception as exc:
-            notifications.notify_exception("Chainlink BTC 行情", exc, key="spot-price")
-            if current_resolution_mode is CryptoResolutionMode.TWAP_30:
+            if "Chainlink report is stale by" in str(exc):
+                logger.warning(
+                    "CHAINLINK_STALE_NOTIFICATION_SUPPRESSED "
+                    "context=Chainlink BTC 行情 error=%s",
+                    exc,
+                )
+            else:
+                notifications.notify_exception("Chainlink BTC 行情", exc, key="spot-price")
+            if current_resolution_mode is CryptoResolutionMode.TWAP_60:
                 logger.warning(
                     "TWAP price unavailable; current window fails closed without legacy/cache fallback: %s",
                     exc,
@@ -3112,6 +4329,7 @@ def watch() -> None:
                 continue
             logger.warning("Spot price unavailable; reusing cached BTC/USD=%s: %s", last_spot_price, exc)
             spot = type("CachedSpotPrice", (), {"price": last_spot_price, "source": "CACHE"})()
+            underlying_spot = spot
 
         spot_age = Decimal(str(time.monotonic() - last_spot_fetched_at)) if last_spot_fetched_at is not None else Decimal("Infinity")
         notifications.update_runtime(
@@ -3122,7 +4340,7 @@ def watch() -> None:
         )
         volatility_observed_at = time.time()
         if spot.source != "CACHE":
-            btc_volatility_samples.append((volatility_observed_at, spot.price))
+            btc_volatility_samples.append((volatility_observed_at, underlying_spot.price))
             while (
                 btc_volatility_samples
                 and volatility_observed_at - btc_volatility_samples[0][0] > 300
@@ -3356,9 +4574,10 @@ def watch() -> None:
                     refreshed_quote = selected_book.quote
                     assert refreshed_quote.ask is not None
                     quoted_ask = refreshed_quote.ask
-                    available_depth = executable_ask_depth(
-                        selected_book,
-                        signal.price,
+                    available_depth = (
+                        executable_bid_depth(selected_book, signal.price)
+                        if signal.action == "SELL"
+                        else executable_ask_depth(selected_book, signal.price)
                     )
                     if available_depth < order_size:
                         logger.info(
@@ -3547,109 +4766,313 @@ def watch() -> None:
             sleep_until_next_poll(poll_interval, iteration_started_at)
             continue
 
+        if start_price is None and args.strategy == "fast_directional_hedge_simple":
+            # This strategy has no strike, TWAP or fair-probability input. Keep
+            # a harmless diagnostic reference so the shared loop can continue,
+            # but never wait for a historical boundary sample or official
+            # Price to Beat before evaluating the live books.
+            start_price = underlying_spot.price
+            underlying_start_price = underlying_spot.price
+            prices = [spot.price]
+            price_sample_times = [time.monotonic()]
+            volatility_prices = [underlying_spot.price]
+            volatility_sample_times = [time.monotonic()]
+            logger.info(
+                "FAST_DIRECTIONAL_HEDGE_SIMPLE_BOOK_ONLY_READY slug=%s diagnostic_reference=%s",
+                current_market.slug,
+                start_price,
+            )
+
         if (
             start_price is None
-            and current_resolution_mode is CryptoResolutionMode.TWAP_30
+            and current_resolution_mode is CryptoResolutionMode.TWAP_60
         ):
             elapsed_since_start = -seconds_to_start
             boundary_timestamp_ms = int(current_market.event_start_time.timestamp() * 1000)
             boundary_spot = None
-            boundary_source = "chainlink_twap_30_boundary"
+            opening_boundary_spot = None
+            endpoint_price_to_beat = None
+            persisted_open_price = (
+                reversal_runtime.strategy.state.chainlink_open_prices.get(
+                    current_market.slug
+                )
+                if reversal_runtime is not None
+                and args.strategy in REVERSAL_STRATEGIES
+                else None
+            )
+            if time.monotonic() < price_to_beat_next_retry_monotonic:
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            use_chainlink_provisional_open = True
+            # Every TWAP-mode strategy can begin from the first Polymarket
+            # Chainlink RTDS tick at/after the exact window boundary. The
+            # official openPrice remains authoritative and is fetched
+            # asynchronously for reconciliation outside the order-critical path.
+            if persisted_open_price is None:
+                try:
+                    opening_boundary_spot = (
+                        price_client.polymarket_chainlink_price_at_or_after(
+                            boundary_timestamp_ms,
+                            args.max_boundary_sample_offset_ms,
+                        )
+                        if use_chainlink_provisional_open
+                        else price_client.polymarket_chainlink_price_near(
+                            boundary_timestamp_ms,
+                            args.max_boundary_sample_offset_ms,
+                        )
+                    )
+                except Exception as opening_boundary_exc:
+                    logger.warning(
+                        "CHAINLINK_OPEN_BOUNDARY_PENDING slug=%s error=%s; %s",
+                        current_market.slug,
+                        opening_boundary_exc,
+                        (
+                            "strategy waits for a bounded post-boundary RTDS tick"
+                            if use_chainlink_provisional_open
+                            else "official Price to Beat requires stability confirmation"
+                        ),
+                    )
+
+            if use_chainlink_provisional_open:
+                if opening_boundary_spot is None and persisted_open_price is None:
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                boundary_source = (
+                    "persisted_chainlink_open_price"
+                    if persisted_open_price is not None
+                    else "chainlink_rtds_provisional"
+                )
+                confirmed_open_price = (
+                    persisted_open_price
+                    if persisted_open_price is not None
+                    else opening_boundary_spot.price
+                )
+                provisional_open_price = confirmed_open_price
+                if official_price_to_beat_task is None:
+                    official_price_to_beat_task = (
+                        current_market.slug,
+                        price_to_beat_executor.submit(
+                            price_to_beat_client.fetch,
+                            current_market.event_start_time,
+                            current_market.end_time,
+                        ),
+                    )
+                    logger.info(
+                        "OFFICIAL_PRICE_TO_BEAT_RECONCILE_STARTED slug=%s provisional=%s",
+                        current_market.slug,
+                        confirmed_open_price,
+                    )
+            else:
+                try:
+                    endpoint_price_to_beat = price_to_beat_client.fetch(
+                        current_market.event_start_time,
+                        current_market.end_time,
+                    )
+                except Exception as price_to_beat_exc:
+                    logger.warning(
+                        "OFFICIAL_PRICE_TO_BEAT_PENDING slug=%s error=%s; "
+                        "TWAP mode fails closed without the published Price to Beat",
+                        current_market.slug,
+                        price_to_beat_exc,
+                    )
+                    price_to_beat_next_retry_monotonic = time.monotonic() + (
+                        3.0 if is_http_rate_limit(price_to_beat_exc) else 1.0
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                price_to_beat_next_retry_monotonic = 0.0
+
+                if opening_boundary_spot is not None:
+                    opening_alignment_difference = abs(
+                        endpoint_price_to_beat.price_to_beat - opening_boundary_spot.price
+                    )
+                    if opening_alignment_difference > max_price_alignment_difference:
+                        open_price_tracker.reset()
+                        logger.warning(
+                            "OFFICIAL_PRICE_TO_BEAT_UNVERIFIED slug=%s official=%s "
+                            "chainlink_open=%s difference=%s max_difference=%s; retrying",
+                            current_market.slug,
+                            endpoint_price_to_beat.price_to_beat,
+                            opening_boundary_spot.price,
+                            opening_alignment_difference,
+                            max_price_alignment_difference,
+                        )
+                        price_to_beat_next_retry_monotonic = time.monotonic() + 1.0
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    boundary_source = "official_price_to_beat_chainlink_verified"
+                    confirmed_open_price = endpoint_price_to_beat.price_to_beat
+                else:
+                    boundary_source = "official_price_to_beat_stability_verified"
+                    # When the independent boundary sample is unavailable, reuse
+                    # the fair-value strategy's stable official-open fallback.
+                    confirmed_open_price = accept_open_price(
+                        args.strategy,
+                        open_price_tracker,
+                        endpoint_price_to_beat.price_to_beat,
+                        time.monotonic(),
+                    )
+                if confirmed_open_price is None:
+                    stable_elapsed = (
+                        0.0
+                        if open_price_tracker.candidate_since is None
+                        else max(
+                            0.0,
+                            time.monotonic() - open_price_tracker.candidate_since,
+                        )
+                    )
+                    price_to_beat_next_retry_monotonic = time.monotonic() + max(
+                        1.0,
+                        open_price_tracker.minimum_stable_seconds - stable_elapsed,
+                    )
+                    logger.info(
+                        "OFFICIAL_PRICE_TO_BEAT_STABILITY_PENDING slug=%s candidate=%s "
+                        "confirmations=%s/%s stable=%.1f/%.1fs incomplete=%s",
+                        current_market.slug,
+                        open_price_tracker.candidate,
+                        open_price_tracker.confirmations,
+                        open_price_tracker.required_confirmations,
+                        stable_elapsed,
+                        open_price_tracker.minimum_stable_seconds,
+                        endpoint_price_to_beat.incomplete,
+                    )
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+            start_price = confirmed_open_price
+            if use_chainlink_provisional_open:
+                logger.info(
+                    "CHAINLINK_PROVISIONAL_PRICE_TO_BEAT_FIXED slug=%s price=%s "
+                    "capture_delay=%ss offset_ms=%s",
+                    current_market.slug,
+                    start_price,
+                    elapsed_since_start,
+                    (
+                        opening_boundary_spot.observed_at_ms - boundary_timestamp_ms
+                        if opening_boundary_spot is not None
+                        else None
+                    ),
+                )
+            else:
+                logger.info(
+                    "OFFICIAL_PRICE_TO_BEAT_FIXED slug=%s price=%s "
+                    "capture_delay=%ss source=%s endpoint_incomplete=%s",
+                    current_market.slug,
+                    start_price,
+                    elapsed_since_start,
+                    boundary_source,
+                    (
+                        endpoint_price_to_beat.incomplete
+                        if endpoint_price_to_beat is not None
+                        else None
+                    ),
+                )
+
+            # Capture the exact same-source Chainlink 60-second TWAP boundary.
+            # This is the only boundary series allowed to settle a TWAP-mode
+            # reversal window. The regular RTDS price and the legacy openPrice
+            # endpoint remain independent inputs for other strategies.
             try:
                 boundary_spot = price_client.polymarket_chainlink_twap_near(
                     boundary_timestamp_ms,
                     args.max_boundary_sample_offset_ms,
                 )
             except Exception as exc:
+                boundary_spot_price = None
+                boundary_offset_ms = None
                 logger.warning(
-                    "TWAP_OPEN_BOUNDARY_PENDING slug=%s boundary_ms=%s error=%s; "
-                    "checking Gamma official priceToBeat without legacy fallback",
+                    "TWAP_SETTLEMENT_BOUNDARY_PENDING slug=%s boundary_ms=%s error=%s",
                     current_market.slug,
                     boundary_timestamp_ms,
                     exc,
                 )
-                gamma_boundary_price = current_market.official_open_price
-                gamma_boundary_source = "gamma_official_price_to_beat"
-                if (
-                    gamma_boundary_price is None
-                    and time.monotonic() >= next_gamma_open_retry_at
-                ):
-                    next_gamma_open_retry_at = time.monotonic() + 2.0
-                    refreshed_market = load_updown_market(gamma, current_market.slug)
-                    if refreshed_market is not None:
-                        current_market = refreshed_market
-                        gamma_boundary_price = current_market.official_open_price
-                    if gamma_boundary_price is None:
-                        previous_market = load_updown_market(
-                            gamma,
-                            previous_5m_slug(current_market.slug),
-                        )
-                        if previous_market is not None:
-                            gamma_boundary_price = previous_market.official_final_price
-                            gamma_boundary_source = "gamma_previous_final_price"
-                if gamma_boundary_price is None:
-                    sleep_until_next_poll(poll_interval, iteration_started_at)
-                    continue
-                start_price = gamma_boundary_price
-                boundary_offset_ms = None
-                boundary_source = gamma_boundary_source
-                logger.info(
-                    "GAMMA_OPEN_BOUNDARY slug=%s price=%s capture_delay=%ss",
-                    current_market.slug,
-                    start_price,
-                    elapsed_since_start,
-                )
             else:
-                start_price = boundary_spot.price
+                boundary_spot_price = boundary_spot.price
                 boundary_offset_ms = (
                     boundary_spot.observed_at_ms - boundary_timestamp_ms
                 )
-            if reversal_runtime is not None and args.strategy in REVERSAL_STRATEGIES:
-                boundary_outcomes = reversal_runtime.observe_chainlink_open_prices(
-                    {current_market.slug: start_price}
-                )
-                for result_slug, settlement_status in boundary_outcomes:
-                    result = reversal_runtime.strategy.state.pending_gamma_results.get(
-                        result_slug
+            if (
+                reversal_runtime is not None
+                and args.strategy in REVERSAL_STRATEGIES
+            ):
+                if boundary_spot_price is None:
+                    logger.warning(
+                        "REVERSAL_TWAP_BOUNDARY_PENDING slug=%s; reversal channel "
+                        "fails closed until the same-source boundary is available",
+                        current_market.slug,
+                    )
+                else:
+                    reversal_runtime.record_chainlink_open_price(
+                        current_market.slug,
+                        boundary_spot_price,
+                        allow_correction=True,
                     )
                     logger.info(
-                        "REVERSAL_TWAP_RESULT slug=%s result=%s status=%s source=%s",
-                        result_slug,
-                        result.value if result is not None else "already_settled",
-                        settlement_status,
-                        boundary_source,
+                        "REVERSAL_TWAP_BOUNDARY_READY slug=%s boundary=%s offset_ms=%s",
+                        current_market.slug,
+                        boundary_spot_price,
+                        boundary_offset_ms,
                     )
-                if (
-                    reversal_runtime.strategy.state.last_settled_slug
-                    == previous_5m_slug(current_market.slug)
-                ):
-                    reversal_boundary_seeded_slug = current_market.slug
-                elif boundary_source.startswith("gamma_"):
-                    # Gamma backfill reconstructs any missing predecessor sequence
-                    # before tick; do not block it on unavailable RTDS history.
-                    reversal_boundary_seeded_slug = current_market.slug
             alignment_record = {
                 "observed_at": datetime.now(timezone.utc).isoformat(),
                 "slug": current_market.slug,
-                "status": "TWAP_30_BOUNDARY",
-                "boundary_source": boundary_source,
-                "official_price_to_beat": str(start_price),
-                "boundary_chainlink_price": str(start_price),
-                "boundary_chainlink_timestamp_ms": (
-                    boundary_spot.observed_at_ms if boundary_spot is not None else None
+                "status": (
+                    "CHAINLINK_PROVISIONAL_BOUNDARY"
+                    if use_chainlink_provisional_open
+                    else "TWAP_60_BOUNDARY"
                 ),
-                "boundary_offset_ms": boundary_offset_ms,
-                "alignment_difference": "0",
+                "boundary_source": boundary_source,
+                "official_price_to_beat": (
+                    str(endpoint_price_to_beat.price_to_beat)
+                    if endpoint_price_to_beat is not None
+                    else None
+                ),
+                "provisional_price_to_beat": (
+                    str(start_price) if use_chainlink_provisional_open else None
+                ),
+                "boundary_chainlink_price": (
+                    str(opening_boundary_spot.price)
+                    if opening_boundary_spot is not None
+                    else None
+                ),
+                "boundary_chainlink_timestamp_ms": (
+                    opening_boundary_spot.observed_at_ms
+                    if opening_boundary_spot is not None
+                    else None
+                ),
+                "boundary_offset_ms": (
+                    opening_boundary_spot.observed_at_ms - boundary_timestamp_ms
+                    if opening_boundary_spot is not None
+                    else None
+                ),
+                "alignment_difference": (
+                    str(abs(endpoint_price_to_beat.price_to_beat - start_price))
+                    if endpoint_price_to_beat is not None
+                    else None
+                ),
+                "twap_settlement_boundary_price": (
+                    str(boundary_spot_price)
+                    if boundary_spot_price is not None
+                    else None
+                ),
                 "boundary_error": None,
                 "capture_delay_seconds": str(elapsed_since_start),
-                "endpoint_timestamp_ms": None,
-                "endpoint_incomplete": None,
+                "endpoint_timestamp_ms": (
+                    endpoint_price_to_beat.timestamp_ms
+                    if endpoint_price_to_beat is not None
+                    else None
+                ),
+                "endpoint_incomplete": (
+                    endpoint_price_to_beat.incomplete
+                    if endpoint_price_to_beat is not None
+                    else None
+                ),
             }
             if boundary_spot is not None:
                 logger.info(
-                    "TWAP_OPEN_BOUNDARY slug=%s price=%s boundary_offset_ms=%s capture_delay=%ss",
+                    "TWAP_SETTLEMENT_BOUNDARY slug=%s price=%s boundary_offset_ms=%s "
+                    "capture_delay=%ss",
                     current_market.slug,
-                    start_price,
+                    boundary_spot_price,
                     boundary_offset_ms,
                     elapsed_since_start,
                 )
@@ -3658,10 +5081,20 @@ def watch() -> None:
                 alignment_path.parent.mkdir(parents=True, exist_ok=True)
                 with alignment_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(alignment_record, ensure_ascii=True) + "\n")
+            underlying_start_price = start_price
+            if opening_boundary_spot is not None:
+                logger.info(
+                    "UNDERLYING_OPEN_BOUNDARY slug=%s price=%s offset_ms=%s",
+                    current_market.slug,
+                    underlying_start_price,
+                    opening_boundary_spot.observed_at_ms - boundary_timestamp_ms,
+                )
             prices = [spot.price]
             price_sample_times = [time.monotonic()]
+            volatility_prices = [underlying_spot.price]
+            volatility_sample_times = [time.monotonic()]
             logger.info(
-                "Captured official price_to_beat=%s for %s source=%s",
+                "Captured price_to_beat=%s for %s source=%s",
                 start_price,
                 current_market.slug,
                 boundary_source,
@@ -3717,7 +5150,7 @@ def watch() -> None:
                             boundary_timestamp_ms,
                             args.max_boundary_sample_offset_ms,
                         )
-                        if current_resolution_mode is CryptoResolutionMode.TWAP_30
+                        if current_resolution_mode is CryptoResolutionMode.TWAP_60
                         else price_client.polymarket_chainlink_price_near(
                             boundary_timestamp_ms,
                             args.max_boundary_sample_offset_ms,
@@ -3792,17 +5225,168 @@ def watch() -> None:
                         handle.write(json.dumps(alignment_record, ensure_ascii=True) + "\n")
             prices = [spot.price]
             price_sample_times = [time.monotonic()]
+            volatility_prices = [underlying_spot.price]
+            volatility_sample_times = [time.monotonic()]
+            underlying_start_price = (
+                boundary_spot.price
+                if boundary_spot is not None
+                else underlying_spot.price
+            )
             logger.info("Captured price_to_beat=%s for %s", start_price, current_market.slug)
         else:
             prices.append(spot.price)
             price_sample_times.append(time.monotonic())
+            volatility_prices.append(underlying_spot.price)
+            volatility_sample_times.append(time.monotonic())
+
+        if (
+            current_resolution_mode is CryptoResolutionMode.TWAP_60
+            and provisional_open_price is not None
+            and official_price_to_beat_verified_slug != current_market.slug
+        ):
+            if (
+                official_price_to_beat_task is not None
+                and official_price_to_beat_task[0] == current_market.slug
+                and official_price_to_beat_task[1].done()
+            ):
+                _, completed_task = official_price_to_beat_task
+                official_price_to_beat_task = None
+                try:
+                    official_open = completed_task.result()
+                except Exception as exc:
+                    retry_delay = 3.0 if is_http_rate_limit(exc) else 1.0
+                    official_price_to_beat_next_retry_monotonic = (
+                        time.monotonic() + retry_delay
+                    )
+                    logger.warning(
+                        "OFFICIAL_PRICE_TO_BEAT_RECONCILE_PENDING slug=%s "
+                        "retry_in=%.1fs error=%s",
+                        current_market.slug,
+                        retry_delay,
+                        exc,
+                    )
+                else:
+                    difference = abs(
+                        official_open.price_to_beat - provisional_open_price
+                    )
+                    official_price_to_beat_verified_slug = current_market.slug
+                    start_price = official_open.price_to_beat
+                    # Never copy legacy openPrice into the reversal boundary
+                    # cache in TWAP mode. It can be incomplete and represents
+                    # a different price series from Chainlink TWAP-60.
+                    up_qty, down_qty = fast_hedge_engine.quantities()
+                    has_paper_exposure = any(
+                        position.slug == current_market.slug and not position.settled
+                        for position in paper_positions
+                    )
+                    has_fast_hedge_exposure = (
+                        args.strategy == "fast_directional_hedge_simple"
+                        and fast_hedge_engine.state.market_slug == current_market.slug
+                        and (up_qty > 0 or down_qty > 0)
+                    )
+                    has_exposure = (
+                        signals_this_window > 0
+                        or primary_orders_this_window > 0
+                        or has_fast_hedge_exposure
+                        or has_paper_exposure
+                    )
+                    provisional_open_mismatch_with_exposure = (
+                        difference > max_price_alignment_difference
+                        and has_exposure
+                        and args.strategy not in REVERSAL_STRATEGIES
+                        and args.strategy != "fast_directional_hedge_simple"
+                    )
+                    if difference <= max_price_alignment_difference:
+                        logger.info(
+                            "OFFICIAL_PRICE_TO_BEAT_RECONCILED slug=%s provisional=%s "
+                            "official=%s difference=%s endpoint_incomplete=%s",
+                            current_market.slug,
+                            provisional_open_price,
+                            start_price,
+                            difference,
+                            official_open.incomplete,
+                        )
+                    else:
+                        prices = [spot.price]
+                        price_sample_times = [time.monotonic()]
+                        volatility_prices = [underlying_spot.price]
+                        volatility_sample_times = [time.monotonic()]
+                        underlying_start_price = start_price
+                        confirmation_state.reset()
+                        logger.error(
+                            "OFFICIAL_PRICE_TO_BEAT_MISMATCH slug=%s provisional=%s "
+                            "official=%s difference=%s max_difference=%s exposure=%s; "
+                            "%s",
+                            current_market.slug,
+                            provisional_open_price,
+                            start_price,
+                            difference,
+                            max_price_alignment_difference,
+                            has_exposure,
+                            (
+                                "new orders blocked for the rest of this window"
+                                if provisional_open_mismatch_with_exposure
+                                else "samples reset to the official strike; reversal channel remains independent"
+                            ),
+                        )
+                    if args.price_alignment_jsonl:
+                        reconciliation_path = Path(args.price_alignment_jsonl)
+                        reconciliation_path.parent.mkdir(parents=True, exist_ok=True)
+                        with reconciliation_path.open("a", encoding="utf-8") as handle:
+                            handle.write(
+                                json.dumps(
+                                    {
+                                        "observed_at": datetime.now(timezone.utc).isoformat(),
+                                        "slug": current_market.slug,
+                                        "status": (
+                                            "OFFICIAL_RECONCILED"
+                                            if difference <= max_price_alignment_difference
+                                            else "OFFICIAL_MISMATCH"
+                                        ),
+                                        "boundary_source": "official_price_to_beat_background_reconcile",
+                                        "provisional_price_to_beat": str(provisional_open_price),
+                                        "official_price_to_beat": str(start_price),
+                                        "alignment_difference": str(difference),
+                                        "endpoint_timestamp_ms": official_open.timestamp_ms,
+                                        "endpoint_incomplete": official_open.incomplete,
+                                    },
+                                    ensure_ascii=True,
+                                )
+                                + "\n"
+                            )
+            if (
+                official_price_to_beat_task is None
+                and official_price_to_beat_verified_slug != current_market.slug
+                and time.monotonic()
+                >= official_price_to_beat_next_retry_monotonic
+            ):
+                official_price_to_beat_task = (
+                    current_market.slug,
+                    price_to_beat_executor.submit(
+                        price_to_beat_client.fetch,
+                        current_market.event_start_time,
+                        current_market.end_time,
+                    ),
+                )
+                logger.info(
+                    "OFFICIAL_PRICE_TO_BEAT_RECONCILE_RETRY_STARTED slug=%s provisional=%s",
+                    current_market.slug,
+                    provisional_open_price,
+                )
+
+        if provisional_open_mismatch_with_exposure:
+            sleep_until_next_poll(poll_interval, iteration_started_at)
+            continue
 
         if (
             args.strategy in REVERSAL_STRATEGIES
             and reversal_runtime is not None
             and reversal_boundary_seeded_slug != current_market.slug
         ):
-            if reversal_pause_slug == current_market.slug:
+            if (
+                reversal_pause_slug == current_market.slug
+                and reversal_forced_exit_slug != current_market.slug
+            ):
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
             if notifications.trading_paused:
@@ -3812,15 +5396,120 @@ def watch() -> None:
                 )
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
-            try:
-                if current_resolution_mode is CryptoResolutionMode.TWAP_30:
-                    chainlink_open_prices = fetch_reversal_twap_open_prices(
-                        price_client,
-                        current_market,
-                        reversal_runtime.strategy.state.chainlink_open_prices,
-                        1,
+            # The TWAP message that closes the previous window is also the
+            # opening boundary for the current one. It can arrive just after
+            # the first loop iteration, so retry here instead of disabling the
+            # reversal channel for the entire five-minute window.
+            if (
+                current_resolution_mode is CryptoResolutionMode.TWAP_60
+                and current_market.slug
+                not in reversal_runtime.strategy.state.chainlink_open_prices
+            ):
+                boundary_timestamp_ms = int(
+                    current_market.event_start_time.timestamp() * 1000
+                )
+                try:
+                    retry_twap_boundary = price_client.polymarket_chainlink_twap_near(
+                        boundary_timestamp_ms,
                         args.max_boundary_sample_offset_ms,
                     )
+                except Exception as exc:
+                    logger.info(
+                        "REVERSAL_TWAP_BOUNDARY_RETRY_PENDING slug=%s "
+                        "boundary_ms=%s error=%s",
+                        current_market.slug,
+                        boundary_timestamp_ms,
+                        exc,
+                    )
+                else:
+                    reversal_runtime.record_chainlink_open_price(
+                        current_market.slug,
+                        retry_twap_boundary.price,
+                        allow_correction=True,
+                    )
+                    logger.info(
+                        "REVERSAL_TWAP_BOUNDARY_RETRY_READY slug=%s "
+                        "boundary=%s offset_ms=%s",
+                        current_market.slug,
+                        retry_twap_boundary.price,
+                        retry_twap_boundary.observed_at_ms - boundary_timestamp_ms,
+                    )
+            official_boundary_pending = (
+                current_resolution_mode is CryptoResolutionMode.TWAP_60
+                and current_market.slug
+                not in reversal_runtime.strategy.state.chainlink_open_prices
+            )
+            if official_boundary_pending:
+                logger.info(
+                    "REVERSAL_TWAP_BOUNDARY_PENDING slug=%s; same-source "
+                    "Chainlink 60-second TWAP boundary is required",
+                    current_market.slug,
+                )
+                if args.strategy != "reversal_or_fair_value":
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                boundary_outcomes = []
+            else:
+                boundary_outcomes = None
+            reversal_result_source: str | None = None
+            try:
+                if boundary_outcomes is not None:
+                    pass
+                elif current_resolution_mode is CryptoResolutionMode.TWAP_60:
+                    current_twap_boundary = (
+                        reversal_runtime.strategy.state.chainlink_open_prices.get(
+                            current_market.slug
+                        )
+                    )
+                    if current_twap_boundary is None:
+                        raise RuntimeError(
+                            f"current Chainlink TWAP boundary unavailable for "
+                            f"{current_market.slug}"
+                        )
+                    try:
+                        completed_prices = fetch_reversal_twap_completed_prices(
+                            current_market,
+                            reversal_runtime.strategy.state.chainlink_open_prices,
+                            current_twap_boundary,
+                        )
+                    except AmbiguousTwapResult as ambiguous:
+                        consensus_result = reversal_terminal_book_results.get(
+                            ambiguous.slug
+                        )
+                        consensus_source = "terminal_executable_book"
+                        if (
+                            consensus_result is None
+                            and reversal_runtime.strategy.state.active_round is not None
+                        ):
+                            consensus_result = fetch_near_certain_market_winner(
+                                ambiguous.slug
+                            )
+                            consensus_source = "gamma_near_certain_market_price"
+                        if consensus_result is None:
+                            raise
+                        boundary_outcomes = (
+                            reversal_runtime.observe_completed_window_results(
+                                {ambiguous.slug: consensus_result}
+                            )
+                        )
+                        reversal_result_source = consensus_source
+                        logger.warning(
+                            "REVERSAL_AMBIGUOUS_TWAP_PRICE_FALLBACK slug=%s "
+                            "move=%s result=%s source=%s",
+                            ambiguous.slug,
+                            ambiguous.move,
+                            consensus_result.value,
+                            consensus_source,
+                        )
+                    else:
+                        boundary_outcomes = (
+                            reversal_runtime.observe_completed_window_prices(
+                                completed_prices
+                            )
+                        )
+                        reversal_result_source = (
+                            "fixed_twap60_price_to_beat_vs_ending_twap"
+                        )
                 else:
                     chainlink_open_prices = fetch_reversal_chainlink_open_prices(
                         price_to_beat_client,
@@ -3829,56 +5518,146 @@ def watch() -> None:
                         reversal_runtime.strategy.state.chainlink_open_prices,
                         reversal_runtime.strategy.settings.trigger_streak,
                     )
-                boundary_outcomes = reversal_runtime.observe_chainlink_open_prices(
-                    chainlink_open_prices
-                )
+                    boundary_outcomes = reversal_runtime.observe_chainlink_open_prices(
+                        chainlink_open_prices
+                    )
             except Exception as exc:
-                if not is_http_rate_limit(exc):
+                if not suppress_reversal_boundary_alert(exc):
                     notifications.notify_exception(
                         f"反转策略 Chainlink 边界结果 {current_market.slug}",
                         exc,
                         key=f"reversal-boundary:{current_market.slug}",
                     )
                 logger.warning(
-                    "REVERSAL_CHAINLINK_PENDING slug=%s rate_limited=%s error=%s; "
-                    "no split submitted and retry follows",
+                    "REVERSAL_CHAINLINK_PENDING slug=%s rate_limited=%s "
+                    "ambiguous_twap=%s notification_suppressed=%s error=%s; "
+                    "%s",
                     current_market.slug,
                     is_http_rate_limit(exc),
+                    isinstance(exc, AmbiguousTwapResult),
+                    suppress_reversal_boundary_alert(exc),
                     exc,
-                )
-                sleep_until_next_poll(poll_interval, iteration_started_at)
-                continue
-            reversal_boundary_seeded_slug = current_market.slug
-            for result_slug, settlement_status in boundary_outcomes:
-                result = reversal_runtime.strategy.state.pending_gamma_results.get(
-                    result_slug
-                )
-                logger.info(
-                    "REVERSAL_CHAINLINK_RESULT slug=%s result=%s status=%s source=%s",
-                    result_slug,
-                    result.value if result is not None else "already_settled",
-                    settlement_status,
                     (
-                        "chainlink_twap_30_boundary"
-                        if current_resolution_mode is CryptoResolutionMode.TWAP_30
-                        else "official_open_boundary"
+                        "reversal channel waits while the independent fair-value channel continues"
+                        if args.strategy == "reversal_or_fair_value"
+                        else "no split submitted and retry follows"
                     ),
                 )
+                if args.strategy != "reversal_or_fair_value":
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                boundary_outcomes = []
+            else:
+                if not official_boundary_pending:
+                    reversal_boundary_seeded_slug = current_market.slug
+                    for result_slug, settlement_status in boundary_outcomes:
+                        result = reversal_runtime.strategy.state.pending_gamma_results.get(
+                            result_slug
+                        )
+                        logger.info(
+                            "REVERSAL_CHAINLINK_RESULT slug=%s result=%s status=%s source=%s",
+                            result_slug,
+                            result.value if result is not None else "already_settled",
+                            settlement_status,
+                            (
+                                reversal_result_source
+                                if current_resolution_mode is CryptoResolutionMode.TWAP_60
+                                else "official_open_boundary"
+                            ),
+                        )
 
+        rolling_volatility_prices, rolling_volatility_sample_times = (
+            cross_window_volatility_series(btc_volatility_samples)
+        )
         sigma = estimate_sigma_per_sqrt_second(
-            prices,
+            rolling_volatility_prices,
             Decimal(str(poll_interval)),
             fallback_sigma,
-            price_sample_times,
+            rolling_volatility_sample_times,
         )
-        fair = btc_up_probability(start_price, spot.price, max(Decimal("0"), seconds_to_end), sigma)
+        remaining_seconds = max(Decimal("0"), seconds_to_end)
+        known_twap_overlap = (
+            trailing_time_weighted_average(
+                volatility_prices,
+                volatility_sample_times,
+                Decimal("60") - remaining_seconds,
+            )
+            if (
+                current_resolution_mode is CryptoResolutionMode.TWAP_60
+                and Decimal("0") < remaining_seconds < Decimal("60")
+            )
+            else None
+        )
+        fair = (
+            btc_up_twap_probability(
+                start_price,
+                spot.price,
+                underlying_spot.price,
+                remaining_seconds,
+                sigma,
+                known_overlap_average=known_twap_overlap,
+            )
+            if current_resolution_mode is CryptoResolutionMode.TWAP_60
+            else btc_up_probability(
+                start_price,
+                spot.price,
+                remaining_seconds,
+                sigma,
+            )
+        )
         up_quote, down_quote = quote_outcomes(clob, current_market)
         up_ask = up_quote.ask if up_quote else None
         down_ask = down_quote.ask if down_quote else None
         if up_ask is not None and down_ask is not None:
             up_ask_prices.append(up_ask)
             down_ask_prices.append(down_ask)
+            book_sample_times.append(time.monotonic())
+        if (
+            args.strategy in REVERSAL_STRATEGIES
+            and current_resolution_mode is CryptoResolutionMode.TWAP_60
+            and 0 <= seconds_to_end <= 2
+        ):
+            terminal_winner = terminal_book_winner(up_quote, down_quote)
+            previous_terminal_winner = reversal_terminal_book_results.get(
+                current_market.slug
+            )
+            if terminal_winner is None:
+                reversal_terminal_book_results.pop(current_market.slug, None)
+            else:
+                reversal_terminal_book_results[current_market.slug] = terminal_winner
+                if terminal_winner is not previous_terminal_winner:
+                    logger.info(
+                        "REVERSAL_TERMINAL_BOOK_READY slug=%s result=%s "
+                        "up_bid=%s down_bid=%s seconds_left=%.3f",
+                        current_market.slug,
+                        terminal_winner.value,
+                        up_quote.bid if up_quote is not None else None,
+                        down_quote.bid if down_quote is not None else None,
+                        seconds_to_end,
+                    )
+            ordered_terminal_slugs = sorted(
+                reversal_terminal_book_results,
+                key=lambda value: int(value.rpartition("-")[2]),
+            )
+            for expired_terminal_slug in ordered_terminal_slugs[:-6]:
+                reversal_terminal_book_results.pop(expired_terminal_slug, None)
         action = choose_theoretical_action(fair.probability_up, up_ask, down_ask, edge_threshold)
+
+        if args.strategy == "reversal_four_64" and args.paper_trading:
+            paper_bankroll = scratch_decayed_paper_positions(
+                paper_positions,
+                paper_bankroll,
+                current_market.slug,
+                shrink_probability_toward_even(
+                    fair.probability_up,
+                    probability_shrinkage,
+                ),
+                up_quote,
+                down_quote,
+                fair_scratch_exit_probability,
+                fair_scratch_price_tolerance,
+                fair_scratch_fee_rate,
+            )
 
         if snapshot_writer is not None:
             snapshot_writer.write(
@@ -3899,106 +5678,53 @@ def watch() -> None:
             )
 
         logger.info(
-            "%s seconds_left=%s spot=%s start=%s p_up=%.4f up=%s down=%s fair_action=%s",
+            "%s seconds_left=%s settlement_price=%s underlying_spot=%s start=%s "
+            "fair_model=%s p_up=%.4f sigma=%.8f up=%s down=%s fair_action=%s",
             current_market.slug,
             int(seconds_to_end),
             spot.price,
+            underlying_spot.price,
             start_price,
+            (
+                "twap60_overlap_integral"
+                if current_resolution_mode is CryptoResolutionMode.TWAP_60
+                else "terminal_spot"
+            ),
             float(fair.probability_up),
+            float(fair.sigma_per_sqrt_second),
             up_quote,
             down_quote,
             action,
         )
 
-        if args.strategy == "spread_market_maker":
-            if spread_runtime is None:
-                error = RuntimeError("spread_market_maker runtime was not initialized")
-                notifications.notify_exception(
-                    "盘口价差做市运行时",
-                    error,
-                    key="spread-runtime-missing",
-                    cooldown=0,
-                )
-                notifications._set_trading_paused(True)
-                sleep_until_next_poll(poll_interval, iteration_started_at)
-                continue
-            if notifications.trading_paused:
-                logger.warning("SPREAD_MAKER_PAUSED slug=%s", current_market.slug)
-                sleep_until_next_poll(poll_interval, iteration_started_at)
-                continue
-            try:
-                up_book, down_book = clob.books(current_market.token_ids)
-
-                def maker_book_side(book: OrderBookSnapshot) -> BookSide:
-                    quote = book.quote
-                    depth = sum(
-                        level.size
-                        for level in book.bids
-                        if quote.bid is not None and level.price == quote.bid
-                    )
-                    return BookSide(quote.bid, quote.ask, depth)
-
-                timestamps = []
-                for book in (up_book, down_book):
-                    try:
-                        raw = Decimal(book.timestamp)
-                        timestamps.append(raw / Decimal("1000") if raw > Decimal("100000000000") else raw)
-                    except (ArithmeticError, ValueError):
-                        pass
-                quote_age = (
-                    max(Decimal("0"), Decimal(str(now.timestamp())) - min(timestamps))
-                    if timestamps
-                    else Decimal("999")
-                )
-                absolute_move = (
-                    abs(spot.price - start_price) / start_price
-                    if start_price > 0
-                    else Decimal("1")
-                )
-                spread_result = spread_runtime.tick(
-                    current_market,
-                    SpreadSnapshot(
-                        seconds_left=int(seconds_to_end),
-                        observed_at=Decimal(str(now.timestamp())),
-                        quote_age_seconds=quote_age,
-                        up=maker_book_side(up_book),
-                        down=maker_book_side(down_book),
-                        absolute_window_move=absolute_move,
-                        short_volatility=sigma,
-                        tick_size=Decimal(current_market.minimum_tick_size),
-                    ),
-                )
-                logger.info(
-                    "SPREAD_MAKER slug=%s status=%s actions=%s detail=%s balances=%s realized_pnl=%s",
+        hybrid_fair_value_fallback = False
+        if (
+            args.strategy in REVERSAL_STRATEGIES
+            and reversal_runtime is not None
+            and reversal_boundary_seeded_slug != current_market.slug
+        ):
+            if reversal_runtime.strategy.state.active_round is not None:
+                logger.warning(
+                    "REVERSAL_RESULT_UNCONFIRMED_PAUSE slug=%s; active round "
+                    "cannot advance until the previous result is final",
                     current_market.slug,
-                    spread_result.status,
-                    len(spread_result.actions),
-                    spread_result.detail,
-                    spread_runtime.state.balances,
-                    spread_runtime.state.realized_pnl,
                 )
-                if spread_result.responses:
-                    live_orders_submitted += len(spread_result.responses)
-                    live_summary["order_attempts"] = live_orders_submitted
-                    live_summary["spread_state"] = {
-                        "window": spread_runtime.state.window_slug,
-                        "balances": spread_runtime.state.balances,
-                        "working_orders": len(spread_runtime.state.orders),
-                        "realized_pnl": spread_runtime.state.realized_pnl,
-                    }
-                    write_live_summary(finalize=False)
-            except Exception as exc:
-                live_summary["error"] = f"{type(exc).__name__}: {exc}"
-                notifications.notify_exception(
-                    f"盘口价差做市 {current_market.slug}",
-                    exc,
-                    key=f"spread:{current_market.slug}",
-                    cooldown=0,
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            if (
+                args.strategy == "reversal_or_fair_value"
+                and hybrid_signal_owner is None
+            ):
+                hybrid_signal_owner = "fair_value"
+                logger.info(
+                    "REVERSAL_RESULT_UNCONFIRMED_FAIR_VALUE_ONLY slug=%s; "
+                    "reversal channel is disabled for this window",
+                    current_market.slug,
                 )
-            sleep_until_next_poll(poll_interval, iteration_started_at)
-            continue
-
-        if args.strategy in REVERSAL_STRATEGIES:
+        if args.strategy in REVERSAL_STRATEGIES and not (
+            args.strategy == "reversal_or_fair_value"
+            and hybrid_signal_owner == "fair_value"
+        ):
             if reversal_runtime is None:
                 error = RuntimeError("reversal_v11 runtime was not initialized")
                 notifications.notify_exception(
@@ -4017,10 +5743,22 @@ def watch() -> None:
                 )
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
-            if reversal_pause_slug == current_market.slug:
+            if (
+                reversal_pause_slug == current_market.slug
+                and reversal_forced_exit_slug != current_market.slug
+            ):
                 sleep_until_next_poll(poll_interval, iteration_started_at)
                 continue
             try:
+                stale_reconciliation = reversal_runtime.reconcile_stale_active_round()
+                if stale_reconciliation is not None:
+                    stale_slug, stale_status = stale_reconciliation
+                    logger.warning(
+                        "REVERSAL_STALE_ACTIVE_RECONCILED slug=%s status=%s; "
+                        "missed windows were not replayed",
+                        stale_slug,
+                        stale_status,
+                    )
                 abandoned_slug = (
                     reversal_runtime.strategy.roll_forward_uncertain_opening(
                         current_market.slug
@@ -4034,45 +5772,72 @@ def watch() -> None:
                         abandoned_slug,
                         current_market.slug,
                     )
-                reversal_state = reversal_runtime.strategy.state
-                if reversal_state.active_round is None:
-                    gamma_backfills = (
-                        reversal_runtime.backfill_immediate_gamma_results(
-                            current_market.slug
-                        )
-                    )
-                    for backfilled_slug, backfilled_result in gamma_backfills:
-                        logger.info(
-                            "REVERSAL_GAMMA_BACKFILL slug=%s result=%s "
-                            "phase=pre_order_missing_history",
-                            backfilled_slug,
-                            backfilled_result,
-                        )
                 next_amount = reversal_runtime.strategy.opening_split_amount(
                     current_market.slug
                 )
                 up_book, down_book = clob.books(current_market.token_ids)
-                reversal_health_by_side = {
-                    side: market_health_from_books(
-                        trend_side=side,
+                if reversal_forced_exit_slug == current_market.slug:
+                    correction_result = reversal_runtime.correct_gamma_mismatch_position(
+                        market=current_market,
                         up_book=up_book,
                         down_book=down_book,
-                        making_amount=next_amount,
-                        spot_prices=prices,
-                        open_price=start_price,
-                        short_volatility_override=(
-                            reversal_entry_rv60
-                            if reversal_entry_rv60 is not None
-                            else Decimal("0")
-                        ),
-                        five_minute_volatility_override=(
-                            reversal_entry_rv300
-                            if reversal_entry_rv300 is not None
-                            else Decimal("0")
-                        ),
+                        seconds_left=Decimal(str(max(0.0, seconds_to_end))),
+                        source="chain",
+                        allow_replacement=False,
                     )
-                    for side in (Direction.UP, Direction.DOWN)
-                }
+                    logger.warning(
+                        "REVERSAL_CHAIN_FORCED_EXIT_RETRY slug=%s status=%s detail=%s",
+                        current_market.slug,
+                        correction_result.status,
+                        correction_result.detail,
+                    )
+                    if correction_result.order is not None:
+                        live_summary["orders"].append(correction_result.order)
+                        live_orders_submitted += 1
+                        live_summary["order_attempts"] = live_orders_submitted
+                        write_live_summary(finalize=False)
+                    if reversal_runtime.strategy.state.active_round is None:
+                        reversal_forced_exit_slug = None
+                    sleep_until_next_poll(poll_interval, iteration_started_at)
+                    continue
+                reversal_open_price = (
+                    reversal_runtime.strategy.state.chainlink_open_prices.get(
+                        current_market.slug,
+                        start_price,
+                    )
+                    if current_resolution_mode is CryptoResolutionMode.TWAP_60
+                    else start_price
+                )
+                def reversal_health_for_books(
+                    latest_up_book: OrderBookSnapshot,
+                    latest_down_book: OrderBookSnapshot,
+                ) -> dict[Direction, MarketHealth]:
+                    return {
+                        side: market_health_from_books(
+                            trend_side=side,
+                            up_book=latest_up_book,
+                            down_book=latest_down_book,
+                            making_amount=next_amount,
+                            spot_prices=prices,
+                            open_price=reversal_open_price,
+                            short_volatility_override=(
+                                reversal_entry_rv60
+                                if reversal_entry_rv60 is not None
+                                else Decimal("0")
+                            ),
+                            five_minute_volatility_override=(
+                                reversal_entry_rv300
+                                if reversal_entry_rv300 is not None
+                                else Decimal("0")
+                            ),
+                        )
+                        for side in (Direction.UP, Direction.DOWN)
+                    }
+
+                reversal_health_by_side = reversal_health_for_books(
+                    up_book,
+                    down_book,
+                )
                 reversal_result = reversal_runtime.tick(
                     market=current_market,
                     up_book=up_book,
@@ -4080,8 +5845,12 @@ def watch() -> None:
                     health_by_side=reversal_health_by_side,
                     book_refresh=lambda: clob.books(current_market.token_ids),
                     spot_price=spot.price,
-                    open_price=start_price,
-                    probability_up=fair.probability_up,
+                    open_price=reversal_open_price,
+                    probability_up=(
+                        None
+                        if args.strategy == "reversal_or_fair_value"
+                        else fair.probability_up
+                    ),
                 )
                 logger.info(
                     "REVERSAL_V11 slug=%s status=%s plan=%s detail=%s",
@@ -4090,6 +5859,42 @@ def watch() -> None:
                     reversal_result.plan,
                     reversal_result.detail,
                 )
+                while (
+                    reversal_result.status == "entry_unmatched"
+                    and reversal_result.plan is not None
+                    and reversal_runtime.strategy.settings.uses_first_stage_order_rules(
+                        reversal_result.plan.attempt
+                    )
+                    and reversal_runtime.strategy.state.active_round is not None
+                ):
+                    # Retry against a newly fetched book while the opening
+                    # liquidity is still present. The runtime re-applies the
+                    # spread, depth and 0.64 ask ceiling before every FAK.
+                    time.sleep(REVERSAL_FAST_FAK_RETRY_DELAY_SECONDS)
+                    up_book, down_book = clob.books(current_market.token_ids)
+                    reversal_result = reversal_runtime.tick(
+                        market=current_market,
+                        up_book=up_book,
+                        down_book=down_book,
+                        health_by_side=reversal_health_for_books(
+                            up_book,
+                            down_book,
+                        ),
+                        spot_price=spot.price,
+                        open_price=reversal_open_price,
+                        probability_up=(
+                            None
+                            if args.strategy == "reversal_or_fair_value"
+                            else fair.probability_up
+                        ),
+                    )
+                    logger.info(
+                        "REVERSAL_V11_FAST_RETRY slug=%s status=%s plan=%s detail=%s",
+                        current_market.slug,
+                        reversal_result.status,
+                        reversal_result.plan,
+                        reversal_result.detail,
+                    )
                 if reversal_result.order is not None:
                     live_summary["orders"].append(reversal_result.order)
                     live_orders_submitted += 1
@@ -4098,69 +5903,78 @@ def watch() -> None:
                         reversal_result.order.get("response"),
                         require_fill_amounts=True,
                     ):
+                        if args.strategy == "reversal_or_fair_value":
+                            hybrid_signal_owner = "reversal"
                         live_orders_matched += 1
                         live_summary["matched_orders"] = live_orders_matched
                         live_summary["error"] = None
                     write_live_summary(finalize=False)
-                if reversal_result.status in {
-                    "entry_complete",
-                    "entry_reconciled",
-                    "entry_partial",
-                    "entry_unmatched",
-                    "entry_amount_rejected",
-                    "entry_book_pending",
-                    "entry_balance_insufficient",
-                    "exit_complete",
-                    "awaiting_settlement",
-                    "exit_reconciled",
-                    "no_trigger_no_split",
-                    "opening_already_processed",
-                    "trigger_filtered_no_split",
-                    "first_stage_extreme_volatility_no_split",
-                    "unused_split_merged",
-                    "paper_complete",
-                    "dynamic_recovery_skipped",
-                    "profit_target_unfunded",
-                    "paper_unused_split_merged",
-                }:
-                    for verified_slug, verified_result in (
-                        reversal_runtime.verify_gamma_results()
-                    ):
-                        logger.info(
-                            "REVERSAL_GAMMA_VERIFIED slug=%s result=%s "
-                            "phase=post_window_action",
-                            verified_slug,
-                            verified_result,
-                        )
+                for audit_source, verified_slug, verified_result in (
+                    reversal_runtime.pump_historical_audits(
+                        max_candidates=2,
+                        worker_time_budget_seconds=2.0,
+                        apply_time_budget_seconds=0.01,
+                    )
+                ):
+                    logger.info(
+                        "REVERSAL_HISTORY_VERIFIED source=%s slug=%s result=%s "
+                        "phase=after_current_window_action",
+                        audit_source,
+                        verified_slug,
+                        verified_result,
+                    )
                 if maintenance_ready and reversal_notifications_may_run(
                     reversal_result.status
                 ):
                     run_slow_notification_maintenance(maintenance_slug)
                 maybe_execute_weekly_restart()
+                if args.strategy == "reversal_or_fair_value":
+                    hybrid_fair_value_fallback = hybrid_fair_value_fallback_allowed(
+                        args.strategy,
+                        reversal_result.order,
+                        reversal_runtime.strategy.state.active_round,
+                        reversal_runtime.strategy.state.prepared_split,
+                        current_slug=current_market.slug,
+                        signal_owner=hybrid_signal_owner,
+                    )
             except Exception as exc:
                 live_summary["error"] = f"{type(exc).__name__}: {exc}"
-                notifications.notify_exception(
-                    f"反转策略 {current_market.slug}",
-                    exc,
-                    key=f"reversal:{current_market.slug}",
-                    cooldown=0,
-                )
+                if is_reversal_clob_timeout(exc):
+                    # A transient read/connection timeout cannot authorize a
+                    # new order. The current pass fails closed; if submission
+                    # state was uncertain, the runtime reconciles balances on
+                    # the next pass before it can retry. Keep the diagnostic in
+                    # local logs without sending a noisy Telegram alert.
+                    logger.warning(
+                        "REVERSAL_CLOB_TIMEOUT_NOTIFICATION_SUPPRESSED "
+                        "slug=%s error=%s",
+                        current_market.slug,
+                        exc,
+                    )
+                else:
+                    notifications.notify_exception(
+                        f"反转策略 {current_market.slug}",
+                        exc,
+                        key=f"reversal:{current_market.slug}",
+                        cooldown=300,
+                    )
                 active_reversal = reversal_runtime.strategy.state.active_round
                 prepared_reversal = reversal_runtime.strategy.state.prepared_split
-                if isinstance(exc, GammaResultMismatch):
-                    reversal_runtime.quarantine_gamma_mismatch(exc)
+                if isinstance(exc, ChainResultMismatch):
+                    reversal_runtime.quarantine_chain_mismatch(exc)
                     reversal_pause_slug = current_market.slug
+                    reversal_forced_exit_slug = current_market.slug
                     try:
-                        correction_result = (
-                            reversal_runtime.correct_gamma_mismatch_position(
-                                market=current_market,
-                                up_book=up_book,
-                                down_book=down_book,
-                                seconds_left=Decimal(str(max(0.0, seconds_to_end))),
-                            )
+                        correction_result = reversal_runtime.correct_gamma_mismatch_position(
+                            market=current_market,
+                            up_book=up_book,
+                            down_book=down_book,
+                            seconds_left=Decimal(str(max(0.0, seconds_to_end))),
+                            source="chain",
+                            allow_replacement=False,
                         )
                         logger.warning(
-                            "REVERSAL_GAMMA_CORRECTION slug=%s result_slug=%s "
+                            "REVERSAL_CHAIN_CORRECTION slug=%s result_slug=%s "
                             "status=%s detail=%s",
                             current_market.slug,
                             exc.slug,
@@ -4171,24 +5985,23 @@ def watch() -> None:
                             live_summary["orders"].append(correction_result.order)
                             live_orders_submitted += 1
                             live_summary["order_attempts"] = live_orders_submitted
-                            if live_response_is_matched(
-                                correction_result.order.get("response"),
-                                require_fill_amounts=True,
-                            ):
-                                live_orders_matched += 1
-                                live_summary["matched_orders"] = live_orders_matched
                             write_live_summary(finalize=False)
+                        if reversal_runtime.strategy.state.active_round is None:
+                            reversal_forced_exit_slug = None
                     except Exception as correction_exc:
                         logger.exception(
-                            "REVERSAL_GAMMA_CORRECTION_FAILED slug=%s result_slug=%s "
-                            "error=%s; current window remains paused",
+                            "REVERSAL_CHAIN_CORRECTION_FAILED slug=%s result_slug=%s "
+                            "error=%s; forced-exit retry remains armed",
                             current_market.slug,
                             exc.slug,
                             correction_exc,
                         )
+                elif isinstance(exc, GammaResultMismatch):
+                    reversal_runtime.quarantine_gamma_mismatch(exc)
+                    reversal_pause_slug = current_market.slug
                     logger.error(
-                        "REVERSAL_GAMMA_WINDOW_PAUSE_SET slug=%s result_slug=%s; "
-                        "global trading remains enabled",
+                        "REVERSAL_GAMMA_AUDIT_CONFLICT slug=%s result_slug=%s; "
+                        "current window paused without position mutation",
                         current_market.slug,
                         exc.slug,
                     )
@@ -4214,16 +6027,71 @@ def watch() -> None:
                         "REVERSAL_WINDOW_PAUSE_SET slug=%s; global trading remains enabled",
                         current_market.slug,
                     )
-            sleep_until_next_poll(poll_interval, iteration_started_at)
-            continue
+        elif (
+            args.strategy == "reversal_or_fair_value"
+            and hybrid_signal_owner == "fair_value"
+        ):
+            hybrid_fair_value_fallback = True
+            logger.info(
+                "HYBRID_FAIR_VALUE_OWNER slug=%s; reversal channel is locked out",
+                current_market.slug,
+            )
+
+        if args.strategy in REVERSAL_STRATEGIES:
+            if not hybrid_fair_value_fallback:
+                sleep_until_next_poll(poll_interval, iteration_started_at)
+                continue
+            logger.info(
+                "HYBRID_FAIR_VALUE_FALLBACK slug=%s reversal_status=%s",
+                current_market.slug,
+                (
+                    reversal_result.status
+                    if hybrid_signal_owner != "fair_value"
+                    else "fair_value_owns_window"
+                ),
+            )
 
         if (
             args.auto_trade
-            and signals_this_window < strategy_trade_limit(args.strategy, args.max_trades)
+            and (
+                signals_this_window < strategy_trade_limit(args.strategy, args.max_trades)
+                or (
+                    args.strategy == "fast_directional_hedge_simple"
+                    and fast_hedge_engine.state.active_trade is not None
+                    and fast_hedge_engine.state.active_trade.status == "RISK_EXIT"
+                )
+            )
             and not risk_pause_active_for_window
             and not notifications.trading_paused
         ):
-            if args.strategy == "late_favorite":
+            if args.strategy == "fast_directional_hedge_simple":
+                try:
+                    fast_up_book, fast_down_book = clob.books(
+                        current_market.token_ids
+                    )
+                except RequestException as exc:
+                    logger.warning(
+                        "FAST_DIRECTIONAL_HEDGE_BOOK_PENDING slug=%s error=%s",
+                        current_market.slug,
+                        exc,
+                    )
+                    signal = None
+                else:
+                    signal = choose_fast_directional_hedge_simple_signal(
+                        fast_hedge_engine,
+                        current_market,
+                        start_price,
+                        underlying_spot.price,
+                        seconds_to_end,
+                        fair.sigma_per_sqrt_second,
+                        fair.probability_up,
+                        volatility_prices,
+                        volatility_sample_times,
+                        fast_up_book,
+                        fast_down_book,
+                        time.time(),
+                    )
+            elif args.strategy == "late_favorite":
                 signal = choose_late_favorite_signal(
                     current_market,
                     fair.probability_up,
@@ -4321,6 +6189,61 @@ def watch() -> None:
                         )
                         if signal is None:
                             confirmation_state.reset()
+            elif args.strategy == "ewma_twap_fair":
+                signal = (
+                    choose_ewma_twap_signal(
+                        current_market,
+                        list(btc_volatility_samples),
+                        underlying_spot.price,
+                        start_price,
+                        seconds_to_end,
+                        up_quote,
+                        down_quote,
+                        ewma_twap_settings,
+                        fallback_sigma,
+                    )
+                    if current_resolution_mode is CryptoResolutionMode.TWAP_60
+                    else None
+                )
+            elif args.strategy == "momentum_confirmation":
+                signal = choose_momentum_confirmation_signal(
+                    current_market,
+                    up_quote,
+                    down_quote,
+                    seconds_to_end,
+                    volatility_prices,
+                    volatility_sample_times,
+                    underlying_start_price or Decimal("0"),
+                    momentum_entry_seconds,
+                    momentum_cutoff_seconds,
+                    momentum_min_move_percent,
+                    momentum_min_move_usd,
+                    momentum_min_entry,
+                    momentum_max_entry,
+                    max_spread,
+                    min_ask_sum,
+                    max_ask_sum,
+                    momentum_confirmation_seconds,
+                )
+            elif args.strategy == "reversal_four_64":
+                signal = choose_fair_value_scratch_signal(
+                    current_market,
+                    fair.probability_up,
+                    up_quote,
+                    down_quote,
+                    seconds_to_end,
+                    fair_scratch_entry_seconds,
+                    fair_scratch_cutoff_seconds,
+                    fair_scratch_min_entry,
+                    fair_scratch_max_entry,
+                    fair_scratch_min_probability,
+                    fair_scratch_min_net_edge,
+                    fair_scratch_fee_rate,
+                    max_spread,
+                    min_ask_sum,
+                    max_ask_sum,
+                    probability_shrinkage,
+                )
             elif args.strategy == "smart_score":
                 signal = choose_smart_score_signal(
                     current_market,
@@ -4336,8 +6259,8 @@ def watch() -> None:
                     max_spread,
                     min_ask_sum,
                     max_ask_sum,
-                    prices,
-                    start_price,
+                    volatility_prices,
+                    underlying_start_price or Decimal("0"),
                     up_ask_prices,
                     down_ask_prices,
                     smart_score_threshold,
@@ -4373,12 +6296,17 @@ def watch() -> None:
                         max_ask_sum,
                         min_seconds_before_end,
                         min_win_probability,
-                        prices,
-                        start_price,
+                        up_ask_prices,
+                        down_ask_prices,
+                        book_sample_times,
+                        fair_value_book_trend_samples,
+                        fair_value_book_min_slope,
+                        fair_value_book_min_relative_slope,
+                        fair_value_book_max_pullback,
                         low_entry_cutoff,
                         low_entry_min_win_probability,
-                        args.low_entry_confirmation_samples,
                         probability_shrinkage,
+                        fair_value_fee_rate,
                     )
                     if not aggregate_protection_completed and protection_slot_reserved
                     else None
@@ -4467,53 +6395,12 @@ def watch() -> None:
                     sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 is_protective_hedge = signal.reason.startswith("protective_")
-                if (
-                    is_fair_value_strategy(args.strategy)
-                    and not is_protective_hedge
-                    and signal.reason.startswith("fair_value_edge")
-                    and not recent_spot_samples_support_side(
-                        prices,
-                        start_price,
-                        signal.side,
-                        args.trend_confirmation_samples,
-                        (
-                            trend_pullback_tolerance_usd
-                            if signal.price >= low_entry_cutoff
-                            else Decimal("0")
-                        ),
-                        (
-                            trend_pullback_tolerance_percent
-                            if signal.price >= low_entry_cutoff
-                            else Decimal("0")
-                        ),
-                    )
-                ):
-                    effective_tolerance = effective_pullback_tolerance(
-                        trend_pullback_tolerance_usd,
-                        max(abs(price - start_price) for price in prices[-args.trend_confirmation_samples:]),
-                        trend_pullback_tolerance_percent,
-                    ) if signal.price >= low_entry_cutoff else Decimal("0")
-                    logger.info(
-                        "SIGNAL_REJECTED side=%s reason=recent_spot_distance_narrowing "
-                        "samples=%s tolerance_usd=%s tolerance_percent=%s effective_tolerance_usd=%s",
-                        signal.side,
-                        args.trend_confirmation_samples,
-                        (
-                            trend_pullback_tolerance_usd
-                            if signal.price >= low_entry_cutoff
-                            else Decimal("0")
-                        ),
-                        (
-                            trend_pullback_tolerance_percent
-                            if signal.price >= low_entry_cutoff
-                            else Decimal("0")
-                        ),
-                        effective_tolerance,
-                    )
-                    confirmation_state.reset()
-                    sleep_until_next_poll(poll_interval, iteration_started_at)
-                    continue
-                if signal.reason.startswith("protective_open_reversal_stop"):
+                if signal.reason.startswith((
+                    "protective_open_reversal_stop",
+                    "ewma_twap_fair",
+                    "book_volatility_arbitrage_v2.0",
+                    "fair_value_edge",
+                )):
                     jump_reset = False
                     adverse_jump = Decimal("0")
                     jump_threshold = Decimal("0")
@@ -4559,6 +6446,10 @@ def watch() -> None:
                         else hedge_confirmation_min_seconds
                         if is_protective_hedge
                         else 0.0
+                        if args.strategy == "fast_directional_hedge_simple"
+                        else fair_value_confirmation_min_seconds
+                        if is_fair_value_strategy(args.strategy)
+                        else 0.0
                     ),
                     hedge_max_price_worsening if is_protective_hedge else None,
                 )
@@ -4573,49 +6464,89 @@ def watch() -> None:
                     sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 confirmation_state.reset()
-                try:
-                    latest_price_to_beat = price_to_beat_client.fetch(
-                        current_market.event_start_time,
-                        current_market.end_time,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "ORDER_BLOCKED_PRICE_TO_BEAT_UNAVAILABLE slug=%s error=%s",
-                        current_market.slug,
-                        exc,
-                    )
-                    sleep_until_next_poll(poll_interval, iteration_started_at)
-                    continue
-                if latest_price_to_beat.price_to_beat != start_price:
-                    logger.warning(
-                        "PRICE_TO_BEAT_CHANGED slug=%s previous=%s latest=%s; "
-                        "resetting samples and confirmations",
+                if current_resolution_mode is CryptoResolutionMode.TWAP_60:
+                    # The boundary strike is frozen for the order attempt. An
+                    # official fetch runs independently and may reconcile later;
+                    # never put that HTTP request back on the submit path.
+                    logger.info(
+                        "PRICE_TO_BEAT_PRE_SUBMIT_FROZEN slug=%s price=%s status=%s",
                         current_market.slug,
                         start_price,
-                        latest_price_to_beat.price_to_beat,
+                        (
+                            "official_reconciled"
+                            if official_price_to_beat_verified_slug
+                            == current_market.slug
+                            else "chainlink_provisional"
+                        ),
                     )
-                    start_price = None
-                    open_price_tracker.reset()
-                    open_price_tracker.observe(
-                        latest_price_to_beat.price_to_beat,
-                        time.monotonic(),
-                    )
-                    prices = []
-                    price_sample_times = []
-                    up_ask_prices = []
-                    down_ask_prices = []
-                    confirmation_state.reset()
-                    sleep_until_next_poll(poll_interval, iteration_started_at)
-                    continue
+                else:
+                    try:
+                        latest_price_to_beat = price_to_beat_client.fetch(
+                            current_market.event_start_time,
+                            current_market.end_time,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ORDER_BLOCKED_PRICE_TO_BEAT_UNAVAILABLE slug=%s error=%s",
+                            current_market.slug,
+                            exc,
+                        )
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
+                    if latest_price_to_beat.price_to_beat != start_price:
+                        logger.warning(
+                            "PRICE_TO_BEAT_CHANGED slug=%s previous=%s latest=%s; "
+                            "resetting samples and confirmations",
+                            current_market.slug,
+                            start_price,
+                            latest_price_to_beat.price_to_beat,
+                        )
+                        start_price = None
+                        open_price_tracker.reset()
+                        open_price_tracker.observe(
+                            latest_price_to_beat.price_to_beat,
+                            time.monotonic(),
+                        )
+                        prices = []
+                        price_sample_times = []
+                        volatility_prices = []
+                        volatility_sample_times = []
+                        underlying_start_price = None
+                        up_ask_prices = []
+                        down_ask_prices = []
+                        book_sample_times = []
+                        confirmation_state.reset()
+                        sleep_until_next_poll(poll_interval, iteration_started_at)
+                        continue
 
                 confirmed_signal = signal
                 try:
-                    refreshed_spot = price_client.btc_usd()
+                    if args.strategy == "fast_directional_hedge_simple":
+                        # Reuse the already-fetched same-loop Chainlink values.
+                        # The V1.1 direction/invalidation gates therefore add
+                        # no network request to the order hot path.
+                        refreshed_spot = spot
+                        refreshed_underlying_spot = underlying_spot
+                    elif current_resolution_mode is CryptoResolutionMode.TWAP_60:
+                        refreshed_spot = price_client.polymarket_chainlink_twap()
+                        refreshed_underlying_spot = price_client.btc_usd()
+                    else:
+                        refreshed_spot = price_client.btc_usd()
+                        refreshed_underlying_spot = refreshed_spot
                     if refreshed_spot.observed_at is not None:
                         refreshed_age = abs(int(time.time()) - refreshed_spot.observed_at)
                         if refreshed_age > args.max_spot_age:
                             raise RuntimeError(
                                 f"Pre-submit Chainlink report is stale by {refreshed_age}s"
+                            )
+                    if refreshed_underlying_spot.observed_at is not None:
+                        refreshed_underlying_age = abs(
+                            int(time.time()) - refreshed_underlying_spot.observed_at
+                        )
+                        if refreshed_underlying_age > args.max_spot_age:
+                            raise RuntimeError(
+                                "Pre-submit underlying Chainlink report is stale by "
+                                f"{refreshed_underlying_age}s"
                             )
                     refreshed_up_book, refreshed_down_book = clob.books(
                         current_market.token_ids
@@ -4634,6 +6565,7 @@ def watch() -> None:
                 refreshed_quote = (
                     refreshed_up_quote if confirmed_signal.side == "UP" else refreshed_down_quote
                 )
+                fast_simple_order = args.strategy == "fast_directional_hedge_simple"
                 if refreshed_quote is None or refreshed_quote.ask is None:
                     logger.info(
                         "ORDER_BLOCKED_PRE_SUBMIT_QUOTE slug=%s side=%s reason=missing_ask",
@@ -4643,7 +6575,7 @@ def watch() -> None:
                     sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 ask_drop = confirmed_signal.price - refreshed_quote.ask
-                if ask_drop > pre_submit_max_adverse_ask_drop:
+                if not fast_simple_order and ask_drop > pre_submit_max_adverse_ask_drop:
                     logger.info(
                         "ORDER_BLOCKED_ADVERSE_ASK_DROP slug=%s side=%s confirmed_ask=%s "
                         "latest_ask=%s drop=%s max_drop=%s",
@@ -4657,7 +6589,7 @@ def watch() -> None:
                     sleep_until_next_poll(poll_interval, iteration_started_at)
                     continue
                 ask_worsening = refreshed_quote.ask - confirmed_signal.price
-                if ask_worsening > pre_submit_max_ask_worsening:
+                if not fast_simple_order and ask_worsening > pre_submit_max_ask_worsening:
                     logger.info(
                         "ORDER_BLOCKED_ASK_WORSENING slug=%s side=%s confirmed_ask=%s "
                         "latest_ask=%s worsening=%s max_worsening=%s",
@@ -4677,21 +6609,60 @@ def watch() -> None:
                 )
                 refreshed_prices = [*prices, refreshed_spot.price]
                 refreshed_sample_times = [*price_sample_times, refreshed_at]
+                refreshed_volatility_prices = [
+                    *volatility_prices,
+                    refreshed_underlying_spot.price,
+                ]
+                refreshed_volatility_sample_times = [
+                    *volatility_sample_times,
+                    refreshed_at,
+                ]
                 refreshed_seconds_to_end = max(
                     Decimal("0"),
                     _seconds_to_end(current_market, datetime.now(timezone.utc)),
                 )
+                refreshed_rolling_prices, refreshed_rolling_times = (
+                    cross_window_volatility_series(
+                        btc_volatility_samples,
+                        (time.time(), refreshed_underlying_spot.price),
+                    )
+                )
                 refreshed_sigma = estimate_sigma_per_sqrt_second(
-                    refreshed_prices,
+                    refreshed_rolling_prices,
                     Decimal(str(poll_interval)),
                     fallback_sigma,
-                    refreshed_sample_times,
+                    refreshed_rolling_times,
                 )
-                refreshed_fair = btc_up_probability(
-                    start_price,
-                    refreshed_spot.price,
-                    refreshed_seconds_to_end,
-                    refreshed_sigma,
+                refreshed_known_twap_overlap = (
+                    trailing_time_weighted_average(
+                        refreshed_volatility_prices,
+                        refreshed_volatility_sample_times,
+                        Decimal("60") - refreshed_seconds_to_end,
+                    )
+                    if (
+                        current_resolution_mode is CryptoResolutionMode.TWAP_60
+                        and Decimal("0")
+                        < refreshed_seconds_to_end
+                        < Decimal("60")
+                    )
+                    else None
+                )
+                refreshed_fair = (
+                    btc_up_twap_probability(
+                        start_price,
+                        refreshed_spot.price,
+                        refreshed_underlying_spot.price,
+                        refreshed_seconds_to_end,
+                        refreshed_sigma,
+                        known_overlap_average=refreshed_known_twap_overlap,
+                    )
+                    if current_resolution_mode is CryptoResolutionMode.TWAP_60
+                    else btc_up_probability(
+                        start_price,
+                        refreshed_spot.price,
+                        refreshed_seconds_to_end,
+                        refreshed_sigma,
+                    )
                 )
 
                 refreshed_signal: AutoTradeSignal | None
@@ -4775,6 +6746,21 @@ def watch() -> None:
                             )
                         ):
                             refreshed_signal = None
+                elif args.strategy == "fast_directional_hedge_simple":
+                    refreshed_signal = choose_fast_directional_hedge_simple_signal(
+                        fast_hedge_engine,
+                        current_market,
+                        start_price,
+                        refreshed_underlying_spot.price,
+                        refreshed_seconds_to_end,
+                        refreshed_fair.sigma_per_sqrt_second,
+                        refreshed_fair.probability_up,
+                        refreshed_volatility_prices,
+                        refreshed_volatility_sample_times,
+                        refreshed_up_book,
+                        refreshed_down_book,
+                        time.time(),
+                    )
                 elif args.strategy == "late_favorite":
                     refreshed_signal = choose_late_favorite_signal(
                         current_market,
@@ -4838,6 +6824,66 @@ def watch() -> None:
                         min_ask_sum,
                         max_ask_sum,
                     )
+                elif args.strategy == "ewma_twap_fair":
+                    refreshed_signal = (
+                        choose_ewma_twap_signal(
+                            current_market,
+                            list(
+                                zip(
+                                    refreshed_rolling_times,
+                                    refreshed_rolling_prices,
+                                )
+                            ),
+                            refreshed_underlying_spot.price,
+                            start_price,
+                            refreshed_seconds_to_end,
+                            refreshed_up_quote,
+                            refreshed_down_quote,
+                            ewma_twap_settings,
+                            fallback_sigma,
+                        )
+                        if current_resolution_mode is CryptoResolutionMode.TWAP_60
+                        else None
+                    )
+                elif args.strategy == "momentum_confirmation":
+                    refreshed_signal = choose_momentum_confirmation_signal(
+                        current_market,
+                        refreshed_up_quote,
+                        refreshed_down_quote,
+                        refreshed_seconds_to_end,
+                        refreshed_volatility_prices,
+                        refreshed_volatility_sample_times,
+                        underlying_start_price or Decimal("0"),
+                        momentum_entry_seconds,
+                        momentum_cutoff_seconds,
+                        momentum_min_move_percent,
+                        momentum_min_move_usd,
+                        momentum_min_entry,
+                        momentum_max_entry,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                        momentum_confirmation_seconds,
+                    )
+                elif args.strategy == "reversal_four_64":
+                    refreshed_signal = choose_fair_value_scratch_signal(
+                        current_market,
+                        refreshed_fair.probability_up,
+                        refreshed_up_quote,
+                        refreshed_down_quote,
+                        refreshed_seconds_to_end,
+                        fair_scratch_entry_seconds,
+                        fair_scratch_cutoff_seconds,
+                        fair_scratch_min_entry,
+                        fair_scratch_max_entry,
+                        fair_scratch_min_probability,
+                        fair_scratch_min_net_edge,
+                        fair_scratch_fee_rate,
+                        max_spread,
+                        min_ask_sum,
+                        max_ask_sum,
+                        probability_shrinkage,
+                    )
                 elif args.strategy == "smart_score":
                     refreshed_signal = choose_smart_score_signal(
                         current_market,
@@ -4853,8 +6899,8 @@ def watch() -> None:
                         max_spread,
                         min_ask_sum,
                         max_ask_sum,
-                        refreshed_prices,
-                        start_price,
+                        refreshed_volatility_prices,
+                        underlying_start_price or Decimal("0"),
                         [
                             *up_ask_prices,
                             *(
@@ -4897,35 +6943,41 @@ def watch() -> None:
                         max_ask_sum,
                         min_seconds_before_end,
                         min_win_probability,
-                        refreshed_prices,
-                        start_price,
+                        [
+                            *up_ask_prices[:-1],
+                            *(
+                                [refreshed_up_quote.ask]
+                                if refreshed_up_quote is not None
+                                and refreshed_up_quote.ask is not None
+                                else []
+                            ),
+                        ],
+                        [
+                            *down_ask_prices[:-1],
+                            *(
+                                [refreshed_down_quote.ask]
+                                if refreshed_down_quote is not None
+                                and refreshed_down_quote.ask is not None
+                                else []
+                            ),
+                        ],
+                        [*book_sample_times[:-1], refreshed_at],
+                        fair_value_book_trend_samples,
+                        fair_value_book_min_slope,
+                        fair_value_book_min_relative_slope,
+                        fair_value_book_max_pullback,
                         low_entry_cutoff,
                         low_entry_min_win_probability,
-                        args.low_entry_confirmation_samples,
                         probability_shrinkage,
+                        fair_value_fee_rate,
                     )
-                    if (
-                        refreshed_signal is not None
-                        and not recent_spot_samples_support_side(
-                            refreshed_prices,
-                            start_price,
-                            refreshed_signal.side,
-                            args.trend_confirmation_samples,
-                            (
-                                trend_pullback_tolerance_usd
-                                if refreshed_signal.price >= low_entry_cutoff
-                                else Decimal("0")
-                            ),
-                            (
-                                trend_pullback_tolerance_percent
-                                if refreshed_signal.price >= low_entry_cutoff
-                                else Decimal("0")
-                            ),
-                        )
-                    ):
-                        refreshed_signal = None
 
-                if refreshed_signal is None or refreshed_signal.side != confirmed_signal.side:
+                if (
+                    refreshed_signal is None
+                    or refreshed_signal.side != confirmed_signal.side
+                    or refreshed_signal.action != confirmed_signal.action
+                    or refreshed_signal.role != confirmed_signal.role
+                ):
                     logger.info(
                         "ORDER_BLOCKED_SIGNAL_CHANGED slug=%s confirmed_side=%s latest_side=%s",
                         current_market.slug,
@@ -4939,10 +6991,12 @@ def watch() -> None:
                 spot = refreshed_spot
                 prices = refreshed_prices
                 price_sample_times = refreshed_sample_times
+                volatility_prices = refreshed_volatility_prices
+                volatility_sample_times = refreshed_volatility_sample_times
                 fair = refreshed_fair
                 up_quote, down_quote = refreshed_up_quote, refreshed_down_quote
                 seconds_to_end = refreshed_seconds_to_end
-                trade_size = order_size
+                trade_size = signal.size if signal.size is not None else order_size
                 quoted_ask = signal.price
                 if trader is not None:
                     maximum_execution_price = (
@@ -4954,9 +7008,13 @@ def watch() -> None:
                         if args.strategy == "late_favorite"
                         else one_way_max_entry
                         if signal.reason.startswith("one_way_trend")
+                        else signal.price
+                        if args.strategy == "fast_directional_hedge_simple"
                         else max_entry + live_buy_slippage
                     )
-                    if signal.reason.startswith("one_way_trend"):
+                    if args.strategy in {"fast_directional_hedge_simple", "ewma_twap_fair"}:
+                        execution_price = signal.price
+                    elif signal.reason.startswith("one_way_trend"):
                         execution_price = buy_limit_price_with_slippage(
                             quoted_ask,
                             live_buy_slippage,
@@ -4984,6 +7042,7 @@ def watch() -> None:
                             selected_probability,
                             seconds_to_end,
                             edge_threshold,
+                            fair_value_fee_rate,
                         )
                     elif is_protective_hedge and signal.reason.startswith("protective_hedge"):
                         selected_probability = (
@@ -5013,6 +7072,11 @@ def watch() -> None:
                             f"max_slippage={live_buy_slippage} "
                             f"applied_slippage={execution_price - quoted_ask}"
                         ),
+                        size=signal.size,
+                        fair_probability=signal.fair_probability,
+                        action=signal.action,
+                        role=signal.role,
+                        executable_price=signal.executable_price,
                     )
                 if is_protective_hedge:
                     is_one_way_reversal = (
@@ -5084,6 +7148,11 @@ def watch() -> None:
                             f"max_loss_after={hedge_risk.max_loss_after.quantize(Decimal('0.0001'))} "
                             f"loss_reduction={(hedge_risk.max_loss_before - hedge_risk.max_loss_after).quantize(Decimal('0.0001'))}"
                         ),
+                        size=signal.size,
+                        fair_probability=signal.fair_probability,
+                        action=signal.action,
+                        role=signal.role,
+                        executable_price=signal.executable_price,
                     )
                 if trader is not None:
                     selected_book = (
@@ -5091,11 +7160,15 @@ def watch() -> None:
                         if signal.side == "UP"
                         else refreshed_down_book
                     )
-                    available_depth = executable_ask_depth(
-                        selected_book,
-                        signal.price,
+                    available_depth = (
+                        executable_bid_depth(selected_book, signal.price)
+                        if signal.action == "SELL"
+                        else executable_ask_depth(selected_book, signal.price)
                     )
-                    if available_depth < trade_size:
+                    if available_depth < trade_size and not (
+                        args.strategy == "fast_directional_hedge_simple"
+                        and available_depth > 0
+                    ):
                         logger.info(
                             "ORDER_BLOCKED_INSUFFICIENT_DEPTH slug=%s side=%s "
                             "limit=%s required=%s available=%s",
@@ -5116,6 +7189,11 @@ def watch() -> None:
                             f"pre_submit_depth={available_depth.quantize(Decimal('0.000001'))} "
                             f"quote_ttl={pre_submit_max_quote_age_seconds:g}s"
                         ),
+                        size=signal.size,
+                        fair_probability=signal.fair_probability,
+                        action=signal.action,
+                        role=signal.role,
+                        executable_price=signal.executable_price,
                     )
                 logger.info(
                     "AUTO_SIGNAL %s side=%s price=%s size=%s reason=%s",
@@ -5126,31 +7204,80 @@ def watch() -> None:
                     signal.reason,
                 )
                 if trader is None:
-                    signals_this_window = window_trade_count_after_attempt(
-                        signals_this_window,
-                        live=False,
+                    if not (
+                        args.strategy == "fast_directional_hedge_simple"
+                        and signal.role in {"HEDGE", "EXIT"}
+                    ):
+                        signals_this_window = window_trade_count_after_attempt(
+                            signals_this_window,
+                            live=False,
                     )
                     if args.paper_trading:
+                        paper_execution_price = signal.executable_price or signal.price
                         paper_trade_stake = (
-                            signal.price * paper_shares
+                            paper_execution_price * trade_size
+                            if args.strategy in {"fast_directional_hedge_simple", "ewma_twap_fair"}
+                            else signal.price * paper_shares
                             if paper_shares > 0
                             else paper_stake
                         )
                         paper_fee_rate = (
                             late_fee_rate
                             if args.strategy == "late_favorite"
+                            else fair_scratch_fee_rate
+                            if args.strategy == "reversal_four_64"
+                            else momentum_fee_rate
+                            if args.strategy == "momentum_confirmation"
                             else smart_score_fee_rate
                             if args.strategy == "smart_score"
+                            else ewma_twap_settings.taker_fee_rate
+                            if args.strategy == "ewma_twap_fair"
+                            else fast_hedge_settings.fee_rate
+                            if args.strategy == "fast_directional_hedge_simple"
                             else Decimal("0")
                         )
-                        paper_bankroll = open_paper_position(
-                            paper_positions,
-                            paper_bankroll,
-                            current_market.slug,
-                            signal,
-                            paper_trade_stake,
-                            paper_fee_rate,
-                        )
+                        paper_position_count_before = len(paper_positions)
+                        if (
+                            args.strategy == "fast_directional_hedge_simple"
+                            and signal.action == "SELL"
+                        ):
+                            paper_bankroll, exit_shares, exit_proceeds = (
+                                close_fast_simple_paper_position(
+                                    paper_positions,
+                                    paper_bankroll,
+                                    current_market.slug,
+                                    signal.side,
+                                    trade_size,
+                                    paper_execution_price,
+                                    paper_fee_rate,
+                                )
+                            )
+                            if exit_shares > 0:
+                                fast_hedge_engine.record_exit_fill(
+                                    current_market.slug,
+                                    signal.side,
+                                    exit_shares,
+                                    exit_proceeds,
+                                )
+                        else:
+                            paper_bankroll = open_paper_position(
+                                paper_positions,
+                                paper_bankroll,
+                                current_market.slug,
+                                replace(signal, price=paper_execution_price),
+                                paper_trade_stake,
+                                paper_fee_rate,
+                            )
+                            if (
+                                args.strategy == "fast_directional_hedge_simple"
+                                and len(paper_positions) > paper_position_count_before
+                            ):
+                                fast_hedge_engine.record_fill(
+                                    current_market.slug,
+                                    signal.side,
+                                    trade_size,
+                                    paper_trade_stake,
+                                )
                         if args.stop_when_bust and paper_bankroll <= 0:
                             logger.info("PAPER_BUST bankroll=%s. Exiting after open position.", paper_bankroll)
                             return
@@ -5159,7 +7286,12 @@ def watch() -> None:
                     if is_protective_hedge:
                         aggregate_protection_completed = True
                         one_way_reversal_started_at = None
-                    elif primary_side_this_window is None:
+                    elif primary_side_this_window is None and not (
+                        args.strategy == "fast_directional_hedge_simple"
+                        and signal.role in {"HEDGE", "EXIT"}
+                    ):
+                        if args.strategy == "reversal_or_fair_value":
+                            hybrid_signal_owner = "fair_value"
                         primary_side_this_window = signal.side
                         primary_orders_this_window = 1
                         if args.paper_trading:
@@ -5181,14 +7313,28 @@ def watch() -> None:
                             primary_shares_this_window += trade_size
                 else:
                     notional = signal.price * trade_size
+                    fast_simple_role = (
+                        signal.role
+                        if args.strategy == "fast_directional_hedge_simple"
+                        else "ENTRY"
+                    )
+                    fast_simple_risk_order = fast_simple_role in {"HEDGE", "EXIT"}
                     live_notional_cap = (
+                        notional
+                        if fast_simple_risk_order
+                        else
                         protection_notional
                         if is_protective_hedge
+                        else ewma_twap_settings.max_notional
+                        if args.strategy == "ewma_twap_fair"
                         else late_max_live_notional
                         if args.strategy == "late_favorite"
                         else max_live_notional
                     )
-                    if not live_session_should_continue(live_orders_submitted, args.max_live_orders):
+                    if (
+                        not fast_simple_risk_order
+                        and not live_session_should_continue(live_orders_submitted, args.max_live_orders)
+                    ):
                         logger.warning("LIVE ORDER LIMIT reached=%s. Exiting.", live_orders_submitted)
                         return
                     if notional > live_notional_cap:
@@ -5207,13 +7353,26 @@ def watch() -> None:
                         "attempted_at": datetime.now(timezone.utc).isoformat(),
                         "slug": current_market.slug,
                         "side": signal.side,
+                        "action": signal.action,
                         "token_id": signal.token_id,
                         "price": str(signal.price),
                         "size": str(trade_size),
                         "notional": str(notional),
-                        "order_type": args.live_order_type,
+                        "order_type": (
+                            "FAK"
+                            if args.strategy == "fast_directional_hedge_simple"
+                            else args.live_order_type
+                        ),
                         "order_role": (
-                            "reverse_protection"
+                            "stop_hedge"
+                            if args.strategy == "fast_directional_hedge_simple"
+                            and fast_simple_role == "HEDGE"
+                            else "stop_exit"
+                            if args.strategy == "fast_directional_hedge_simple"
+                            and fast_simple_role == "EXIT"
+                            else "directional_entry"
+                            if args.strategy == "fast_directional_hedge_simple"
+                            else "reverse_protection"
                             if is_protective_hedge
                             else "primary"
                             if primary_side_this_window is None
@@ -5234,16 +7393,30 @@ def watch() -> None:
                     live_summary["order_attempts"] = live_orders_submitted
                     write_live_summary(finalize=False)
                     try:
-                        response = trader.buy_limit(
+                        if args.strategy == "fast_directional_hedge_simple":
+                            fast_hedge_engine.mark_submission_started(fast_simple_role)
+                        submission_order_type = (
+                            "FAK"
+                            if args.strategy == "fast_directional_hedge_simple"
+                            else args.live_order_type
+                        )
+                        order_method = (
+                            trader.sell_limit
+                            if signal.action == "SELL"
+                            else trader.buy_limit
+                        )
+                        response = order_method(
                             token_id=signal.token_id,
                             price=signal.price,
                             size=trade_size,
                             tick_size=current_market.minimum_tick_size,
                             neg_risk=current_market.neg_risk,
-                            order_type=args.live_order_type,
+                            order_type=submission_order_type,
                             submit_not_after_monotonic=submit_not_after_monotonic,
                         )
                     except OrderQuoteExpiredError as exc:
+                        if args.strategy == "fast_directional_hedge_simple":
+                            fast_hedge_engine.mark_submission_failed(uncertain=False)
                         live_orders_submitted -= 1
                         live_summary["status"] = "running"
                         live_summary["order_attempts"] = live_orders_submitted
@@ -5259,6 +7432,8 @@ def watch() -> None:
                         sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     except Exception as exc:
+                        if args.strategy == "fast_directional_hedge_simple":
+                            fast_hedge_engine.mark_submission_failed(uncertain=True)
                         live_summary["status"] = "running"
                         live_summary["error"] = f"{type(exc).__name__}: {exc}"
                         order_record["error"] = live_summary["error"]
@@ -5274,7 +7449,7 @@ def watch() -> None:
                             live_orders_submitted,
                             live_summary["error"],
                         )
-                        if not live_session_should_continue(live_orders_submitted, args.max_live_orders):
+                        if not fast_simple_risk_order and not live_session_should_continue(live_orders_submitted, args.max_live_orders):
                             live_summary["status"] = "completed"
                             write_live_summary()
                             return
@@ -5285,14 +7460,20 @@ def watch() -> None:
                     logger.info("LIVE ORDER response=%s", response)
                     matched = live_response_is_matched(
                         response,
-                        require_fill_amounts=args.live_order_type == "FAK",
+                        require_fill_amounts=(
+                            args.strategy == "fast_directional_hedge_simple"
+                            or args.live_order_type == "FAK"
+                        ),
                     )
-                    signals_this_window = window_trade_count_after_attempt(
-                        signals_this_window,
-                        live=True,
-                        matched=matched,
-                    )
+                    if not fast_simple_risk_order:
+                        signals_this_window = window_trade_count_after_attempt(
+                            signals_this_window,
+                            live=True,
+                            matched=matched,
+                        )
                     if not matched:
+                        if args.strategy == "fast_directional_hedge_simple":
+                            fast_hedge_engine.mark_submission_failed(uncertain=False)
                         live_summary["status"] = "running"
                         live_summary["error"] = f"Order response was not conclusively matched: {response}"
                         order_record["error"] = live_summary["error"]
@@ -5307,17 +7488,44 @@ def watch() -> None:
                             "LIVE ORDER attempt=%s was not matched; continuing.",
                             live_orders_submitted,
                         )
-                        if not live_session_should_continue(live_orders_submitted, args.max_live_orders):
+                        if not fast_simple_risk_order and not live_session_should_continue(live_orders_submitted, args.max_live_orders):
                             live_summary["status"] = "completed"
                             write_live_summary()
                             return
                         sleep_until_next_poll(poll_interval, iteration_started_at)
                         continue
                     live_orders_matched += 1
+                    if args.strategy == "fast_directional_hedge_simple":
+                        if signal.action == "SELL":
+                            fast_fill_proceeds, fast_fill_shares = response_sell_fill_amounts(
+                                response,
+                                signal.price,
+                                trade_size,
+                            )
+                            fast_hedge_engine.record_exit_fill(
+                                current_market.slug,
+                                signal.side,
+                                fast_fill_shares,
+                                fast_fill_proceeds,
+                            )
+                        else:
+                            fast_fill_cost, fast_fill_shares = response_fill_amounts(
+                                response,
+                                signal.price,
+                                trade_size,
+                            )
+                            fast_hedge_engine.record_fill(
+                                current_market.slug,
+                                signal.side,
+                                fast_fill_shares,
+                                fast_fill_cost,
+                            )
                     if is_protective_hedge:
                         aggregate_protection_completed = True
                         one_way_reversal_started_at = None
-                    elif primary_side_this_window is None:
+                    elif primary_side_this_window is None and not fast_simple_risk_order:
+                        if args.strategy == "reversal_or_fair_value":
+                            hybrid_signal_owner = "fair_value"
                         primary_side_this_window = signal.side
                         primary_orders_this_window = 1
                         primary_cost_this_window, primary_shares_this_window = response_fill_amounts(
@@ -5340,7 +7548,7 @@ def watch() -> None:
                     live_summary["matched_orders"] = live_orders_matched
                     order_record["matched_at"] = datetime.now(timezone.utc).isoformat()
                     notifications.record_fill(order_record)
-                    if not live_session_should_continue(live_orders_submitted, args.max_live_orders):
+                    if not fast_simple_risk_order and not live_session_should_continue(live_orders_submitted, args.max_live_orders):
                         live_summary["status"] = "completed"
                         write_live_summary()
                         logger.warning(
@@ -5364,6 +7572,8 @@ def watch() -> None:
 
     if args.paper_trading:
         paper_bankroll = settle_all_paper_positions(paper_positions, paper_bankroll)
+        if args.strategy == "fast_directional_hedge_simple":
+            record_fast_simple_paper_settlements(fast_hedge_engine, paper_positions)
         open_positions = sum(1 for position in paper_positions if not position.settled)
         logger.info(
             "PAPER_SUMMARY bankroll=%s positions=%s open_positions=%s",

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import pytest
+import requests
 
 from src.telegram_commands import TelegramCommand
 from src.telegram_notify import (
@@ -22,6 +23,8 @@ from src.telegram_notify import (
     format_settlement_message,
     format_window_settlement_message,
     model_probability,
+    position_exit_adjustments,
+    position_exit_key,
     position_value_breakdown,
     positions_for_market,
     sanitize_sensitive_text,
@@ -50,6 +53,36 @@ class FakeSession:
     def delete(self, url: str, timeout: float) -> FakeResponse:
         self.delete_calls.append((url, timeout))
         return FakeResponse()
+
+
+class FailingSession:
+    def __init__(self, error: requests.RequestException) -> None:
+        self.error = error
+        self.calls = 0
+
+    def post(self, url: str, json: dict, timeout: float) -> FakeResponse:
+        self.calls += 1
+        raise self.error
+
+
+def test_reversal_unlocked_profit_locks_seventy_percent_of_high_water(tmp_path) -> None:
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(None, None),
+        trader=None,
+        signature_type=3,
+        strategy="reversal_compact",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=tmp_path / "trades.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+    service.state["settlements"] = {
+        "one": {"gross_pnl": "10", "estimated_fee": "0", "settled_at": "1"},
+        "two": {"gross_pnl": "-2", "estimated_fee": "0", "settled_at": "2"},
+    }
+
+    assert service.reversal_unlocked_profit(Decimal("0.70")) == Decimal("1.00")
 
 
 class StubCommandPoller:
@@ -95,6 +128,32 @@ def test_disabled_notifier_is_a_noop() -> None:
     notifier = TelegramNotifier(None, None, session=session)
     assert notifier.send("hello") is False
     assert session.calls == []
+
+
+def test_telegram_notifier_fails_over_after_primary_proxy_error() -> None:
+    class BrokenSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, url: str, json: dict, timeout: float) -> FakeResponse:
+            self.calls += 1
+            raise requests.exceptions.ProxyError("primary proxy disconnected")
+
+    primary = BrokenSession()
+    fallback = FakeSession()
+    notifier = TelegramNotifier(
+        "123456:telegram-token-value_1234567890",
+        "42",
+        session=primary,
+        fallback_session=fallback,
+    )
+
+    assert notifier.send("fallback test") is True
+    assert len(fallback.calls) == 1
+    assert notifier.session is fallback
+    assert notifier.send("promoted fallback") is True
+    assert primary.calls == 1
+    assert len(fallback.calls) == 2
 
 
 def test_disabled_discord_notifier_is_a_noop() -> None:
@@ -239,6 +298,36 @@ def test_notifier_sends_persistent_reply_keyboard() -> None:
     assert session.calls[0][1]["reply_markup"] == markup
 
 
+def test_notifier_does_not_retry_send_message_after_read_timeout() -> None:
+    primary = FailingSession(requests.exceptions.ReadTimeout("response timed out"))
+    fallback = FakeSession()
+    notifier = TelegramNotifier(
+        "123456:telegram-token-value_1234567890",
+        "42",
+        session=primary,
+        fallback_session=fallback,
+    )
+
+    assert notifier.send("once only") is True
+    assert primary.calls == 1
+    assert fallback.calls == []
+
+
+def test_notifier_retries_send_message_after_connect_timeout() -> None:
+    primary = FailingSession(requests.exceptions.ConnectTimeout("connect timed out"))
+    fallback = FakeSession()
+    notifier = TelegramNotifier(
+        "123456:telegram-token-value_1234567890",
+        "42",
+        session=primary,
+        fallback_session=fallback,
+    )
+
+    assert notifier.send("safe fallback") is True
+    assert primary.calls == 1
+    assert len(fallback.calls) == 1
+
+
 def test_alert_cooldown_suppresses_duplicate(monkeypatch) -> None:
     session = FakeSession()
     notifier = TelegramNotifier("123456:telegram-token-value_1234567890", "42", session=session)
@@ -262,6 +351,27 @@ def test_fill_message_uses_actual_matched_amounts_and_probability() -> None:
     assert "Taker 手续费估算: 0.0825 pUSD" in message
     assert "获胜时净收益估算: 1.8175 pUSD" in message
     assert "模型期望收益: -2.1825 pUSD" in message
+
+
+def test_sell_fill_message_uses_sell_response_orientation() -> None:
+    message = format_fill_message(
+        {
+            "slug": "btc-updown-5m-1",
+            "side": "UP",
+            "action": "SELL",
+            "price": "0.39",
+            "size": "2",
+            "response": {
+                "makingAmount": "2",
+                "takingAmount": "0.80",
+                "orderID": "sell-order",
+            },
+        }
+    )
+    assert "风险退出已成交" in message
+    assert "成交均价: 0.4000" in message
+    assert "卖出数量: 2.0000 份" in message
+    assert "实际回款: 0.8000 pUSD" in message
 
 
 def test_fee_and_account_equity_use_actual_fills_and_position_values() -> None:
@@ -306,6 +416,122 @@ def test_settlement_message_reports_realized_values_and_cumulative_stats() -> No
     assert "累计胜率: 50.00%" in message
     assert "累计毛盈亏: -0.6500 pUSD" in message
     assert "累计净盈亏估算: -0.8191 pUSD" in message
+
+
+def test_forced_exit_reduces_settlement_payout_and_prevents_false_profit() -> None:
+    order = matched_order(side="DOWN", cost="58.799999", shares="101.379309")
+    order.update(
+        {
+            "slug": "btc-updown-5m-1786151100",
+            "order_role": "reversal_retained",
+            "round_id": 429,
+            "attempt": 6,
+            "reversal_execution": "direct_buy",
+            "reversal_entry_cost": "58.799999",
+            "reversal_planned_shares": "101.379309",
+        }
+    )
+    exit_order = {
+        "slug": order["slug"],
+        "side": "DOWN",
+        "round_id": 429,
+        "attempt": 6,
+        "order_role": "gamma_correction_exit",
+        "ledger_type": "position_exit",
+        "response": {
+            "status": "matched",
+            "makingAmount": "101.37",
+            "takingAmount": "50.941270",
+        },
+    }
+    adjustments = position_exit_adjustments([order, exit_order])
+    settlement = settlement_values(order, "DOWN", adjustments[position_exit_key(order)])
+
+    assert settlement["settlement_side_won"] is True
+    assert settlement["won"] is False
+    assert settlement["forced_exit_shares"] == "101.37"
+    assert settlement["remaining_shares"] == "0.009309"
+    assert settlement["payout"] == "0.009309"
+    assert Decimal(settlement["net_pnl"]) < Decimal("-9")
+
+    message = format_window_settlement_message(
+        [settlement],
+        AccountSnapshot(Decimal("553.599972"), Decimal("0"), Decimal("0"), 0),
+        [settlement],
+    )
+    assert "结果: ❌ 亏损" in message
+    assert "强制卖出数量: 101.3700份" in message
+    assert "强制卖出回款: 50.9413 pUSD" in message
+    assert "结算剩余仓位: 0.0093份" in message
+    assert "结算返还: 0.0093 pUSD" in message
+
+
+def test_correction_exit_ledger_adjusts_single_buy_settlement(tmp_path) -> None:
+    session = FakeSession()
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(
+            "123456:telegram-token-value_1234567890",
+            "42",
+            session=session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="reversal_v11",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+        settlement_interval=0,
+        notify_on_matched=False,
+    )
+    service.record_reversal_exit(
+        {
+            "slug": "btc-updown-5m-1786151100",
+            "side": "DOWN",
+            "trend_side": "UP",
+            "planned_shares": "101.379309",
+            "round_id": 429,
+            "attempt": 6,
+            "order_role": "reversal_direct_entry",
+            "response": {
+                "success": True,
+                "status": "matched",
+                "orderID": "0xbuy",
+                "makingAmount": "58.799999",
+                "takingAmount": "101.379309",
+            },
+        }
+    )
+    service.record_reversal_exit(
+        {
+            "slug": "btc-updown-5m-1786151100",
+            "side": "DOWN",
+            "round_id": 429,
+            "attempt": 6,
+            "order_role": "gamma_correction_exit",
+            "response": {
+                "success": True,
+                "status": "matched",
+                "orderID": "0xsell",
+                "makingAmount": "101.37",
+                "takingAmount": "50.941270",
+            },
+        }
+    )
+
+    service.maybe_send_settlements(lambda slug: "DOWN")
+
+    saved = json.loads(state.read_text())
+    assert len(saved["settlements"]) == 1
+    settlement = next(iter(saved["settlements"].values()))
+    assert settlement["payout"] == "0.009309"
+    assert settlement["won"] is False
+    assert len(session.calls) == 1
+    assert "本窗口成交: 1 单" in session.calls[0][1]["text"]
+    assert "强制卖出回款: 50.9413 pUSD" in session.calls[0][1]["text"]
 
 
 def test_window_settlement_message_combines_two_orders() -> None:
@@ -394,7 +620,7 @@ def test_settlement_service_sends_one_notification_per_window(tmp_path) -> None:
     assert len(saved["settlements"]) == 2
 
 
-def test_reversal_retained_position_uses_window_pnl_notification_on_both_channels(
+def test_reversal_retained_position_uses_window_pnl_notification_only_on_telegram(
     tmp_path,
 ) -> None:
     telegram_session = FakeSession()
@@ -443,6 +669,7 @@ def test_reversal_retained_position_uses_window_pnl_notification_on_both_channel
     ledger_order = json.loads(ledger.read_text().strip())
     assert ledger_order["side"] == "DOWN"
     assert ledger_order["order_role"] == "reversal_retained"
+    assert ledger_order["strategy"] == "reversal_v11"
     assert ledger_order["response"]["makingAmount"] == "0.80"
     assert ledger_order["response"]["takingAmount"] == "2"
 
@@ -457,14 +684,13 @@ def test_reversal_retained_position_uses_window_pnl_notification_on_both_channel
     assert "趋势仓卖出回款: 1.2000 pUSD" in telegram_text
     assert "轮次/阶段: 3/2" in telegram_text
     assert "本轮累计净盈亏估算: +1.1664 pUSD" in telegram_text
-    assert len(discord_session.calls) == 1
-    discord_payload = discord_session.calls[0][1]
-    assert discord_payload["content"] == telegram_text
-    assert "embeds" not in discord_payload
+    assert "策略: 5窗反转·10阶" in telegram_text
+    assert "阶段上限: 10" in telegram_text
+    assert discord_session.calls == []
     saved = json.loads(state.read_text())
     assert saved["settlement_windows"]["btc-updown-5m-700"][
         "notified_channels"
-    ] == ["discord", "telegram"]
+    ] == ["telegram"]
 
 
 def test_reversal_notification_round_pnl_includes_prior_attempt_losses() -> None:
@@ -544,7 +770,7 @@ def test_settlement_window_migration_does_not_repeat_legacy_notifications(tmp_pa
     assert window["migrated_from_individual"] is True
 
 
-def test_start_notification_is_sent_to_telegram_and_discord(tmp_path) -> None:
+def test_start_notification_is_sent_only_to_telegram(tmp_path) -> None:
     telegram_session = FakeSession()
     discord_session = FakeSession()
     service = TradingNotificationService(
@@ -565,26 +791,20 @@ def test_start_notification_is_sent_to_telegram_and_discord(tmp_path) -> None:
     service.start()
 
     assert "机器人启动成功" in telegram_session.calls[0][1]["text"]
-    assert "机器人启动成功" in discord_session.calls[0][1]["embeds"][0]["title"]
     assert "reply_markup" in telegram_session.calls[0][1]
-    assert "reply_markup" not in discord_session.calls[0][1]
+    assert discord_session.calls == []
     saved = json.loads((tmp_path / "state.json").read_text())
-    queued = saved["discord_message_deletions"]
-    assert len(queued) == 1
-    assert queued[0]["message_id"] == "discord-message-1"
-    assert queued[0]["kind"] == "start"
+    assert saved["discord_message_deletions"] == []
 
 
-def test_discord_deletion_waits_until_deadline_and_survives_restart(tmp_path, monkeypatch) -> None:
-    now = [1000.0]
-    monkeypatch.setattr("src.telegram_notify.time.time", lambda: now[0])
+def test_discord_daily_only_mode_does_not_send_or_schedule_start_message(tmp_path) -> None:
     state = tmp_path / "state.json"
-    first_session = FakeSession()
-    first = TradingNotificationService(
+    discord_session = FakeSession()
+    service = TradingNotificationService(
         notifier=TelegramNotifier(None, None),
         discord_notifier=DiscordNotifier(
             "https://discord.com/api/webhooks/123456/secret_webhook_token",
-            session=first_session,
+            session=discord_session,
         ),
         trader=None,
         signature_type=3,
@@ -595,34 +815,13 @@ def test_discord_deletion_waits_until_deadline_and_survives_restart(tmp_path, mo
         state_path=state,
         discord_start_stop_retention_seconds=300,
     )
-    first.start()
+    service.start()
 
-    restarted_session = FakeSession()
-    restarted = TradingNotificationService(
-        notifier=TelegramNotifier(None, None),
-        discord_notifier=DiscordNotifier(
-            "https://discord.com/api/webhooks/123456/secret_webhook_token",
-            session=restarted_session,
-        ),
-        trader=None,
-        signature_type=3,
-        strategy="fair_value_edge",
-        mode="live",
-        version="test",
-        summary={},
-        state_path=state,
-    )
-    now[0] = 1299.0
-    restarted.maybe_delete_expired_discord_messages()
-    assert restarted_session.delete_calls == []
-
-    now[0] = 1300.0
-    restarted.maybe_delete_expired_discord_messages()
-    assert len(restarted_session.delete_calls) == 1
+    assert discord_session.calls == []
     assert json.loads(state.read_text())["discord_message_deletions"] == []
 
 
-def test_settlement_retries_only_missing_discord_delivery(tmp_path) -> None:
+def test_settlement_never_attempts_discord_delivery(tmp_path) -> None:
     class FlakyResponse(FakeResponse):
         def __init__(self, should_fail: bool) -> None:
             self.should_fail = should_fail
@@ -670,21 +869,17 @@ def test_settlement_retries_only_missing_discord_delivery(tmp_path) -> None:
     saved = json.loads(state.read_text())
     assert saved["settlements"][key]["notified_channels"] == ["telegram"]
     assert len(telegram_session.calls) == 1
-    assert len(discord_session.calls) == 1
+    assert discord_session.calls == []
 
     discord_session.should_fail = False
     service._next_settlement_attempt = 0
     service.maybe_send_settlements(lambda slug: None)
 
     saved = json.loads(state.read_text())
-    assert saved["settlements"][key]["notified_channels"] == ["discord", "telegram"]
-    assert saved["discord_message_deletions"][0]["kind"] == "settlement"
-    assert (
-        saved["discord_message_deletions"][0]["delete_at"]
-        - datetime.fromisoformat(saved["discord_message_deletions"][0]["created_at"]).timestamp()
-    ) == pytest.approx(259200, abs=2)
+    assert saved["settlements"][key]["notified_channels"] == ["telegram"]
+    assert saved["discord_message_deletions"] == []
     assert len(telegram_session.calls) == 1
-    assert len(discord_session.calls) == 2
+    assert discord_session.calls == []
 
 
 def test_record_fill_is_silent_until_settlement_by_default(tmp_path) -> None:
@@ -712,9 +907,13 @@ def test_discord_ignores_matched_and_exceptions_but_keeps_daily_report(tmp_path)
     discord_session = FakeSession()
     ledger = tmp_path / "trades.jsonl"
     state = tmp_path / "state.json"
-    report_day = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    report_day = datetime.now(timezone.utc).date() - timedelta(days=1)
     order = matched_order()
-    order["matched_at"] = datetime.combine(report_day, datetime.min.time(), ZoneInfo("Asia/Shanghai")).isoformat()
+    order["matched_at"] = datetime.combine(
+        report_day,
+        datetime.min.time(),
+        timezone.utc,
+    ).isoformat()
     ledger.write_text(json.dumps(order) + "\n")
     state.write_text(
         json.dumps(
@@ -766,6 +965,80 @@ def test_discord_ignores_matched_and_exceptions_but_keeps_daily_report(tmp_path)
     assert "日报" in discord_session.calls[0][1]["embeds"][0]["title"]
     saved = json.loads(state.read_text())
     assert saved["discord_message_deletions"] == []
+
+
+def test_daily_report_merges_strategy_section_and_uses_utc_boundary(tmp_path) -> None:
+    telegram_session = FakeSession()
+    discord_session = FakeSession()
+    ledger = tmp_path / "trades.jsonl"
+    state = tmp_path / "state.json"
+    report_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+    order = matched_order()
+    order["matched_at"] = datetime.combine(
+        report_day,
+        datetime.min.time(),
+        timezone.utc,
+    ).isoformat()
+    ledger.write_text(json.dumps(order) + "\n")
+    state.write_text(
+        json.dumps(
+            {
+                "days": {
+                    report_day.isoformat(): {
+                        "reported": False,
+                        "start_balance": "20",
+                        "end_balance": "21",
+                    }
+                },
+                "settlements": {},
+            }
+        )
+    )
+    service = TradingNotificationService(
+        notifier=TelegramNotifier(
+            "123456:telegram-token-value_1234567890",
+            "42",
+            session=telegram_session,
+        ),
+        discord_notifier=DiscordNotifier(
+            "https://discord.com/api/webhooks/123456/secret_webhook_token",
+            session=discord_session,
+        ),
+        trader=None,
+        signature_type=3,
+        strategy="reversal_v11",
+        mode="live",
+        version="test",
+        summary={},
+        ledger_path=ledger,
+        state_path=state,
+    )
+    service.current_account_snapshot = lambda: AccountSnapshot(
+        Decimal("22"), Decimal("0"), Decimal("0")
+    )
+    marked: list[date] = []
+
+    sent_day = service.maybe_send_daily(
+        lambda slug: "UP",
+        additional_report=lambda day: f"反转轮次统计 {day.isoformat()}",
+        on_reported=marked.append,
+    )
+
+    assert sent_day == report_day
+    assert marked == [report_day]
+    assert len(telegram_session.calls) == 1
+    telegram_text = telegram_session.calls[0][1]["text"]
+    assert "统计周期: 北京时间" in telegram_text
+    assert "实际成交: 1 单" in telegram_text
+    assert "反转轮次统计" in telegram_text
+    assert len(discord_session.calls) == 1
+    discord_embed = json.dumps(
+        discord_session.calls[0][1]["embeds"][0],
+        ensure_ascii=False,
+    )
+    assert "实际成交" in discord_embed
+    assert "1 单" in discord_embed
+    assert "反转轮次统计" in discord_embed
 
 
 def test_daily_stats_count_only_resolved_orders_in_win_rate() -> None:
@@ -1038,7 +1311,7 @@ def test_live_strategy_switch_queues_reversal_v11(tmp_path) -> None:
     service._queue_strategy("reversal_v11")
 
     assert service.pending_strategy == "reversal_v11"
-    assert "反转·2窗" in session.calls[-1][1]["text"]
+    assert "5窗反转·10阶" in session.calls[-1][1]["text"]
 
 
 def test_strategy_override_persists_for_paper_and_live(tmp_path) -> None:

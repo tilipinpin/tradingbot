@@ -87,6 +87,15 @@ class SpotPriceClient:
             raise RuntimeError("Polymarket Chainlink stream has not started")
         return self._polymarket_stream.price_near(timestamp_ms, max_distance_ms)
 
+    def polymarket_chainlink_price_at_or_after(
+        self,
+        timestamp_ms: int,
+        max_delay_ms: int,
+    ) -> SpotPrice:
+        if self._polymarket_stream is None:
+            raise RuntimeError("Polymarket Chainlink stream has not started")
+        return self._polymarket_stream.price_at_or_after(timestamp_ms, max_delay_ms)
+
     def polymarket_chainlink_twap(self) -> SpotPrice:
         if self._polymarket_twap_stream is None:
             self._polymarket_twap_stream = PolymarketChainlinkTwapStream(
@@ -103,13 +112,21 @@ class SpotPriceClient:
             )
         self._polymarket_twap_stream.start()
 
+    def warm_polymarket_chainlink_spot(self) -> None:
+        if self._polymarket_stream is None:
+            self._polymarket_stream = PolymarketChainlinkStream(
+                timeout=self.timeout,
+                proxy_url=self.ws_proxy,
+            )
+        self._polymarket_stream.start()
+
     def polymarket_chainlink_twap_near(
         self,
         timestamp_ms: int,
         max_distance_ms: int,
     ) -> SpotPrice:
         if self._polymarket_twap_stream is None:
-            raise RuntimeError("Polymarket Chainlink 30-second TWAP stream has not started")
+            raise RuntimeError("Polymarket Chainlink 60-second TWAP stream has not started")
         return self._polymarket_twap_stream.price_near(timestamp_ms, max_distance_ms)
 
     def _btc_usd_from_source(self, source: str) -> SpotPrice:
@@ -311,6 +328,32 @@ class PolymarketChainlinkStream:
             )
         return nearest
 
+    def price_at_or_after(self, timestamp_ms: int, max_delay_ms: int) -> SpotPrice:
+        """Return the first RTDS tick on or just after a window boundary.
+
+        A pre-boundary tick must never become the provisional Price to Beat.
+        The bounded delay also prevents a bot that started mid-window from
+        treating a fresh but late tick as the opening strike.
+        """
+        if max_delay_ms < 0:
+            raise ValueError("max_delay_ms must be non-negative")
+        with self._lock:
+            candidates = [
+                price
+                for price in self._history
+                if price.observed_at_ms is not None
+                and int(price.observed_at_ms) >= timestamp_ms
+            ]
+        if not candidates:
+            raise RuntimeError("Polymarket Chainlink post-boundary sample is unavailable")
+        first = min(candidates, key=lambda price: int(price.observed_at_ms))
+        delay_ms = int(first.observed_at_ms) - timestamp_ms
+        if delay_ms > max_delay_ms:
+            raise RuntimeError(
+                f"First Polymarket Chainlink sample is {delay_ms}ms after boundary"
+            )
+        return first
+
     def close(self) -> None:
         self._stop.set()
 
@@ -378,13 +421,13 @@ class PolymarketChainlinkStream:
 
 
 class PolymarketChainlinkTwapStream(PolymarketChainlinkStream):
-    """Official RTDS BTC/USD 30-second TWAP using its exact E18 value."""
+    """Official RTDS BTC/USD 60-second TWAP using its exact E18 value."""
 
     SUBSCRIPTION = {
         "action": "subscribe",
         "subscriptions": [
             {
-                "topic": "crypto_prices_twap_thirty",
+                "topic": "crypto_prices_twap_sixty",
                 "type": "update",
                 "filters": '{"symbol":"btc/usd"}',
             }
@@ -398,12 +441,12 @@ class PolymarketChainlinkTwapStream(PolymarketChainlinkStream):
     @staticmethod
     def parse_message(message: str) -> SpotPrice | None:
         envelope = json.loads(message)
-        if envelope.get("topic") != "crypto_prices_twap_thirty" or envelope.get("type") != "update":
+        if envelope.get("topic") != "crypto_prices_twap_sixty" or envelope.get("type") != "update":
             return None
         payload = envelope.get("payload") or {}
         if str(payload.get("symbol", "")).lower() != "btc/usd":
             return None
-        if int(payload.get("window_s", 0)) != 30:
+        if int(payload.get("window_s", 0)) != 60:
             return None
         exact = payload.get("full_accuracy_value")
         if exact is None:
@@ -415,7 +458,7 @@ class PolymarketChainlinkTwapStream(PolymarketChainlinkStream):
         return SpotPrice(
             symbol="BTC/USD",
             price=price,
-            source="POLYMARKET_CHAINLINK_TWAP_30",
+            source="POLYMARKET_CHAINLINK_TWAP_60",
             observed_at=timestamp_ms // 1000,
             observed_at_ms=timestamp_ms,
         )

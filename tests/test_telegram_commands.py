@@ -124,7 +124,6 @@ def test_persistent_keyboard_has_all_control_buttons() -> None:
         "▶️ 恢复交易",
         "🧠 选择策略",
         "🎛 手动交易",
-        "🔄 重启机器人",
     ]
 
 
@@ -141,27 +140,49 @@ def test_live_strategy_menu_keeps_combined_strategy_and_adds_reversal_v11() -> N
     markup = strategy_selection_markup("live", "fair_value_edge", None)
     buttons = [button for row in markup["inline_keyboard"] for button in row]
     by_data = {button["callback_data"]: button["text"] for button in buttons}
+    callbacks = [button["callback_data"] for button in buttons]
 
     assert "✅ 公允价值差" == by_data["strategy:select:fair_value_edge"]
+    assert "盘口波动套利" == by_data[
+        "strategy:select:fast_directional_hedge_simple"
+    ]
     assert "strategy:select:open_060_late_070" not in by_data
-    assert "智能评分（仅纸面）" == by_data["strategy:unavailable:smart_score"]
-    assert "反转·2窗" == by_data[
+    assert "智能评分" == by_data["strategy:select:smart_score"]
+    assert "EWMA·TWAP公平价" == by_data["strategy:select:ewma_twap_fair"]
+    assert "动量确认" == by_data["strategy:select:momentum_confirmation"]
+    assert "4窗反转·64U" == by_data[
+        "strategy:select:reversal_four_64"
+    ]
+    assert "5窗反转·10阶" == by_data[
         "strategy:select:reversal_v11"
     ]
-    assert "反转·3窗" == by_data[
-        "strategy:select:reversal_v11_three_streak"
-    ]
-    assert "反转·4窗" == by_data[
+    assert "4窗反转·10阶" == by_data[
         "strategy:select:reversal_v11_four_streak"
     ]
-    assert "盘口价差做市" == by_data[
-        "strategy:select:spread_market_maker"
+    assert "4窗反转·4-0-0追回" == by_data[
+        "strategy:select:reversal_v11_six_streak"
     ]
+    assert "strategy:select:reversal_v11_seven_streak" not in by_data
+    assert "strategy:select:reversal_v11_eight_streak" not in by_data
+    assert "strategy:select:reversal_v11_three_streak" not in by_data
+    assert "strategy:select:reversal_compact" not in by_data
+    assert "反转·首段" == by_data[
+        "strategy:select:reversal_first_stage"
+    ]
+    assert "3窗反转·16U" == by_data[
+        "strategy:select:reversal_three_16"
+    ]
+    assert "2窗反转·12阶" == by_data[
+        "strategy:select:reversal_three_4_8"
+    ]
+    assert "strategy:select:spread_market_maker" not in by_data
     assert "strategy:select:late_070" not in by_data
     assert "strategy:select:late_one_way" not in by_data
     assert "strategy:select:open_060" not in by_data
     assert "↩️ 恢复启动策略" == by_data[f"strategy:select:{DEFAULT_STRATEGY}"]
-    assert len(buttons) == 8
+    assert len(buttons) == 14
+    assert callbacks.index("strategy:select:reversal_first_stage") == 5
+    assert callbacks.index("strategy:select:reversal_four_64") == 10
 
 
 def test_paper_strategy_menu_allows_smart_score() -> None:
@@ -170,13 +191,21 @@ def test_paper_strategy_menu_allows_smart_score() -> None:
     by_data = {button["callback_data"]: button["text"] for button in buttons}
 
     assert by_data["strategy:select:smart_score"] == "智能评分"
-    assert by_data["strategy:select:reversal_v11"] == "反转·2窗"
-    assert by_data["strategy:select:reversal_v11_three_streak"] == (
-        "反转·3窗"
-    )
+    assert by_data["strategy:select:ewma_twap_fair"] == "EWMA·TWAP公平价"
+    assert by_data["strategy:select:fast_directional_hedge_simple"] == "盘口波动套利"
+    assert by_data["strategy:select:momentum_confirmation"] == "动量确认"
+    assert by_data["strategy:select:reversal_four_64"] == "4窗反转·64U"
+    assert by_data["strategy:select:reversal_v11"] == "5窗反转·10阶"
     assert by_data["strategy:select:reversal_v11_four_streak"] == (
-        "反转·4窗"
+        "4窗反转·10阶"
     )
+    assert by_data["strategy:select:reversal_v11_six_streak"] == "4窗反转·4-0-0追回"
+    assert by_data["strategy:select:reversal_three_4_8"] == "2窗反转·12阶"
+    assert by_data["strategy:select:reversal_three_16"] == "3窗反转·16U"
+    assert "strategy:select:reversal_v11_seven_streak" not in by_data
+    assert "strategy:select:reversal_compact" not in by_data
+    assert "strategy:select:reversal_v11_eight_streak" not in by_data
+    assert "strategy:select:reversal_v11_three_streak" not in by_data
 
 
 def test_poller_parses_strategy_callback_from_authorized_chat() -> None:

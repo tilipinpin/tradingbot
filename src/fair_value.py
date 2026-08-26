@@ -110,6 +110,106 @@ def btc_up_probability(
     )
 
 
+def twap_effective_variance_seconds(
+    seconds_to_expiry: Decimal,
+    window_seconds: Decimal = Decimal("60"),
+) -> Decimal:
+    """Brownian variance clock for a future rolling-window average."""
+    remaining = max(Decimal("0"), seconds_to_expiry)
+    if window_seconds <= 0:
+        raise ValueError("TWAP window must be positive")
+    if remaining >= window_seconds:
+        return remaining - Decimal("2") * window_seconds / Decimal("3")
+    return remaining**3 / (Decimal("3") * window_seconds**2)
+
+
+def trailing_time_weighted_average(
+    prices: list[Decimal],
+    sample_times: list[float],
+    lookback_seconds: Decimal,
+) -> Decimal | None:
+    """Trapezoidal average over an exact trailing interval, with interpolation."""
+    if len(prices) != len(sample_times):
+        raise ValueError("sample_times must match prices")
+    if len(prices) < 2 or lookback_seconds <= 0:
+        return None
+    end = sample_times[-1]
+    start = end - float(lookback_seconds)
+    if sample_times[0] > start:
+        return None
+
+    integral = Decimal("0")
+    covered = 0.0
+    for index, (left_time, right_time) in enumerate(
+        zip(sample_times, sample_times[1:])
+    ):
+        if right_time <= left_time or right_time <= start or left_time >= end:
+            continue
+        overlap_left = max(left_time, start)
+        overlap_right = min(right_time, end)
+        if overlap_right <= overlap_left:
+            continue
+        left_price = prices[index]
+        right_price = prices[index + 1]
+        duration = right_time - left_time
+        left_fraction = Decimal(str((overlap_left - left_time) / duration))
+        right_fraction = Decimal(str((overlap_right - left_time) / duration))
+        price_at_left = left_price + (right_price - left_price) * left_fraction
+        price_at_right = left_price + (right_price - left_price) * right_fraction
+        overlap_duration = Decimal(str(overlap_right - overlap_left))
+        integral += (price_at_left + price_at_right) * overlap_duration / Decimal("2")
+        covered += overlap_right - overlap_left
+
+    if covered + 1e-6 < float(lookback_seconds):
+        return None
+    return integral / lookback_seconds
+
+
+def btc_up_twap_probability(
+    start_twap: Decimal,
+    current_twap: Decimal,
+    current_spot: Decimal,
+    seconds_to_expiry: Decimal,
+    sigma_per_sqrt_second: Decimal,
+    window_seconds: Decimal = Decimal("60"),
+    known_overlap_average: Decimal | None = None,
+) -> FairValueResult:
+    """Estimate the probability that the expiry TWAP beats the opening TWAP.
+
+    The current rolling TWAP is projected toward spot as its old observations
+    roll out. Uncertainty uses the integrated-Brownian variance of the future
+    portion of the final TWAP window rather than terminal spot variance.
+    """
+    if min(start_twap, current_twap, current_spot) <= 0:
+        raise ValueError("TWAP and spot prices must be positive")
+    remaining = max(Decimal("0"), seconds_to_expiry)
+    if remaining <= 0:
+        return btc_up_probability(
+            start_twap,
+            current_twap,
+            Decimal("0"),
+            sigma_per_sqrt_second,
+        )
+    if window_seconds <= 0:
+        raise ValueError("TWAP window must be positive")
+    roll_fraction = min(Decimal("1"), remaining / window_seconds)
+    if known_overlap_average is not None and remaining < window_seconds:
+        if known_overlap_average <= 0:
+            raise ValueError("Known TWAP overlap average must be positive")
+        overlap_seconds = window_seconds - remaining
+        projected_twap = (
+            known_overlap_average * overlap_seconds + current_spot * remaining
+        ) / window_seconds
+    else:
+        projected_twap = current_twap + roll_fraction * (current_spot - current_twap)
+    return btc_up_probability(
+        start_twap,
+        projected_twap,
+        twap_effective_variance_seconds(remaining, window_seconds),
+        sigma_per_sqrt_second,
+    )
+
+
 def choose_theoretical_action(
     probability_up: Decimal,
     up_ask: Decimal | None,

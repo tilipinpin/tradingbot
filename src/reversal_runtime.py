@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -8,6 +10,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from src.crypto_resolution import resolve_btc_5m_twap
 from src.polymarket import Market, OrderBookSnapshot
 from src.polygon_split import CompleteSetSplitter
 from src.reversal_v11 import (
@@ -38,6 +41,10 @@ class GammaResultMismatch(ReversalRuntimeError):
         self.slug = slug
         self.provisional = provisional
         self.official = official
+
+
+class ChainResultMismatch(GammaResultMismatch):
+    pass
 
 
 logger = logging.getLogger(__name__)
@@ -114,6 +121,92 @@ class ReversalStartupReport:
     up_balance: Decimal
     down_balance: Decimal
     relayer_deployed: bool
+
+
+@dataclass(frozen=True)
+class HistoricalAuditTask:
+    source: str
+    slug: str
+    expected: Direction
+    deadline: float
+
+
+@dataclass(frozen=True)
+class HistoricalAuditResult:
+    source: str
+    slug: str
+    expected: Direction
+    published: str | None = None
+    error: str | None = None
+
+
+class HistoricalAuditWorker:
+    """Run slow Polygon/Gamma history lookups away from the trading loop."""
+
+    def __init__(
+        self,
+        *,
+        gamma_lookup: Callable[[str], str | None],
+        chain_lookup: Callable[[str], str | None] | None,
+    ) -> None:
+        self.gamma_lookup = gamma_lookup
+        self.chain_lookup = chain_lookup
+        self.tasks: queue.Queue[HistoricalAuditTask] = queue.Queue()
+        self.results: queue.Queue[HistoricalAuditResult] = queue.Queue()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="reversal-history-audit",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def submit(self, task: HistoricalAuditTask) -> None:
+        self.tasks.put_nowait(task)
+
+    def _run(self) -> None:
+        while True:
+            task = self.tasks.get()
+            if time.monotonic() > task.deadline:
+                self.results.put(
+                    HistoricalAuditResult(
+                        source=task.source,
+                        slug=task.slug,
+                        expected=task.expected,
+                        error="audit batch deadline expired before lookup",
+                    )
+                )
+                continue
+            lookup = self.chain_lookup if task.source == "chain" else self.gamma_lookup
+            if lookup is None:
+                self.results.put(
+                    HistoricalAuditResult(
+                        source=task.source,
+                        slug=task.slug,
+                        expected=task.expected,
+                        error="audit source unavailable",
+                    )
+                )
+                continue
+            try:
+                published = lookup(task.slug)
+            except Exception as exc:
+                self.results.put(
+                    HistoricalAuditResult(
+                        source=task.source,
+                        slug=task.slug,
+                        expected=task.expected,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+            else:
+                self.results.put(
+                    HistoricalAuditResult(
+                        source=task.source,
+                        slug=task.slug,
+                        expected=task.expected,
+                        published=published,
+                    )
+                )
 
 
 @dataclass(frozen=True)
@@ -261,6 +354,7 @@ def reversal_startup_self_check(
     required_collateral: Decimal = Decimal("30"),
     execution_mode: str = "split_sell",
     wallet: str = "CLOB funder",
+    require_trade_collateral: bool = True,
 ) -> ReversalStartupReport:
     if signature_type != 3:
         raise ReversalRuntimeError("reversal_v11 live execution requires SIGNATURE_TYPE=3")
@@ -273,7 +367,12 @@ def reversal_startup_self_check(
     down_balance = trader.conditional_balance(market.token_ids[1], signature_type)
     if execution_mode == "direct_buy":
         collateral = trader.collateral_balance(signature_type)
-        if collateral < required_collateral:
+        required_collateral = (
+            max(required_collateral, MIN_MARKETABLE_BUY_NOTIONAL)
+            if require_trade_collateral
+            else Decimal("0")
+        )
+        if require_trade_collateral and collateral < required_collateral:
             raise ReversalRuntimeError(
                 f"startup blocked: collateral {collateral} is below required "
                 f"{required_collateral} pUSD"
@@ -332,6 +431,13 @@ def slug_epoch(slug: str) -> int:
 def bid_depth(book: OrderBookSnapshot, minimum_price: Decimal = Decimal("0")) -> Decimal:
     return sum(
         (level.size for level in book.bids if level.price >= minimum_price and level.size > 0),
+        Decimal("0"),
+    )
+
+
+def ask_depth(book: OrderBookSnapshot, maximum_price: Decimal) -> Decimal:
+    return sum(
+        (level.size for level in book.asks if level.price <= maximum_price and level.size > 0),
         Decimal("0"),
     )
 
@@ -403,6 +509,8 @@ class ReversalRuntime:
         live: bool,
         execution_mode: str = "split_sell",
         order_callback: Callable[[dict[str, Any]], None] | None = None,
+        chain_winner_lookup: Callable[[str], str | None] | None = None,
+        unlocked_profit_lookup: Callable[[Decimal], Decimal] | None = None,
     ) -> None:
         self.strategy = strategy
         self.state_path = state_path
@@ -415,16 +523,35 @@ class ReversalRuntime:
             raise ValueError("execution_mode must be split_sell or direct_buy")
         self.execution_mode = execution_mode
         self.order_callback = order_callback
+        self.chain_winner_lookup = chain_winner_lookup
+        self.unlocked_profit_lookup = unlocked_profit_lookup
+        self._next_chain_verification_at = 0.0
+        self._next_chain_backfill_at = 0.0
         self._next_gamma_verification_at = 0.0
         self._next_gamma_backfill_at = 0.0
+        self._historical_audit_worker: HistoricalAuditWorker | None = None
+        self._historical_audits_inflight: set[tuple[str, str]] = set()
+        self._historical_audit_retry_at: dict[tuple[str, str], float] = {}
 
     def save(self) -> None:
         self.strategy.dump(self.state_path)
 
     def set_boundary_price_mode(self, mode: str) -> bool:
         """Switch boundary conventions without ever mixing cached price types."""
-        if mode not in {"legacy", "twap30"}:
-            raise ValueError("boundary price mode must be legacy or twap30")
+        if mode == "twap30":
+            mode = "twap60"
+        if mode not in {
+            "legacy",
+            "twap60",
+            "twap60_ptb_open",
+            "twap_official_boundary_v2",
+            "twap60_chainlink_boundary_v3",
+        }:
+            raise ValueError(
+                "boundary price mode must be legacy, twap60, "
+                "twap60_ptb_open, twap_official_boundary_v2, or "
+                "twap60_chainlink_boundary_v3"
+            )
         state = self.strategy.state
         if state.chainlink_price_mode == mode:
             return False
@@ -433,21 +560,182 @@ class ReversalRuntime:
         self.save()
         return True
 
+    def pump_historical_audits(
+        self,
+        *,
+        max_candidates: int = 2,
+        worker_time_budget_seconds: float = 2.0,
+        apply_time_budget_seconds: float = 0.01,
+    ) -> list[tuple[str, str, str]]:
+        """Apply finished audits and schedule a bounded, nonblocking batch."""
+        if self._historical_audit_worker is None:
+            self._historical_audit_worker = HistoricalAuditWorker(
+                gamma_lookup=self.winner_lookup,
+                chain_lookup=self.chain_winner_lookup,
+            )
+        worker = self._historical_audit_worker
+        max_candidates = max(0, max_candidates)
+        apply_deadline = time.monotonic() + max(0.0, apply_time_budget_seconds)
+        verified: list[tuple[str, str, str]] = []
+        changed = False
+        while time.monotonic() <= apply_deadline:
+            try:
+                result = worker.results.get_nowait()
+            except queue.Empty:
+                break
+            self._historical_audits_inflight.discard((result.source, result.slug))
+            if result.error:
+                self._historical_audit_retry_at[(result.source, result.slug)] = (
+                    time.monotonic() + (2.0 if result.source == "chain" else 15.0)
+                )
+                logger.warning(
+                    "%s history audit pending for %s: %s",
+                    result.source,
+                    result.slug,
+                    result.error,
+                )
+                continue
+            if result.published not in {Direction.UP.value, Direction.DOWN.value}:
+                self._historical_audit_retry_at[(result.source, result.slug)] = (
+                    time.monotonic() + (2.0 if result.source == "chain" else 15.0)
+                )
+                continue
+            self._historical_audit_retry_at.pop((result.source, result.slug), None)
+            state = self.strategy.state
+            expected = state.pending_gamma_results.get(result.slug)
+            if expected is None:
+                continue
+            actual = Direction(result.published)
+            if result.source == "chain":
+                if actual is not expected:
+                    raise ChainResultMismatch(
+                        f"Polygon result mismatch for {result.slug}: "
+                        f"provisional={expected.value} chain={actual.value}",
+                        slug=result.slug,
+                        provisional=expected,
+                        official=actual,
+                    )
+                if result.slug not in state.chain_verified_slugs:
+                    state.chain_verified_slugs.append(result.slug)
+                    changed = True
+            else:
+                if actual is not expected:
+                    if result.slug in state.chain_verified_slugs:
+                        logger.error(
+                            "Gamma audit conflicts with Polygon result for %s: "
+                            "chain=%s gamma=%s",
+                            result.slug,
+                            expected.value,
+                            actual.value,
+                        )
+                        del state.pending_gamma_results[result.slug]
+                        state.chain_verified_slugs = [
+                            slug
+                            for slug in state.chain_verified_slugs
+                            if slug != result.slug
+                        ]
+                        state.gamma_mismatch_slugs = (
+                            state.gamma_mismatch_slugs + [result.slug]
+                        )[-100:]
+                        changed = True
+                        continue
+                    raise GammaResultMismatch(
+                        f"Gamma result mismatch for {result.slug}: "
+                        f"provisional={expected.value} Gamma={actual.value}",
+                        slug=result.slug,
+                        provisional=expected,
+                        official=actual,
+                    )
+                del state.pending_gamma_results[result.slug]
+                state.chain_verified_slugs = [
+                    slug for slug in state.chain_verified_slugs if slug != result.slug
+                ]
+                state.gamma_verified_slugs = (
+                    state.gamma_verified_slugs + [result.slug]
+                )[-100:]
+                changed = True
+            verified.append((result.source, result.slug, actual.value))
+        if changed:
+            self.save()
+
+        available_slots = max_candidates - len(self._historical_audits_inflight)
+        if available_slots <= 0:
+            return verified
+        state = self.strategy.state
+        deadline = time.monotonic() + max(0.0, worker_time_budget_seconds)
+        now = time.monotonic()
+        chain_candidates: list[tuple[str, str, Direction]] = []
+        if self.chain_winner_lookup is not None:
+            chain_candidates.extend(
+                ("chain", slug, state.pending_gamma_results[slug])
+                for slug in sorted(
+                    state.pending_gamma_results,
+                    key=slug_epoch,
+                    reverse=True,
+                )
+                if slug not in state.chain_verified_slugs
+                and ("chain", slug) not in self._historical_audits_inflight
+                and now >= self._historical_audit_retry_at.get(("chain", slug), 0.0)
+            )
+        gamma_candidates = [
+            ("gamma", slug, state.pending_gamma_results[slug])
+            for slug in sorted(
+                state.pending_gamma_results,
+                key=slug_epoch,
+                reverse=True,
+            )
+            if ("gamma", slug) not in self._historical_audits_inflight
+            and now >= self._historical_audit_retry_at.get(("gamma", slug), 0.0)
+        ]
+        candidates: list[tuple[str, str, Direction]] = []
+        for index in range(max(len(chain_candidates), len(gamma_candidates))):
+            if index < len(chain_candidates):
+                candidates.append(chain_candidates[index])
+            if index < len(gamma_candidates):
+                candidates.append(gamma_candidates[index])
+        for source, slug, expected in candidates[:available_slots]:
+            key = (source, slug)
+            self._historical_audits_inflight.add(key)
+            worker.submit(
+                HistoricalAuditTask(
+                    source=source,
+                    slug=slug,
+                    expected=expected,
+                    deadline=deadline,
+                )
+            )
+        return verified
+
     def send_daily_report_once(
         self,
         report_day: date,
         sender: Callable[[str], bool],
     ) -> bool:
+        if self.daily_report_was_sent(report_day):
+            return False
+        if not sender(self.daily_report_text(report_day)):
+            return False
+        self.mark_daily_report_sent(report_day)
+        return True
+
+    def daily_report_was_sent(self, report_day: date) -> bool:
+        return report_day.isoformat() in self.strategy.state.reported_days
+
+    def daily_report_text(self, report_day: date) -> str:
+        return format_daily_report(
+            report_day,
+            self.strategy.metrics(report_day),
+            self.strategy.settings.attempt_limit,
+        )
+
+    def mark_daily_report_sent(self, report_day: date) -> None:
         key = report_day.isoformat()
         if key in self.strategy.state.reported_days:
-            return False
-        if not sender(format_daily_report(report_day, self.strategy.metrics(report_day))):
-            return False
+            return
         self.strategy.state.reported_days = (
             self.strategy.state.reported_days + [key]
         )[-14:]
         self.save()
-        return True
 
     def observe_chainlink_open_prices(
         self,
@@ -489,7 +777,7 @@ class ReversalRuntime:
                 continue
             opening_price = self.strategy.state.chainlink_open_prices[opening_slug]
             closing_price = self.strategy.state.chainlink_open_prices[closing_slug]
-            result = Direction.UP if closing_price >= opening_price else Direction.DOWN
+            result = Direction(resolve_btc_5m_twap(opening_price, closing_price))
             outcome = self.strategy.settle_window(opening_slug, result)
             self.strategy.state.pending_gamma_results[opening_slug] = result
             observed.append((opening_slug, outcome))
@@ -510,29 +798,76 @@ class ReversalRuntime:
             self.save()
         return observed
 
+    def record_chainlink_open_price(
+        self,
+        slug: str,
+        price: Decimal,
+        *,
+        allow_correction: bool = False,
+    ) -> None:
+        """Persist one window's same-source Chainlink resolution boundary.
+
+        Settlement remains explicit in ``observe_completed_window_prices`` so
+        recording one boundary can never mutate round state by itself.
+        """
+        slug_epoch(slug)
+        if price <= 0:
+            raise ReversalRuntimeError(
+                f"invalid Chainlink open price for {slug}: {price}"
+            )
+        existing = self.strategy.state.chainlink_open_prices.get(slug)
+        if existing is not None and existing != price and not allow_correction:
+            raise ReversalRuntimeError(
+                f"Chainlink open price changed for {slug}: {existing} -> {price}"
+            )
+        if existing == price:
+            return
+        self.strategy.state.chainlink_open_prices[slug] = price
+        ordered = sorted(
+            self.strategy.state.chainlink_open_prices,
+            key=slug_epoch,
+        )
+        keep = set(ordered[-6:])
+        self.strategy.state.chainlink_open_prices = {
+            value_slug: value_price
+            for value_slug, value_price in self.strategy.state.chainlink_open_prices.items()
+            if value_slug in keep
+        }
+        self.save()
+
     def observe_completed_window_prices(
         self,
         completed_prices: dict[str, tuple[Decimal, Decimal]],
     ) -> list[tuple[str, str]]:
-        """Settle windows from completed Polymarket openPrice/closePrice pairs."""
+        """Settle windows from completed same-source opening/closing boundaries."""
+        completed_results: dict[str, Direction] = {}
+        for slug, (opening_price, closing_price) in completed_prices.items():
+            if opening_price <= 0 or closing_price <= 0:
+                raise ReversalRuntimeError(
+                    f"invalid completed price for {slug}: "
+                    f"{opening_price} -> {closing_price}"
+                )
+            completed_results[slug] = Direction(
+                resolve_btc_5m_twap(opening_price, closing_price)
+            )
+        return self.observe_completed_window_results(completed_results)
+
+    def observe_completed_window_results(
+        self,
+        completed_results: dict[str, Direction],
+    ) -> list[tuple[str, str]]:
+        """Settle explicit provisional outcomes and queue Gamma verification."""
         observed: list[tuple[str, str]] = []
         last_epoch = (
             slug_epoch(self.strategy.state.last_settled_slug)
             if self.strategy.state.last_settled_slug
             else None
         )
-        for slug in sorted(completed_prices, key=slug_epoch):
+        for slug in sorted(completed_results, key=slug_epoch):
             epoch = slug_epoch(slug)
             if last_epoch is not None and epoch <= last_epoch:
                 continue
-            opening_price, closing_price = completed_prices[slug]
-            if opening_price <= 0 or closing_price <= 0:
-                raise ReversalRuntimeError(
-                    f"invalid completed price for {slug}: {opening_price} -> {closing_price}"
-                )
-            result = (
-                Direction.UP if closing_price >= opening_price else Direction.DOWN
-            )
+            result = completed_results[slug]
             expected = self.strategy.state.pending_gamma_results.get(slug)
             if expected is not None and expected is not result:
                 raise GammaResultMismatch(
@@ -557,6 +892,7 @@ class ReversalRuntime:
             return []
         self._next_gamma_verification_at = now + 15.0
         verified: list[tuple[str, str]] = []
+        changed = False
         for slug in sorted(
             self.strategy.state.pending_gamma_results,
             key=slug_epoch,
@@ -571,6 +907,19 @@ class ReversalRuntime:
                 continue
             actual = Direction(published)
             if actual is not expected:
+                if slug in self.strategy.state.chain_verified_slugs:
+                    logger.error(
+                        "Gamma audit conflicts with Polygon result for %s: chain=%s gamma=%s",
+                        slug,
+                        expected.value,
+                        actual.value,
+                    )
+                    del self.strategy.state.pending_gamma_results[slug]
+                    self.strategy.state.gamma_mismatch_slugs = (
+                        self.strategy.state.gamma_mismatch_slugs + [slug]
+                    )[-100:]
+                    changed = True
+                    continue
                 raise GammaResultMismatch(
                     f"Gamma result mismatch for {slug}: Chainlink={expected.value} "
                     f"Gamma={actual.value}",
@@ -583,9 +932,126 @@ class ReversalRuntime:
                 self.strategy.state.gamma_verified_slugs + [slug]
             )[-100:]
             verified.append((slug, actual.value))
+            changed = True
+        if changed:
+            self.save()
+        return verified
+
+    def verify_chain_results(self) -> list[tuple[str, str]]:
+        """Check Polygon payouts before Gamma; keep Gamma pending for later audit."""
+        if self.chain_winner_lookup is None:
+            return []
+        now = time.monotonic()
+        if now < self._next_chain_verification_at:
+            return []
+        self._next_chain_verification_at = now + 2.0
+        verified: list[tuple[str, str]] = []
+        state = self.strategy.state
+        for slug in sorted(state.pending_gamma_results, key=slug_epoch):
+            if slug in state.chain_verified_slugs:
+                continue
+            expected = state.pending_gamma_results[slug]
+            try:
+                published = self.chain_winner_lookup(slug)
+            except Exception as exc:
+                logger.warning("Polygon resolution pending for %s: %s", slug, exc)
+                continue
+            if published not in {Direction.UP.value, Direction.DOWN.value}:
+                continue
+            actual = Direction(published)
+            if actual is not expected:
+                raise ChainResultMismatch(
+                    f"Polygon result mismatch for {slug}: provisional={expected.value} "
+                    f"chain={actual.value}",
+                    slug=slug,
+                    provisional=expected,
+                    official=actual,
+                )
+            state.chain_verified_slugs = (state.chain_verified_slugs + [slug])[-100:]
+            verified.append((slug, actual.value))
         if verified:
             self.save()
         return verified
+
+    def backfill_immediate_chain_results(
+        self,
+        current_slug: str,
+    ) -> list[tuple[str, str]]:
+        """Fill an exact missing trigger sequence from finalized Polygon payouts."""
+        if self.chain_winner_lookup is None:
+            return []
+        state = self.strategy.state
+        if state.active_round is not None or state.prepared_split is not None:
+            return []
+        count = self.strategy.settings.trigger_streak
+        expected = [
+            previous_5m_slug(current_slug, offset)
+            for offset in range(count, 0, -1)
+        ]
+        if state.recent_slugs[-count:] == expected:
+            return []
+        known = {
+            slug: result
+            for slug, result in zip(state.recent_slugs, state.recent_results)
+            if slug in expected
+        }
+        missing = [slug for slug in expected if slug not in known]
+        if not missing:
+            return []
+        now = time.monotonic()
+        if now < self._next_chain_backfill_at:
+            return []
+        self._next_chain_backfill_at = now + 2.0
+        backfilled: list[tuple[str, str]] = []
+        for slug in missing:
+            try:
+                published = self.chain_winner_lookup(slug)
+            except Exception as exc:
+                logger.warning("Polygon history backfill pending for %s: %s", slug, exc)
+                return []
+            if published not in {Direction.UP.value, Direction.DOWN.value}:
+                return []
+            official = Direction(published)
+            known[slug] = official
+            backfilled.append((slug, official.value))
+        if any(slug not in known for slug in expected):
+            return []
+        for slug, result in backfilled:
+            state.pending_gamma_results[slug] = Direction(result)
+            state.chain_verified_slugs = (state.chain_verified_slugs + [slug])[-100:]
+        state.recent_slugs = expected
+        state.recent_results = [known[slug] for slug in expected]
+        final_side = state.recent_results[-1]
+        state.current_streak_side = final_side
+        streak = 0
+        for result in reversed(state.recent_results):
+            if result is not final_side:
+                break
+            streak += 1
+        state.current_streak = streak
+        state.last_settled_slug = expected[-1]
+        self.save()
+        return backfilled
+
+    def quarantine_chain_mismatch(self, mismatch: ChainResultMismatch) -> None:
+        """Apply the Polygon payout while retaining it for Gamma audit."""
+        state = self.strategy.state
+        if mismatch.slug in state.recent_slugs:
+            index = state.recent_slugs.index(mismatch.slug)
+            state.recent_results[index] = mismatch.official
+            final_side = state.recent_results[-1]
+            streak = 0
+            for result in reversed(state.recent_results):
+                if result is not final_side:
+                    break
+                streak += 1
+            state.current_streak_side = final_side
+            state.current_streak = streak
+        state.pending_gamma_results[mismatch.slug] = mismatch.official
+        state.chain_verified_slugs = (state.chain_verified_slugs + [mismatch.slug])[-100:]
+        state.chain_mismatch_slugs = (state.chain_mismatch_slugs + [mismatch.slug])[-100:]
+        self.strategy.metrics().api_order_errors += 1
+        self.save()
 
     def backfill_immediate_gamma_results(
         self,
@@ -676,6 +1142,8 @@ class ReversalRuntime:
         up_book: OrderBookSnapshot,
         down_book: OrderBookSnapshot,
         seconds_left: Decimal,
+        source: str = "gamma",
+        allow_replacement: bool = True,
     ) -> ReversalTickResult:
         """Close a filled provisional order and replace it only without added loss.
 
@@ -710,6 +1178,11 @@ class ReversalRuntime:
         # FAK has no live remainder to cancel.  Before any fill, change the
         # persisted plan so the next retry uses Gamma's corrected direction.
         if active.exit_sold_shares <= Decimal("0.000001"):
+            if not allow_replacement:
+                state.active_round = None
+                state.last_opening_processed_slug = market.slug
+                self.save()
+                return ReversalTickResult(f"{source}_unfilled_plan_cancelled")
             if corrected_trend is None:
                 state.active_round = None
                 state.last_opening_processed_slug = market.slug
@@ -724,7 +1197,7 @@ class ReversalRuntime:
                 detail=f"new_side={active.target_side.value}",
             )
 
-        if seconds_left < GAMMA_CORRECTION_MIN_SECONDS_LEFT:
+        if allow_replacement and seconds_left < GAMMA_CORRECTION_MIN_SECONDS_LEFT:
             return ReversalTickResult(
                 "gamma_correction_blocked",
                 detail=f"seconds_left={seconds_left} below 30",
@@ -737,15 +1210,18 @@ class ReversalRuntime:
         wrong_bid = wrong_book.quote.bid
         available = self.trader.conditional_balance(wrong_token, self.signature_type)
         wrong_shares = min(active.exit_sold_shares, available)
+        depth = bid_depth(wrong_book, wrong_bid) if wrong_bid is not None else Decimal("0")
+        if not allow_replacement:
+            wrong_shares = min(wrong_shares, depth)
         if (
             wrong_bid is None
             or wrong_bid <= 0
             or wrong_shares <= Decimal("0.000001")
-            or bid_depth(wrong_book, wrong_bid) < wrong_shares
+            or (allow_replacement and depth < wrong_shares)
         ):
             return ReversalTickResult(
                 "gamma_correction_blocked",
-                detail="wrong-side position is not fully sellable at best bid",
+                detail="wrong-side position has no immediately sellable best-bid depth",
             )
 
         corrected_side = corrected_trend.opposite if corrected_trend is not None else None
@@ -787,8 +1263,9 @@ class ReversalRuntime:
             "price": str(wrong_bid),
             "size": str(wrong_shares),
             "order_type": "FAK",
-            "order_role": "gamma_correction_exit",
+            "order_role": f"{source}_correction_exit",
             "round_id": active.round_id,
+            "attempt": active.failures + 1,
             "response": sell_response,
         }
         if sold_shares <= Decimal("0.000001"):
@@ -825,12 +1302,13 @@ class ReversalRuntime:
         original_failures = active.failures
         original_committed = active.committed
         original_cumulative_loss = active.cumulative_loss
+        original_soft_limit_final_recovery = active.soft_limit_final_recovery
         state.active_round = None
         state.last_opening_processed_slug = market.slug
-        if corrected_side is None:
+        if corrected_side is None or not allow_replacement:
             self.save()
             return ReversalTickResult(
-                "gamma_invalid_trigger_position_closed",
+                f"{source}_position_closed",
                 order=sell_order,
             )
 
@@ -869,8 +1347,9 @@ class ReversalRuntime:
             "price": str(corrected_ask),
             "size": str(replacement_shares),
             "order_type": "FAK",
-            "order_role": "gamma_correction_replacement",
+            "order_role": f"{source}_correction_replacement",
             "round_id": original_round_id,
+            "attempt": original_failures + 1,
             "response": buy_response,
         }
         if bought_shares <= Decimal("0.000001"):
@@ -898,6 +1377,7 @@ class ReversalRuntime:
             planned_shares=bought_shares,
             entry_fees=buy_fee,
             cumulative_loss=original_cumulative_loss,
+            soft_limit_final_recovery=original_soft_limit_final_recovery,
         )
         metrics.total_making_amount += buy_cost
         metrics.fees += buy_fee
@@ -950,6 +1430,28 @@ class ReversalRuntime:
             observed.append((candidate, outcome))
             last_epoch = candidate_epoch
         return observed
+
+    def reconcile_stale_active_round(self) -> tuple[str, str] | None:
+        """Resolve an old direct-buy round without replaying missed windows."""
+        active = self.strategy.state.active_round
+        last_slug = self.strategy.state.last_settled_slug
+        if active is None or active.awaiting_window is None or last_slug is None:
+            return None
+        active_slug = active.awaiting_window
+        if slug_epoch(active_slug) >= slug_epoch(last_slug):
+            return None
+        winner = self.winner_lookup(active_slug)
+        if winner not in {Direction.UP.value, Direction.DOWN.value}:
+            raise ReversalRuntimeError(
+                f"stale active round result unavailable for {active_slug}"
+            )
+        outcome = self.strategy.reconcile_stale_direct_entry(
+            active_slug,
+            winner,
+            day=date.fromtimestamp(slug_epoch(active_slug)),
+        )
+        self.save()
+        return active_slug, outcome
 
     def tick(
         self,
@@ -1005,6 +1507,8 @@ class ReversalRuntime:
                 raise ReversalRuntimeError("no market-health snapshot for active trend side")
             resumed_plan = self.strategy.plan_window(market.slug, selected)
             assert resumed_plan is not None
+            if book_refresh is not None:
+                up_book, down_book = book_refresh()
             return self._finish_selected_plan(
                 market=market,
                 up_book=up_book,
@@ -1050,25 +1554,25 @@ class ReversalRuntime:
             if prepared is None:
                 self.strategy.state.last_opening_processed_slug = market.slug
                 self.save()
-                if (
-                    (
-                        self.strategy.settings.first_stage_rv60_filter_enabled
-                        and selected_health.short_volatility
-                        >= self.strategy.settings.first_stage_max_rv60
+                volatility_reason = (
+                    self.strategy.settings.first_stage_volatility_block_reason(
+                        selected_health.short_volatility,
+                        selected_health.five_minute_volatility,
                     )
-                    or (
-                        self.strategy.settings.first_stage_rv300_filter_enabled
-                        and selected_health.five_minute_volatility
-                        >= self.strategy.settings.first_stage_max_rv300
-                    )
-                ):
+                )
+                if volatility_reason is not None:
                     return ReversalTickResult(
                         "first_stage_extreme_volatility_no_split",
                         detail=(
-                            f"RV60={selected_health.short_volatility} >= "
-                            f"{self.strategy.settings.first_stage_max_rv60}; "
-                            f"RV300={selected_health.five_minute_volatility} >= "
-                            f"{self.strategy.settings.first_stage_max_rv300}"
+                            f"reason={volatility_reason}; "
+                            f"RV60={selected_health.short_volatility} "
+                            f"threshold={self.strategy.settings.first_stage_max_rv60}; "
+                            f"RV300={selected_health.five_minute_volatility} "
+                            f"base_threshold={self.strategy.settings.first_stage_max_rv300} "
+                            f"persistence_ratio="
+                            f"{self.strategy.settings.first_stage_rv300_persistence_ratio} "
+                            f"hard_multiplier="
+                            f"{self.strategy.settings.first_stage_rv300_hard_multiplier}"
                         ),
                     )
                 return ReversalTickResult(
@@ -1080,12 +1584,174 @@ class ReversalRuntime:
         if self.execution_mode == "direct_buy" and prepared is None:
             active = self.strategy.state.active_round
             assert active is not None
+            if (
+                self.strategy.settings.sparse_recovery_notional_stages
+                and plan.making_amount == 0
+                and active.execution_phase == "planned"
+            ):
+                self.strategy.mark_observation_stage(plan)
+                self.save()
+                return ReversalTickResult(
+                    "sparse_stage_observing",
+                    plan=plan,
+                    detail=f"stage {plan.attempt} is observation-only; no order submitted",
+                )
             if active.execution_phase in {
                 "planned",
                 "direct_entry_ready",
                 "direct_entry_partial",
             }:
-                if (
+                if self.strategy.settings.sparse_recovery_notional_stages:
+                    retained_book = (
+                        up_book if plan.retained_side is Direction.UP else down_book
+                    )
+                    ask = retained_book.quote.ask
+                    if ask is None or ask <= 0 or ask >= 1:
+                        return ReversalTickResult(
+                            "entry_book_pending",
+                            plan=plan,
+                            detail="retained-side ask unavailable for sparse-stage sizing",
+                        )
+                    if active.execution_phase == "planned":
+                        cash_floor = self.strategy.settings.sparse_recovery_notional_stages[
+                            plan.attempt - 1
+                        ]
+                        floor_shares = _affordable_marketable_buy_size(
+                            available_collateral=cash_floor,
+                            price=ask,
+                        )
+                        if (
+                            floor_shares <= 0
+                            and cash_floor < MIN_MARKETABLE_BUY_NOTIONAL
+                        ):
+                            floor_shares = _marketable_buy_size(
+                                nominal_shares=cash_floor / ask,
+                                price=ask,
+                            )
+                        if floor_shares <= 0:
+                            self._defer_or_abandon_unfilled_attempt(plan)
+                            self.save()
+                            return ReversalTickResult(
+                                "sparse_entry_filtered",
+                                plan=plan,
+                                detail="stage budget is below the exchange minimum",
+                            )
+                        desired_shares = floor_shares
+                        if self.strategy.settings.uses_sparse_full_loss_recovery(
+                            plan.attempt
+                        ):
+                            desired_shares = full_loss_recovery_size(
+                                cumulative_loss=active.cumulative_loss,
+                                entry_price=ask,
+                                recovery_fraction=Decimal("1"),
+                                minimum_profit=Decimal("0"),
+                                minimum_shares=floor_shares,
+                            )
+                        available_collateral = self.trader.collateral_balance(
+                            self.signature_type
+                        )
+                        required = desired_shares * ask
+                        if required > available_collateral:
+                            self.strategy.abandon_filtered_attempt(plan)
+                            self.save()
+                            return ReversalTickResult(
+                                "break_even_target_unfunded",
+                                plan=plan,
+                                detail=(
+                                    f"required {required} pUSD for stage floor/recovery; "
+                                    f"available {available_collateral}"
+                                ),
+                            )
+                        plan = self.strategy.resize_active_plan(plan, desired_shares)
+                        self.save()
+                elif self.strategy.settings.fixed_notional_stages:
+                    retained_book = (
+                        up_book if plan.retained_side is Direction.UP else down_book
+                    )
+                    ask = retained_book.quote.ask
+                    max_ask = self.strategy.settings.fixed_notional_max_ask
+                    recovery_attempt = (
+                        self.strategy.settings.uses_fixed_notional_full_loss_recovery(
+                            plan.attempt
+                        )
+                    )
+                    if (
+                        ask is None
+                        or ask <= 0
+                        or ask >= 1
+                        or (not recovery_attempt and ask >= max_ask)
+                    ):
+                        if active.exit_sold_shares <= 0:
+                            self._defer_or_abandon_unfilled_attempt(plan)
+                        self.save()
+                        return ReversalTickResult(
+                            "fixed_notional_entry_filtered",
+                            plan=plan,
+                            detail=(
+                                "retained-side ask unavailable"
+                                if ask is None
+                                else f"ask {ask} is not below strict limit {max_ask}"
+                                if not recovery_attempt
+                                else f"invalid recovery ask {ask}"
+                            ),
+                        )
+                    if active.execution_phase == "planned":
+                        cash_budget = self.strategy.settings.fixed_notional_stages[
+                            plan.attempt - 1
+                        ]
+                        fixed_shares = _affordable_marketable_buy_size(
+                            available_collateral=cash_budget,
+                            price=ask,
+                        )
+                        if (
+                            fixed_shares <= 0
+                            and cash_budget < MIN_MARKETABLE_BUY_NOTIONAL
+                        ):
+                            # A configured 1 pUSD stage is nominal: Polymarket
+                            # rejects marketable BUY orders below 1.01 pUSD and
+                            # requires two-decimal maker precision. Submit the
+                            # smallest exchange-valid order for that price so
+                            # the 1 pUSD stages are executable instead of being
+                            # silently skipped forever.
+                            fixed_shares = _marketable_buy_size(
+                                nominal_shares=cash_budget / ask,
+                                price=ask,
+                            )
+                        if fixed_shares <= 0:
+                            self._defer_or_abandon_unfilled_attempt(plan)
+                            self.save()
+                            return ReversalTickResult(
+                                "fixed_notional_entry_filtered",
+                                plan=plan,
+                                detail="stage budget is below the exchange minimum",
+                            )
+                        desired_shares = fixed_shares
+                        if recovery_attempt:
+                            desired_shares = full_loss_recovery_size(
+                                cumulative_loss=active.cumulative_loss,
+                                entry_price=ask,
+                                recovery_fraction=Decimal("1"),
+                                minimum_profit=Decimal("0"),
+                                minimum_shares=fixed_shares,
+                            )
+                            available_collateral = self.trader.collateral_balance(
+                                self.signature_type
+                            )
+                            required = desired_shares * ask
+                            if required > available_collateral:
+                                self.strategy.abandon_filtered_attempt(plan)
+                                self.save()
+                                return ReversalTickResult(
+                                    "break_even_target_unfunded",
+                                    plan=plan,
+                                    detail=(
+                                        f"required {required} pUSD for stage floor/recovery; "
+                                        f"available {available_collateral}"
+                                    ),
+                                )
+                        plan = self.strategy.resize_active_plan(plan, desired_shares)
+                        self.save()
+                elif (
                     self.strategy.settings.uses_dynamic_recovery(plan.attempt)
                 ):
                     retained_book = (
@@ -1149,11 +1815,9 @@ class ReversalRuntime:
                             else self.strategy.settings.late_stage_recovery_fraction
                         ),
                         minimum_profit=self.strategy.settings.minimum_round_profit,
-                        minimum_shares=(
-                            self.strategy.settings.stakes[plan.attempt - 1]
-                            if plan.attempt <= 4
-                            else Decimal("0")
-                        ),
+                        minimum_shares=self.strategy.settings.stakes[
+                            plan.attempt - 1
+                        ],
                         filled_shares=active.exit_sold_shares,
                         filled_cost=active.exit_sell_proceeds,
                         filled_fees=active.entry_fees,
@@ -1166,7 +1830,10 @@ class ReversalRuntime:
                         self.signature_type
                     )
                     if desired_additional * ask > available_collateral:
-                        if self.strategy.settings.minimum_round_profit > 0:
+                        if (
+                            self.strategy.settings.minimum_round_profit > 0
+                            or self.strategy.settings.full_loss_recovery_strict_funding
+                        ):
                             logger.warning(
                                 "REVERSAL_PROFIT_TARGET_UNFUNDED slug=%s attempt=%s "
                                 "desired_shares=%s required_notional=%s "
@@ -1185,13 +1852,16 @@ class ReversalRuntime:
                                 self.strategy.abandon_filtered_attempt(plan)
                                 self.save()
                                 return ReversalTickResult(
-                                    "profit_target_unfunded",
+                                    (
+                                        "profit_target_unfunded"
+                                        if self.strategy.settings.minimum_round_profit > 0
+                                        else "break_even_target_unfunded"
+                                    ),
                                     plan=plan,
                                     detail=(
                                         f"required {desired_additional * ask} pUSD to cover "
-                                        f"round loss plus "
-                                        f"{self.strategy.settings.minimum_round_profit} "
-                                        f"pUSD profit; available {available_collateral}"
+                                        "the round break-even target; "
+                                        f"available {available_collateral}"
                                     ),
                                 )
                             return ReversalTickResult(
@@ -1199,9 +1869,8 @@ class ReversalRuntime:
                                 plan=plan,
                                 detail=(
                                     f"partial entry requires {desired_additional * ask} "
-                                    f"pUSD more to preserve the "
-                                    f"{self.strategy.settings.minimum_round_profit} "
-                                    f"pUSD round-profit target; available "
+                                    "pUSD more to preserve the round break-even "
+                                    "target; available "
                                     f"{available_collateral}"
                                 ),
                             )
@@ -1222,10 +1891,59 @@ class ReversalRuntime:
                     if recovery_shares != plan.making_amount:
                         plan = self.strategy.resize_active_plan(plan, recovery_shares)
                         self.save()
+                retained_book = (
+                    up_book if plan.retained_side is Direction.UP else down_book
+                )
+                round_loss_block = self._round_loss_entry_block_reason(
+                    plan=plan,
+                    book=retained_book,
+                )
+                if round_loss_block is not None:
+                    if active.exit_sold_shares <= 0:
+                        self._defer_or_abandon_unfilled_attempt(plan)
+                    self.save()
+                    return ReversalTickResult(
+                        "round_loss_limit_reached",
+                        plan=plan,
+                        detail=round_loss_block,
+                    )
+                if self.strategy.settings.compact_two_stage_enabled:
+                    compact_block = self._compact_entry_block_reason(
+                        plan=plan,
+                        book=retained_book,
+                    )
+                    if compact_block is not None:
+                        if active.exit_sold_shares <= 0:
+                            self._defer_or_abandon_unfilled_attempt(plan)
+                        self.save()
+                        return ReversalTickResult(
+                            "compact_entry_filtered",
+                            plan=plan,
+                            detail=compact_block,
+                        )
+                if self.strategy.settings.uses_first_stage_order_rules(plan.attempt):
+                    first_stage_block = self._first_stage_entry_block_reason(
+                        plan=plan,
+                        book=retained_book,
+                    )
+                    if first_stage_block is not None:
+                        if active.exit_sold_shares <= 0:
+                            self._defer_or_abandon_unfilled_attempt(plan)
+                        self.save()
+                        return ReversalTickResult(
+                            "first_stage_entry_filtered",
+                            plan=plan,
+                            detail=first_stage_block,
+                        )
                 if active.execution_phase == "planned":
                     self.strategy.mark_direct_entry_ready(plan)
                     self.save()
-            return self._finish_direct_plan(
+            # The health snapshot can be a few hundred milliseconds old by the
+            # time the FAK is signed. Refresh immediately before validating the
+            # entry and use that exact executable ask for the order.
+            if book_refresh is not None:
+                up_book, down_book = book_refresh()
+            return self._finish_selected_plan(
                 market=market,
                 up_book=up_book,
                 down_book=down_book,
@@ -1261,6 +1979,17 @@ class ReversalRuntime:
             plan=plan,
         )
 
+    def _defer_or_abandon_unfilled_attempt(
+        self,
+        plan: TradePlan,
+        *,
+        block_trend: bool = True,
+    ) -> None:
+        if self.strategy.settings.continue_final_stage_until_success_or_unfunded:
+            self.strategy.defer_unfilled_attempt(plan)
+            return
+        self.strategy.abandon_filtered_attempt(plan, block_trend=block_trend)
+
     def _finish_selected_plan(
         self,
         *,
@@ -1275,6 +2004,37 @@ class ReversalRuntime:
             and active is not None
             and active.split_transaction_hash == "direct-buy"
         ):
+            if (
+                self.strategy.settings.uses_first_stage_order_rules(plan.attempt)
+                and active.execution_phase
+                in {"direct_entry_ready", "direct_entry_partial"}
+            ):
+                retained_book = (
+                    up_book if plan.retained_side is Direction.UP else down_book
+                )
+                block_reason = self._first_stage_entry_block_reason(
+                    plan=plan,
+                    book=retained_book,
+                )
+                if block_reason is not None:
+                    if active.exit_sold_shares <= 0:
+                        self._defer_or_abandon_unfilled_attempt(
+                            plan, block_trend=False
+                        )
+                        self.save()
+                        return ReversalTickResult(
+                            "first_stage_entry_filtered",
+                            plan=plan,
+                            detail=(
+                                f"retry stopped: {block_reason}; "
+                                "trend remains eligible next window"
+                            ),
+                        )
+                    return ReversalTickResult(
+                        "entry_book_pending",
+                        plan=plan,
+                        detail=f"partial entry retry waiting: {block_reason}",
+                    )
             return self._finish_direct_plan(
                 market=market,
                 up_book=up_book,
@@ -1287,6 +2047,135 @@ class ReversalRuntime:
             down_book=down_book,
             plan=plan,
         )
+
+    def _compact_entry_block_reason(
+        self,
+        *,
+        plan: TradePlan,
+        book: OrderBookSnapshot,
+    ) -> str | None:
+        settings = self.strategy.settings
+        active = self.strategy.state.active_round
+        assert active is not None
+        ask = book.quote.ask
+        bid = book.quote.bid
+        if ask is None or bid is None or ask <= 0 or ask >= 1:
+            return "compact order book is incomplete"
+        max_ask = (
+            settings.compact_first_max_ask
+            if plan.attempt == 1
+            else settings.compact_second_max_ask
+        )
+        if ask > max_ask:
+            return f"ask {ask} exceeds stage-{plan.attempt} limit {max_ask}"
+        if ask - bid > settings.compact_max_spread:
+            return f"spread {ask - bid} exceeds {settings.compact_max_spread}"
+        remaining = max(Decimal("0"), plan.making_amount - active.exit_sold_shares)
+        order_size = (
+            _marketable_buy_size(nominal_shares=remaining, price=ask)
+            if remaining > 0
+            else Decimal("0")
+        )
+        if order_size > 0 and ask_depth(book, ask) < order_size:
+            return "best ask depth cannot fill the compact order"
+        remaining_cost = order_size * ask
+        remaining_fee = order_size * Decimal("0.07") * ask * (Decimal("1") - ask)
+        attempt_cost = active.exit_sell_proceeds + remaining_cost
+        attempt_fees = active.entry_fees + remaining_fee
+        if attempt_cost > settings.compact_max_order_notional:
+            return (
+                f"order notional {attempt_cost} exceeds compact limit "
+                f"{settings.compact_max_order_notional}"
+            )
+        projected_loss = active.cumulative_loss + attempt_cost + attempt_fees
+        if projected_loss > settings.compact_round_loss_limit:
+            return (
+                f"projected round loss {projected_loss} exceeds compact limit "
+                f"{settings.compact_round_loss_limit}"
+            )
+        if plan.attempt == 2:
+            if self.unlocked_profit_lookup is None:
+                return "settled unlocked-profit budget is unavailable"
+            unlocked = self.unlocked_profit_lookup(settings.compact_profit_lock_fraction)
+            if unlocked < attempt_cost + attempt_fees:
+                return (
+                    f"unlocked profit {unlocked} cannot fund stage-2 risk "
+                    f"{attempt_cost + attempt_fees}"
+                )
+        return None
+
+    def _round_loss_entry_block_reason(
+        self,
+        *,
+        plan: TradePlan,
+        book: OrderBookSnapshot,
+    ) -> str | None:
+        """Reject an attempt whose complete fill could breach the round hard cap."""
+        settings = self.strategy.settings
+        hard_limit = settings.hard_round_loss_limit
+        if hard_limit is None:
+            return None
+        active = self.strategy.state.active_round
+        assert active is not None
+        ask = book.quote.ask
+        if ask is None or ask <= 0 or ask >= 1:
+            return None
+        remaining = max(Decimal("0"), plan.making_amount - active.exit_sold_shares)
+        if remaining <= 0:
+            return None
+        order_size = _marketable_buy_size(nominal_shares=remaining, price=ask)
+        remaining_cost = order_size * ask
+        remaining_fee = (
+            order_size * Decimal("0.07") * ask * (Decimal("1") - ask)
+        )
+        projected_loss = (
+            active.cumulative_loss
+            + active.exit_sell_proceeds
+            + active.entry_fees
+            + remaining_cost
+            + remaining_fee
+        )
+        if projected_loss > hard_limit:
+            return (
+                f"projected round loss {projected_loss} exceeds hard limit "
+                f"{hard_limit}"
+            )
+        return None
+
+    def _first_stage_entry_block_reason(
+        self,
+        *,
+        plan: TradePlan,
+        book: OrderBookSnapshot,
+    ) -> str | None:
+        """Apply only executable ask, spread, and depth checks to this profile."""
+        settings = self.strategy.settings
+        active = self.strategy.state.active_round
+        assert active is not None
+        ask = book.quote.ask
+        bid = book.quote.bid
+        if ask is None or bid is None or ask <= 0 or ask >= 1:
+            return "first-stage order book is incomplete"
+        if ask > settings.first_stage_only_max_ask:
+            return (
+                f"ask {ask} exceeds first-stage limit "
+                f"{settings.first_stage_only_max_ask}"
+            )
+        spread = ask - bid
+        if spread > settings.first_stage_only_max_spread:
+            return (
+                f"spread {spread} exceeds "
+                f"{settings.first_stage_only_max_spread}"
+            )
+        remaining = max(Decimal("0"), plan.making_amount - active.exit_sold_shares)
+        order_size = (
+            _marketable_buy_size(nominal_shares=remaining, price=ask)
+            if remaining > 0
+            else Decimal("0")
+        )
+        if order_size > 0 and ask_depth(book, ask) < order_size:
+            return "best ask depth cannot fill the first-stage order"
+        return None
 
     def _finish_direct_plan(
         self,
@@ -1369,12 +2258,72 @@ class ReversalRuntime:
                 api_order_errors=1 if amount_rejected else 0,
             )
             self.strategy.mark_direct_entry_retryable(plan)
+            first_stage_retry_attempt = 0
+            first_stage_retry_scheduled = False
+            first_stage_retry_exhausted = False
+            if (
+                self.strategy.settings.uses_first_stage_order_rules(plan.attempt)
+                and not amount_rejected
+                and active.exit_sold_shares <= 0
+            ):
+                first_stage_retry_attempt = (
+                    self.strategy.record_direct_entry_unmatched(plan)
+                )
+                first_stage_retry_exhausted = (
+                    first_stage_retry_attempt
+                    >= self.strategy.settings.first_stage_only_max_fak_attempts
+                )
+                if first_stage_retry_exhausted:
+                    # A zero-fill FAK must not consume the whole trend. Stop
+                    # retrying this window, then permit a fresh attempt in the
+                    # next window if the same streak is still intact.
+                    self._defer_or_abandon_unfilled_attempt(
+                        plan, block_trend=False
+                    )
+                else:
+                    first_stage_retry_scheduled = True
+            elif (
+                (
+                    self.strategy.settings.compact_two_stage_enabled
+                    or self.strategy.settings.uses_first_stage_order_rules(plan.attempt)
+                    or bool(self.strategy.settings.fixed_notional_stages)
+                )
+                and active.exit_sold_shares <= 0
+            ):
+                self._defer_or_abandon_unfilled_attempt(plan)
             self.save()
             return ReversalTickResult(
-                "entry_amount_rejected" if amount_rejected else "entry_unmatched",
+                (
+                    "entry_unmatched"
+                    if first_stage_retry_scheduled
+                    else "compact_fak_skipped"
+                    if self.strategy.settings.compact_two_stage_enabled
+                    else "first_stage_fak_skipped"
+                    if self.strategy.settings.uses_first_stage_order_rules(plan.attempt)
+                    else "fixed_notional_fak_skipped"
+                    if self.strategy.settings.fixed_notional_stages
+                    else "entry_amount_rejected" if amount_rejected else "entry_unmatched"
+                ),
                 plan=plan,
                 detail=(
-                    "CLOB conclusively rejected BUY amount precision; live-book resize retry scheduled"
+                    (
+                        f"FAK zero fill; retry {first_stage_retry_attempt + 1}/"
+                        f"{self.strategy.settings.first_stage_only_max_fak_attempts} "
+                        "scheduled on the next fresh book"
+                    )
+                    if first_stage_retry_scheduled
+                    else (
+                        f"FAK zero fill after {first_stage_retry_attempt} attempts; "
+                        "this window ended without locking the trend"
+                    )
+                    if first_stage_retry_exhausted
+                    else "bounded attempt ended after a conclusive CLOB rejection"
+                    if (
+                        self.strategy.settings.compact_two_stage_enabled
+                        or self.strategy.settings.uses_first_stage_order_rules(plan.attempt)
+                        or bool(self.strategy.settings.fixed_notional_stages)
+                    )
+                    else "CLOB conclusively rejected BUY amount precision; live-book resize retry scheduled"
                     if amount_rejected
                     else "FAK had no immediately matchable counterparty; retry scheduled"
                 ),
@@ -1392,6 +2341,7 @@ class ReversalRuntime:
             "attempt": plan.attempt,
             "trend_side": plan.trend_side.value,
             "planned_shares": str(plan.making_amount),
+            "soft_limit_final_recovery": active.soft_limit_final_recovery,
             "response": response,
         }
         if shares > 0:
@@ -1409,6 +2359,34 @@ class ReversalRuntime:
             )
         self.strategy.record_execution(unmatched_orders=1)
         self.strategy.mark_direct_entry_retryable(plan)
+        if (
+            self.strategy.settings.uses_first_stage_order_rules(plan.attempt)
+            and active.exit_sold_shares <= 0
+        ):
+            retry_attempt = self.strategy.record_direct_entry_unmatched(plan)
+            if retry_attempt >= self.strategy.settings.first_stage_only_max_fak_attempts:
+                self._defer_or_abandon_unfilled_attempt(plan, block_trend=False)
+                self.save()
+                return ReversalTickResult(
+                    "first_stage_fak_skipped",
+                    plan=plan,
+                    order=order,
+                    detail=(
+                        f"FAK zero fill after {retry_attempt} attempts; "
+                        "this window ended without locking the trend"
+                    ),
+                )
+            self.save()
+            return ReversalTickResult(
+                "entry_unmatched",
+                plan=plan,
+                order=order,
+                detail=(
+                    f"FAK zero fill; retry {retry_attempt + 1}/"
+                    f"{self.strategy.settings.first_stage_only_max_fak_attempts} "
+                    "scheduled on the next fresh book"
+                ),
+            )
         self.save()
         return ReversalTickResult(
             "entry_unmatched",
@@ -1441,7 +2419,7 @@ class ReversalRuntime:
             or active.awaiting_window is None
             or active.execution_phase != "trend_exit_complete"
             or previous_5m_slug(market.slug) != active.awaiting_window
-            or active.failures + 1 >= len(self.strategy.settings.stakes)
+            or active.failures + 1 >= self.strategy.settings.attempt_limit
         ):
             return None
 

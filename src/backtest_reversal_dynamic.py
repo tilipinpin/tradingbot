@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
 
+from src.crypto_resolution import resolve_btc_5m_twap
 from src.reversal_runtime import dynamic_recovery_decision, _marketable_buy_size
 from src.reversal_v11 import Direction, ReversalSettings
 
@@ -68,6 +69,159 @@ class Outcome:
     filter_skips: int = 0
 
 
+@dataclass
+class CompactOutcome(Outcome):
+    stage2_trades: int = 0
+    stage2_wins: int = 0
+    stage2_skips: int = 0
+    losing_rounds: int = 0
+    pause_events: int = 0
+    paused_windows: int = 0
+
+
+def simulate_compact(
+    windows: list[Window],
+    *,
+    profit_lock_fraction: Decimal | None = Decimal("0.70"),
+) -> CompactOutcome:
+    """Backtest the four-window, two-stage compact live profile.
+
+    Snapshot logs contain best quotes but not full order-book levels, so this
+    assumes the displayed best ask can fill the requested size.  Price,
+    spread, notional, round-loss, profit-lock and pause gates are reproduced.
+    """
+    outcome = CompactOutcome(
+        policy=(
+            "reversal_compact"
+            if profit_lock_fraction is not None
+            else "reversal_compact_unlocked_stage2"
+        )
+    )
+    recent: list[Direction] = []
+    active_trend: Direction | None = None
+    blocked: Direction | None = None
+    failures = 0
+    round_loss = Decimal("0")
+    equity = Decimal("0")
+    peak = Decimal("0")
+    previous_epoch: int | None = None
+    losing_round_streak = 0
+    pause_remaining = 0
+
+    def finish_losing_round() -> None:
+        nonlocal losing_round_streak, pause_remaining
+        outcome.losing_rounds += 1
+        outcome.worst_round_loss = max(outcome.worst_round_loss, round_loss)
+        losing_round_streak += 1
+        if losing_round_streak >= 5:
+            losing_round_streak = 0
+            pause_remaining = 3
+            outcome.pause_events += 1
+
+    for window in windows:
+        outcome.windows += 1
+        pause_before = pause_remaining
+        if previous_epoch is not None and window.epoch != previous_epoch + 300:
+            recent = []
+            active_trend = None
+            blocked = None
+            failures = 0
+            round_loss = Decimal("0")
+        previous_epoch = window.epoch
+
+        if pause_remaining > 0:
+            outcome.paused_windows += 1
+        elif active_trend is None and len(recent) == 4 and len(set(recent)) == 1:
+            if blocked != recent[-1]:
+                active_trend = recent[-1]
+                failures = 0
+                round_loss = Decimal("0")
+                outcome.triggered_rounds += 1
+
+        traded = False
+        if active_trend is not None and window.snapshots:
+            target = active_trend.opposite
+            attempt = failures + 1
+            nominal = (Decimal("2"), Decimal("4"))[failures]
+            frame = window.snapshots[0]
+            ask = frame.up_ask if target is Direction.UP else frame.down_ask
+            bid = frame.up_bid if target is Direction.UP else frame.down_bid
+            shares = (
+                _marketable_buy_size(nominal_shares=nominal, price=ask)
+                if Decimal("0") < ask < Decimal("1")
+                else Decimal("0")
+            )
+            cost = shares * ask
+            fee = shares * Decimal("0.07") * ask * (Decimal("1") - ask)
+            max_ask = Decimal("0.50") if attempt == 1 else Decimal("0.45")
+            unlocked_profit = (
+                max(Decimal("0"), equity - peak * profit_lock_fraction)
+                if profit_lock_fraction is not None
+                else Decimal("Infinity")
+            )
+            allowed = (
+                shares > 0
+                and ask <= max_ask
+                and ask - bid <= Decimal("0.03")
+                and cost <= Decimal("1.90")
+                and round_loss + cost + fee <= Decimal("3")
+                and (attempt == 1 or unlocked_profit >= cost + fee)
+            )
+            if not allowed:
+                outcome.filter_skips += 1
+                if attempt == 2:
+                    outcome.stage2_skips += 1
+                    finish_losing_round()
+                blocked = active_trend
+                active_trend = None
+                failures = 0
+                round_loss = Decimal("0")
+            else:
+                won = window.result is target
+                pnl = shares - cost - fee if won else -cost - fee
+                outcome.trades += 1
+                outcome.cost += cost
+                outcome.fees += fee
+                outcome.net_profit += pnl
+                equity += pnl
+                peak = max(peak, equity)
+                outcome.max_drawdown = max(outcome.max_drawdown, peak - equity)
+                traded = True
+                if attempt == 2:
+                    outcome.stage2_trades += 1
+                if won:
+                    outcome.wins += 1
+                    if attempt == 2:
+                        outcome.stage2_wins += 1
+                    outcome.worst_round_loss = max(outcome.worst_round_loss, round_loss)
+                    active_trend = None
+                    blocked = None
+                    failures = 0
+                    round_loss = Decimal("0")
+                    losing_round_streak = 0
+                else:
+                    outcome.losses += 1
+                    round_loss += cost + fee
+                    failures += 1
+                    if failures == 2:
+                        outcome.forced_exits += 1
+                        finish_losing_round()
+                        blocked = active_trend
+                        active_trend = None
+                        failures = 0
+                        round_loss = Decimal("0")
+
+        if blocked is not None:
+            if window.result != blocked:
+                blocked = None
+            elif not traded:
+                outcome.locked_windows += 1
+        recent = (recent + [window.result])[-4:]
+        if pause_before > 0:
+            pause_remaining = pause_before - 1
+    return outcome
+
+
 def load_windows(path: Path) -> list[Window]:
     snapshots: dict[str, dict[int, dict[str, str]]] = {}
     explicit_results: dict[str, Direction] = {}
@@ -100,7 +254,7 @@ def load_windows(path: Path) -> list[Window]:
         next_open = opens.get(epoch + 300)
         if result is None and next_open is not None:
             current_open = Decimal(value["open"])
-            result = Direction.UP if next_open >= current_open else Direction.DOWN
+            result = Direction(resolve_btc_5m_twap(current_open, next_open))
         if result is None:
             continue
         frames = tuple(
@@ -533,6 +687,9 @@ def main() -> None:
         json.dumps(
             {
                 "sample_windows": len(windows),
+                "sample_start_epoch": windows[0].epoch if windows else None,
+                "sample_end_epoch": windows[-1].epoch if windows else None,
+                "reversal_compact": serializable(simulate_compact(windows)),
                 "unfiltered_fixed": serializable(
                     simulate(windows, policy="unfiltered_fixed")
                 ),

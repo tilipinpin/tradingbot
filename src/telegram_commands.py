@@ -42,28 +42,53 @@ MANUAL_ACTIONS = frozenset(
 )
 STRATEGY_LABELS = {
     "fair_value_edge": "公允价值差",
+    "fast_directional_hedge_simple": "盘口波动套利",
     "smart_score": "智能评分",
-    "reversal_v11": "反转·2窗",
-    "reversal_v11_three_streak": "反转·3窗",
-    "reversal_v11_four_streak": "反转·4窗",
-    "spread_market_maker": "盘口价差做市",
+    "ewma_twap_fair": "EWMA·TWAP公平价",
+    "momentum_confirmation": "动量确认",
+    "reversal_first_stage": "反转·首段",
+    "reversal_three_16": "3窗反转·16U",
+    "reversal_v11": "5窗反转·10阶",
+    "reversal_v11_four_streak": "4窗反转·10阶",
+    "reversal_v11_six_streak": "4窗反转·4-0-0追回",
+    "reversal_four_64": "4窗反转·64U",
+    "reversal_three_4_8": "2窗反转·12阶",
 }
-PAPER_ONLY_STRATEGIES = {"smart_score"}
+PAPER_ONLY_STRATEGIES: set[str] = set()
 LIVE_STRATEGIES = {
     "fair_value_edge",
+    "fast_directional_hedge_simple",
+    "smart_score",
+    "ewma_twap_fair",
+    "reversal_four_64",
+    "momentum_confirmation",
     "reversal_v11",
-    "reversal_v11_three_streak",
     "reversal_v11_four_streak",
-    "spread_market_maker",
+    "reversal_v11_six_streak",
+    "reversal_first_stage",
+    "reversal_three_16",
+    "reversal_three_4_8",
 }
 REVERSAL_TRIGGER_STREAKS = {
-    "reversal_v11": 2,
-    "reversal_v11_three_streak": 3,
+    "reversal_four_64": 4,
+    "reversal_v11": 5,
     "reversal_v11_four_streak": 4,
+    "reversal_v11_six_streak": 4,
+    "reversal_first_stage": 4,
+    "reversal_three_16": 3,
+    "reversal_three_4_8": 2,
 }
 REVERSAL_STRATEGIES = frozenset(REVERSAL_TRIGGER_STREAKS)
+REVERSAL_STAGE_LIMITS = {
+    "reversal_v11": 10,
+    "reversal_v11_four_streak": 10,
+    "reversal_v11_six_streak": 10,
+    "reversal_first_stage": 1,
+    "reversal_three_16": 25,
+    "reversal_three_4_8": 12,
+}
 EXECUTION_ADAPTER_PENDING_STRATEGIES: set[str] = set()
-DEFAULT_LAUNCH_STRATEGY = "reversal_v11"
+DEFAULT_LAUNCH_STRATEGY = "reversal_three_16"
 DEFAULT_STRATEGY = "__default__"
 BUTTON_COMMANDS = {
     "📈 查看余额": "/balance",
@@ -74,7 +99,6 @@ BUTTON_COMMANDS = {
     "🎛 手动交易": "/manual",
     "⛔ 停止交易": "/stop",
     "▶️ 恢复交易": "/start",
-    "🔄 重启机器人": "/restart",
 }
 
 
@@ -85,7 +109,6 @@ def reply_keyboard_markup() -> dict[str, Any]:
             [{"text": "📋 查看持仓"}, {"text": "❤️ 运行状态"}],
             [{"text": "⛔ 停止交易"}, {"text": "▶️ 恢复交易"}],
             [{"text": "🧠 选择策略"}, {"text": "🎛 手动交易"}],
-            [{"text": "🔄 重启机器人"}],
         ],
         "is_persistent": True,
         "resize_keyboard": True,
